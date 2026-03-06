@@ -12,14 +12,19 @@ env:
 jobs:
   build:
 
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
 
     steps:
     - uses: actions/checkout@v4
     - name: Install system dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y libwebkit2gtk-4.0-dev build-essential curl wget libssl-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev
+        sudo apt-get install -y libwebkitgtk-6.0-dev build-essential curl wget libssl-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libsoup-3.0-dev libjavascriptcoregtk-6.0-dev
+        # Create symlinks for pkg-config files to match expected names
+        # This is a workaround for Tauri v2 crates expecting GTK/WebKit 4.1 libraries
+        # while Ubuntu 24.04 provides 6.0 versions. The libraries are compatible.
+        sudo ln -sf /usr/lib/x86_64-linux-gnu/pkgconfig/webkitgtk-6.0.pc /usr/lib/x86_64-linux-gnu/pkgconfig/webkit2gtk-4.1.pc
+        sudo ln -sf /usr/lib/x86_64-linux-gnu/pkgconfig/javascriptcoregtk-6.0.pc /usr/lib/x86_64-linux-gnu/pkgconfig/javascriptcoregtk-4.1.pc
     - name: Build
       run: cargo build --verbose
     - name: Run tests

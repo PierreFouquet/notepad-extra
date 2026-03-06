@@ -1,4 +1,5 @@
 use tauri::command;
+use tauri_plugin_dialog::DialogExt;
 use std::fs;
 
 #[command]
@@ -61,6 +62,7 @@ async fn save_file(app: tauri::AppHandle, content: String, path: Option<String>)
 
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![open_file, save_file])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -16,6 +16,8 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+    - name: Create dummy icon
+      run: mkdir -p icons && touch icons/icon.png
     - name: Install system dependencies
       run: |
         sudo apt-get update

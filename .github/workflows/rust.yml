@@ -16,17 +16,20 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
-    - name: Create dummy icon
-      run: mkdir -p icons && touch icons/icon.png
+    - name: Ensure icons and write minimal PNG
+      run: |
+        mkdir -p icons
+        # write a valid 1x1 PNG (base64-decoded)
+        echo "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAAWgmWQ0AAAAASUVORK5CYII=" | base64 -d > icons/icon.png
     - name: Install system dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y libwebkitgtk-6.0-dev build-essential curl wget libssl-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libsoup-3.0-dev libjavascriptcoregtk-6.0-dev
-        # Create symlinks for pkg-config files to match expected names
-        # This is a workaround for Tauri v2 crates expecting GTK/WebKit 4.1 libraries
-        # while Ubuntu 24.04 provides 6.0 versions. The libraries are compatible.
-        sudo ln -sf /usr/lib/x86_64-linux-gnu/pkgconfig/webkitgtk-6.0.pc /usr/lib/x86_64-linux-gnu/pkgconfig/webkit2gtk-4.1.pc
-        sudo ln -sf /usr/lib/x86_64-linux-gnu/pkgconfig/javascriptcoregtk-6.0.pc /usr/lib/x86_64-linux-gnu/pkgconfig/javascriptcoregtk-4.1.pc
+        sudo apt-get install -y --no-install-recommends \
+          build-essential pkg-config curl wget ca-certificates \
+          libssl-dev libgtk-3-dev libayatana-appindicator3-dev \
+          librsvg2-dev libsoup-3.0-dev libjavascriptcoregtk-6.0-dev \
+          libwebkitgtk-6.0-dev libgdk-pixbuf2.0-dev libglib2.0-dev
+        # Note: no pkg-config symlink workarounds — using ubuntu-latest packages.
     - name: Build
       run: cargo build --verbose
     - name: Run tests

@@ -16,11 +16,6 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
-    - name: Ensure icons and write minimal PNG
-      run: |
-        mkdir -p icons
-        # write a valid 1x1 PNG (base64-decoded)
-        echo "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAAWgmWQ0AAAAASUVORK5CYII=" | base64 -d > icons/icon.png
     - name: Install system dependencies
       run: |
         sudo apt-get update
@@ -28,7 +23,8 @@ jobs:
           build-essential pkg-config curl wget ca-certificates \
           libssl-dev libgtk-3-dev libayatana-appindicator3-dev \
           librsvg2-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev \
-          libwebkit2gtk-4.1-dev libgdk-pixbuf2.0-dev libglib2.0-dev
+          libwebkit2gtk-4.1-dev libgdk-pixbuf2.0-dev libglib2.0-dev \
+          imagemagick
         # Ensure pkg-config can find .pc files — include the standard pc_path
         echo "PKG_CONFIG_PATH=/usr/local/lib/x86_64-linux-gnu/pkgconfig:/usr/local/lib/pkgconfig:/usr/local/share/pkgconfig:/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/lib/pkgconfig:/usr/share/pkgconfig" >> $GITHUB_ENV
         # Note: avoid setting PKG_CONFIG_LIBDIR (it can mask pkg-config defaults).

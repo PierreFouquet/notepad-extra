@@ -11,3 +11,4 @@ tauri-plugin-dialog = "2.0"
 
 [build-dependencies]
 tauri-build = "2.0"
+image = "0.24"

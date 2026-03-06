@@ -1,7 +1,6 @@
 use tauri::command;
 use tauri_plugin_dialog::DialogExt;
 use std::time::Duration;
-use std::path::Path;
 use notepad_extra::{read_file_at, write_file_at};
 
 #[command]

@@ -1,6 +1,5 @@
 use notepad_extra::{read_file_at, write_file_at};
 use tempfile::tempdir;
-use std::path::Path;
 
 #[test]
 fn integration_write_and_read() {

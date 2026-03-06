@@ -8,8 +8,7 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
-    "icon": null
+    "targets": "all"
   },
   "plugins": {
     "dialog": {}

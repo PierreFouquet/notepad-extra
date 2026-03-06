@@ -12,15 +12,17 @@
     "icon": []
   },
   "plugins": {},
-  "security": {
-    "csp": null
-  },
-  "windows": [
-    {
-      "title": "Notepad Extra",
-      "width": 800,
-      "height": 600,
-      "resizable": true
+  "app": {
+    "windows": [
+      {
+        "title": "Notepad Extra",
+        "width": 800,
+        "height": 600,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": null
     }
-  ]
+  }
 }

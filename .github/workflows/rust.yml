@@ -31,7 +31,23 @@ jobs:
           libwebkit2gtk-4.1-dev libgdk-pixbuf2.0-dev libglib2.0-dev
         # Ensure pkg-config can find .pc files installed to multiarch dirs
         echo "PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/lib/pkgconfig" >> $GITHUB_ENV
+        # Also set PKG_CONFIG_LIBDIR so pkg-config will search the correct lib dirs
+        echo "PKG_CONFIG_LIBDIR=/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/lib/pkgconfig" >> $GITHUB_ENV
         # Note: prefer installing correct dev packages on ubuntu-latest.
+
+    - name: Diagnose pkg-config and installed .pc files
+      run: |
+        echo "--- Environment ---"
+        env | sort
+        echo "--- pkg-config pc_path ---"
+        pkg-config --variable pc_path pkg-config || true
+        echo "--- pkg-config: javascriptcoregtk-4.1 (modversion) ---"
+        PKG_CONFIG_ALLOW_SYSTEM_CFLAGS=1 pkg-config --modversion javascriptcoregtk-4.1 || true
+        echo "--- pkgconfig dirs listing ---"
+        ls -la /usr/lib/x86_64-linux-gnu/pkgconfig || true
+        ls -la /usr/lib/pkgconfig || true
+        echo "--- dpkg listing for libjavascriptcoregtk package (if present) ---"
+        dpkg -L libjavascriptcoregtk-4.1-dev || true
     - name: Build
       run: cargo build --verbose
     - name: Run tests

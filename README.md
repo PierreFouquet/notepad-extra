@@ -27,6 +27,10 @@ Notepad but extra. For Windows, Mac, and Linux, built with Rust and Tauri.
 
 Run `cargo tauri build` to build the application for your platform.
 
+## Run test
+
+Run `cargo run` to test running the application.
+
 ## Usage
 
 - Click "Open" to open a text file

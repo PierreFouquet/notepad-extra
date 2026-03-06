@@ -10,9 +10,7 @@
     "active": true,
     "targets": "all"
   },
-  "plugins": {
-    "dialog": {}
-  },
+  "plugins": {},
   "app": {
     "windows": [
       {

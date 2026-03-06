@@ -1,25 +1,16 @@
-use tauri::{command, State};
+use tauri::command;
 use std::fs;
-use std::sync::Mutex;
-
-// Define a struct to hold app state if needed
-struct AppState {
-    // For now, empty
-}
 
 #[command]
 async fn open_file() -> Result<Option<serde_json::Value>, String> {
-    use tauri::api::dialog::FileDialogBuilder;
+    use tauri::dialog::FileDialog;
 
-    let (tx, rx) = std::sync::mpsc::channel();
-
-    FileDialogBuilder::new()
+    let file_path = FileDialog::new()
         .add_filter("Text Files", &["txt", "md", "rs", "js", "html", "css"])
-        .pick_file(move |file_path| {
-            tx.send(file_path).unwrap();
-        });
+        .pick_file()
+        .await;
 
-    match rx.recv().unwrap() {
+    match file_path {
         Some(path) => {
             match fs::read_to_string(&path) {
                 Ok(content) => {
@@ -38,18 +29,16 @@ async fn open_file() -> Result<Option<serde_json::Value>, String> {
 
 #[command]
 async fn save_file(content: String, path: Option<String>) -> Result<Option<serde_json::Value>, String> {
-    use tauri::api::dialog::FileDialogBuilder;
+    use tauri::dialog::FileDialog;
 
     let file_path = if let Some(p) = path {
         std::path::PathBuf::from(p)
     } else {
-        let (tx, rx) = std::sync::mpsc::channel();
-        FileDialogBuilder::new()
+        let file_path = FileDialog::new()
             .add_filter("Text Files", &["txt", "md", "rs", "js", "html", "css"])
-            .save_file(move |file_path| {
-                tx.send(file_path).unwrap();
-            });
-        match rx.recv().unwrap() {
+            .save_file()
+            .await;
+        match file_path {
             Some(p) => p,
             None => return Ok(None),
         }
@@ -63,7 +52,7 @@ async fn save_file(content: String, path: Option<String>) -> Result<Option<serde
             })))
         }
         Err(e) => Err(format!("Failed to save file: {}", e)),
-    }
+        }
 }
 
 fn main() {

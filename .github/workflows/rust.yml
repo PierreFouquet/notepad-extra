@@ -19,7 +19,7 @@ jobs:
     - name: Install system dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y libwebkitgtk-6.0-dev build-essential curl wget libssl-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libsoup-2.4-dev
+        sudo apt-get install -y libwebkitgtk-6.0-dev build-essential curl wget libssl-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libsoup-3.0-dev libjavascriptcoregtk-6.0-dev
     - name: Build
       run: cargo build --verbose
     - name: Run tests

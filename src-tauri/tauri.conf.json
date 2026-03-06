@@ -1,25 +1,26 @@
 {
-  "package": {
-    "productName": "Notepad Extra",
-    "version": "0.1.0"
+  "productName": "Notepad Extra",
+  "version": "0.1.0",
+  "identifier": "com.notepad.extra",
+  "build": {
+    "beforeDevCommand": "",
+    "beforeBuildCommand": ""
   },
-  "tauri": {
-    "bundle": {
-      "active": true,
-      "targets": "all",
-      "identifier": "com.notepad.extra",
-      "icon": []
-    },
-    "security": {
-      "csp": null
-    },
-    "windows": [
-      {
-        "title": "Notepad Extra",
-        "width": 800,
-        "height": 600,
-        "resizable": true
-      }
-    ]
-  }
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": []
+  },
+  "plugins": {},
+  "security": {
+    "csp": null
+  },
+  "windows": [
+    {
+      "title": "Notepad Extra",
+      "width": 800,
+      "height": 600,
+      "resizable": true
+    }
+  ]
 }

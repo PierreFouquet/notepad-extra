@@ -9,9 +9,11 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "icon": []
+    "icon": null
   },
-  "plugins": {},
+  "plugins": {
+    "dialog": {}
+  },
   "app": {
     "windows": [
       {

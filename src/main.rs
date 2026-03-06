@@ -2,13 +2,15 @@ use tauri::command;
 use std::fs;
 
 #[command]
-async fn open_file() -> Result<Option<serde_json::Value>, String> {
-    use tauri::dialog::FileDialog;
-
-    let file_path = FileDialog::new()
+async fn open_file(app: tauri::AppHandle) -> Result<Option<serde_json::Value>, String> {
+    let file_path: Option<std::path::PathBuf> = app
+        .dialog()
+        .file()
         .add_filter("Text Files", &["txt", "md", "rs", "js", "html", "css"])
         .pick_file()
-        .await;
+        .await
+        .ok()
+        .flatten();
 
     match file_path {
         Some(path) => {
@@ -28,16 +30,18 @@ async fn open_file() -> Result<Option<serde_json::Value>, String> {
 }
 
 #[command]
-async fn save_file(content: String, path: Option<String>) -> Result<Option<serde_json::Value>, String> {
-    use tauri::dialog::FileDialog;
-
+async fn save_file(app: tauri::AppHandle, content: String, path: Option<String>) -> Result<Option<serde_json::Value>, String> {
     let file_path = if let Some(p) = path {
         std::path::PathBuf::from(p)
     } else {
-        let file_path = FileDialog::new()
+        let file_path: Option<std::path::PathBuf> = app
+            .dialog()
+            .file()
             .add_filter("Text Files", &["txt", "md", "rs", "js", "html", "css"])
             .save_file()
-            .await;
+            .await
+            .ok()
+            .flatten();
         match file_path {
             Some(p) => p,
             None => return Ok(None),
@@ -52,7 +56,7 @@ async fn save_file(content: String, path: Option<String>) -> Result<Option<serde
             })))
         }
         Err(e) => Err(format!("Failed to save file: {}", e)),
-        }
+    }
 }
 
 fn main() {

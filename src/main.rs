@@ -1,6 +1,8 @@
 use tauri::command;
 use tauri_plugin_dialog::DialogExt;
-use std::fs;
+use std::time::Duration;
+use std::path::Path;
+use notepad_extra::{read_file_at, write_file_at};
 
 #[command]
 fn open_file(app: tauri::AppHandle) -> Result<Option<serde_json::Value>, String> {
@@ -13,22 +15,15 @@ fn open_file(app: tauri::AppHandle) -> Result<Option<serde_json::Value>, String>
             let _ = tx.send(file_path);
         });
 
-    let file_path = rx.recv().map_err(|e| e.to_string())?;
+    let file_path = rx
+        .recv_timeout(Duration::from_secs(30))
+        .map_err(|e| format!("no response from dialog: {}", e))?;
 
     match file_path {
         Some(fp) => {
             // Convert the plugin FilePath into a PathBuf when possible
             let path_buf = fp.into_path().map_err(|e| e.to_string())?;
-            match fs::read_to_string(&path_buf) {
-                Ok(content) => {
-                    let path_str = path_buf.to_string_lossy().to_string();
-                    Ok(Some(serde_json::json!({
-                        "path": path_str,
-                        "content": content
-                    })))
-                }
-                Err(e) => Err(format!("Failed to read file: {}", e)),
-            }
+            read_file_at(&path_buf).map(Some)
         }
         None => Ok(None),
     }
@@ -46,7 +41,9 @@ fn save_file(app: tauri::AppHandle, content: String, path: Option<String>) -> Re
             .save_file(move |file_path| {
                 let _ = tx.send(file_path);
             });
-        let fp = match rx.recv().map_err(|e| e.to_string())? {
+        let fp = match rx
+            .recv_timeout(Duration::from_secs(30))
+            .map_err(|e| format!("no response from dialog: {}", e))? {
             Some(fp) => fp,
             None => return Ok(None),
         };
@@ -54,15 +51,7 @@ fn save_file(app: tauri::AppHandle, content: String, path: Option<String>) -> Re
         fp.into_path().map_err(|e| e.to_string())?
     };
 
-    match fs::write(&file_path, content) {
-        Ok(_) => {
-            let path_str = file_path.to_string_lossy().to_string();
-            Ok(Some(serde_json::json!({
-                "path": path_str
-            })))
-        }
-        Err(e) => Err(format!("Failed to save file: {}", e)),
-    }
+    write_file_at(&content, &file_path).map(Some)
 }
 
 fn main() {
@@ -72,3 +61,4 @@ fn main() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+

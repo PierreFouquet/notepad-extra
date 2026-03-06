@@ -48,5 +48,14 @@ jobs:
         dpkg -L libjavascriptcoregtk-4.1-dev || true
     - name: Build
       run: cargo build --verbose
-    - name: Run tests
-      run: cargo test --verbose
+    - name: Diagnose tests and run (verbose + nocapture)
+      run: |
+        echo "--- pwd and workspace files ---"
+        pwd
+        ls -la
+
+        echo "--- cargo test -- --list (displays test cases that would run) ---"
+        cargo test -- --list || true
+
+        echo "--- Running cargo test (verbose, nocapture, single thread) ---"
+        cargo test --verbose -- --nocapture --test-threads=1

@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Notepad Extra</title>
+    
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.2/codemirror.min.css">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.2/theme/monokai.min.css">
     <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.2/codemirror.min.js"></script>
@@ -12,30 +13,8 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.2/mode/markdown/markdown.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.2/mode/htmlmixed/htmlmixed.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.2/mode/css/css.min.js"></script>
-    <style>
-        body {
-            margin: 0;
-            font-family: Arial, sans-serif;
-            background-color: #f0f0f0;
-        }
-        .toolbar {
-            background-color: #e0e0e0;
-            padding: 5px;
-            border-bottom: 1px solid #ccc;
-        }
-        button {
-            margin: 0 5px;
-            padding: 5px 10px;
-        }
-        #editor-container {
-            height: calc(100vh - 40px);
-        }
-        .CodeMirror {
-            height: 100%;
-            font-family: 'Courier New', monospace;
-            font-size: 14px;
-        }
-    </style>
+    
+    <link rel="stylesheet" href="styles.css">
 </head>
 <body>
     <div class="toolbar">
@@ -51,78 +30,10 @@
             <option value="css">CSS</option>
         </select>
     </div>
+    
+    <div class="tabs-container" id="tabsContainer"></div>
     <div id="editor-container"></div>
 
-    <script>
-        const { invoke } = window.__TAURI__.tauri;
-
-        const openBtn = document.getElementById('openBtn');
-        const saveBtn = document.getElementById('saveBtn');
-        const newBtn = document.getElementById('newBtn');
-        const languageSelect = document.getElementById('languageSelect');
-
-        let currentFilePath = null;
-        let editor;
-
-        // Initialize CodeMirror
-        editor = CodeMirror(document.getElementById('editor-container'), {
-            lineNumbers: true,
-            theme: 'monokai',
-            mode: 'plaintext',
-            value: 'Welcome to Notepad Extra!\n\nStart typing or open a file.'
-        });
-
-        languageSelect.addEventListener('change', () => {
-            const mode = languageSelect.value;
-            editor.setOption('mode', mode);
-        });
-
-        openBtn.addEventListener('click', async () => {
-            try {
-                const result = await invoke('open_file');
-                if (result) {
-                    editor.setValue(result.content);
-                    currentFilePath = result.path;
-                    document.title = `Notepad Extra - ${result.path}`;
-                    // Auto-detect mode based on extension
-                    const ext = result.path.split('.').pop().toLowerCase();
-                    const modeMap = {
-                        'js': 'javascript',
-                        'rs': 'rust',
-                        'md': 'markdown',
-                        'html': 'htmlmixed',
-                        'css': 'css',
-                        'txt': 'plaintext'
-                    };
-                    const mode = modeMap[ext] || 'plaintext';
-                    editor.setOption('mode', mode);
-                    languageSelect.value = mode;
-                }
-            } catch (error) {
-                console.error('Error opening file:', error);
-            }
-        });
-
-        saveBtn.addEventListener('click', async () => {
-            try {
-                const content = editor.getValue();
-                const result = await invoke('save_file', { content, path: currentFilePath });
-                if (result && result.path) {
-                    currentFilePath = result.path;
-                    document.title = `Notepad Extra - ${result.path}`;
-                }
-            } catch (error) {
-                console.error('Error saving file:', error);
-            }
-        });
-
-        newBtn.addEventListener('click', () => {
-            editor.setValue('');
-            currentFilePath = null;
-            document.title = 'Notepad Extra';
-            editor.setOption('mode', 'plaintext');
-            languageSelect.value = 'plaintext';
-        });
-    </script>
+    <script src="main.js" defer></script>
 </body>
 </html>

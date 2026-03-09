@@ -15,21 +15,16 @@ Notepad but extra. For Windows, Mac, and Linux, built with Rust and Tauri.
 ### Prerequisites
 
 - Rust (latest stable)
-- Node.js and npm (for frontend dependencies, if needed)
-- Tauri CLI: `cargo install tauri-cli --version "~1.5"`
+- Tauri CLI: `cargo install tauri-cli --version "^2.0.0" --locked`
 
-### Setup
+### Setup & Run
 
 1. Clone the repository
-2. Run `cargo tauri dev` to start development mode
+2. Run `cargo tauri dev` to start the application in development mode with hot-reloading.
 
 ### Build
 
-Run `cargo tauri build` to build the application for your platform.
-
-## Run test
-
-Run `cargo run` to test running the application.
+Run `cargo tauri build` to compile the final, optimized executable for your current platform. 
 
 ## Usage
 

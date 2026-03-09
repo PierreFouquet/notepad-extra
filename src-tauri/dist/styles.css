@@ -1,0 +1,70 @@
+/* src-tauri/dist/styles.css */
+
+body {
+    margin: 0;
+    font-family: Arial, sans-serif;
+    background-color: #272822; /* Match Monokai background */
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+}
+
+.toolbar {
+    background-color: #e0e0e0;
+    padding: 5px;
+    border-bottom: 1px solid #ccc;
+    flex-shrink: 0;
+}
+
+button, select { 
+    margin: 0 5px; 
+    padding: 5px 10px; 
+}
+
+/* Tab Styles */
+.tabs-container {
+    display: flex;
+    background-color: #d0d0d0;
+    overflow-x: auto;
+    border-bottom: 1px solid #272822;
+    min-height: 0;
+}
+
+.tab {
+    padding: 8px 15px;
+    background-color: #e0e0e0;
+    border-right: 1px solid #ccc;
+    cursor: pointer;
+    user-select: none;
+    display: flex;
+    align-items: center;
+    font-size: 14px;
+}
+
+.tab.active {
+    background-color: #272822;
+    color: #f8f8f2;
+    border-bottom: none;
+}
+
+.tab-close {
+    margin-left: 10px;
+    color: #888;
+    font-weight: bold;
+    cursor: pointer;
+}
+
+.tab-close:hover { 
+    color: #ff5555; 
+}
+
+#editor-container { 
+    flex-grow: 1;
+    min-height: 0;
+}
+
+.CodeMirror { 
+    height: 100%; 
+    font-family: 'Courier New', monospace; 
+    font-size: 14px; 
+}

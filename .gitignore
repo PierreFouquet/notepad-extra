@@ -45,5 +45,4 @@ tmp/
 
 # Frontend (if present)
 node_modules/
-dist/
 build/

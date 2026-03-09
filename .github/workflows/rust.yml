@@ -17,7 +17,7 @@ jobs:
         include:
           - platform: "macos-13" # Intel-based Mac
             args: "--target x86_64-apple-darwin"
-          - platform: "macos-14" # Apple Silicon Mac (M1/M2+)
+          - platform: "macos-latest" # Currently points to Apple Silicon (M1/M2)
             args: "--target aarch64-apple-darwin"
           - platform: "windows-latest"
             args: ""
@@ -31,8 +31,7 @@ jobs:
       - name: install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
-          # Ensure both targets are available on macOS runners
-          targets: ${{ matrix.platform == 'macos-13' && 'x86_64-apple-darwin' || matrix.platform == 'macos-14' && 'aarch64-apple-darwin' || '' }}
+          targets: ${{ matrix.platform == 'macos-13' && 'x86_64-apple-darwin' || matrix.platform == 'macos-latest' && 'aarch64-apple-darwin' || '' }}
 
       - name: install dependencies (ubuntu only)
         if: matrix.platform == 'ubuntu-22.04'

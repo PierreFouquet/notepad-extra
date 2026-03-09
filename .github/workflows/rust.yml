@@ -22,11 +22,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: setup node
-        uses: actions/setup-node@v4
-        with:
-          node-version: lts/*
-
       - name: install Rust stable
         uses: dtolnay/rust-toolchain@stable
 
@@ -35,14 +30,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libfuse2
 
-      - name: install frontend dependencies
-        run: npm install
-
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: app-v__VERSION__
+          tagName: v__VERSION__
           releaseName: "Notepad Extra v__VERSION__"
           releaseBody: "See the assets below to download."
           releaseDraft: true

@@ -4,7 +4,9 @@
   "identifier": "com.notepad.extra",
   "build": {
     "beforeDevCommand": "",
-    "beforeBuildCommand": ""
+    "beforeBuildCommand": "",
+    "devUrl": "src-tauri/dist",
+    "frontendDist": "src-tauri/dist"
   },
   "bundle": {
     "active": true,

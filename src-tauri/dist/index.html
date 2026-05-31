@@ -4,36 +4,119 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Notepad Extra</title>
-    
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.2/codemirror.min.css">
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.2/theme/monokai.min.css">
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.2/codemirror.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.2/mode/javascript/javascript.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.2/mode/rust/rust.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.2/mode/markdown/markdown.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.2/mode/htmlmixed/htmlmixed.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.2/mode/css/css.min.js"></script>
-    
+
+    <!-- CodeMirror is vendored locally so the app works fully offline -->
+    <link rel="stylesheet" href="vendor/codemirror/codemirror.min.css">
+    <link rel="stylesheet" href="vendor/codemirror/theme/monokai.min.css">
+
+    <script src="vendor/codemirror/codemirror.min.js"></script>
+    <!-- xml must load before htmlmixed -->
+    <script src="vendor/codemirror/mode/xml/xml.min.js"></script>
+    <script src="vendor/codemirror/mode/javascript/javascript.min.js"></script>
+    <script src="vendor/codemirror/mode/css/css.min.js"></script>
+    <script src="vendor/codemirror/mode/htmlmixed/htmlmixed.min.js"></script>
+    <script src="vendor/codemirror/mode/rust/rust.min.js"></script>
+    <script src="vendor/codemirror/mode/markdown/markdown.min.js"></script>
+    <script src="vendor/codemirror/mode/clike/clike.min.js"></script>
+    <script src="vendor/codemirror/mode/python/python.min.js"></script>
+    <script src="vendor/codemirror/mode/shell/shell.min.js"></script>
+    <script src="vendor/codemirror/mode/yaml/yaml.min.js"></script>
+    <!-- searchcursor powers our custom Find/Replace popup; the others are editor niceties -->
+    <script src="vendor/codemirror/addon/search/searchcursor.min.js"></script>
+    <script src="vendor/codemirror/addon/edit/matchbrackets.min.js"></script>
+    <script src="vendor/codemirror/addon/selection/active-line.min.js"></script>
+
     <link rel="stylesheet" href="styles.css">
 </head>
 <body>
     <div class="toolbar">
-        <button id="openBtn">Open</button>
-        <button id="saveBtn">Save</button>
-        <button id="newBtn">New</button>
-        <select id="languageSelect">
-            <option value="plaintext">Plain Text</option>
-            <option value="javascript">JavaScript</option>
-            <option value="rust">Rust</option>
-            <option value="markdown">Markdown</option>
-            <option value="htmlmixed">HTML</option>
-            <option value="css">CSS</option>
-        </select>
+        <div class="toolbar-group">
+            <button id="newBtn" title="New (Ctrl+N)">New</button>
+            <button id="openBtn" title="Open (Ctrl+O)">Open</button>
+            <button id="saveBtn" title="Save (Ctrl+S)">Save</button>
+            <button id="saveAsBtn" title="Save As (Ctrl+Shift+S)">Save As</button>
+        </div>
+        <div class="toolbar-sep"></div>
+        <div class="toolbar-group">
+            <select id="languageSelect" title="Syntax language">
+                <option value="plaintext">Plain Text</option>
+                <option value="javascript">JavaScript</option>
+                <option value="application/json">JSON</option>
+                <option value="rust">Rust</option>
+                <option value="python">Python</option>
+                <option value="text/x-csrc">C</option>
+                <option value="text/x-c++src">C++</option>
+                <option value="text/x-java">Java</option>
+                <option value="markdown">Markdown</option>
+                <option value="htmlmixed">HTML</option>
+                <option value="xml">XML</option>
+                <option value="css">CSS</option>
+                <option value="shell">Shell</option>
+                <option value="yaml">YAML</option>
+            </select>
+        </div>
+        <div class="toolbar-sep"></div>
+        <div class="toolbar-group">
+            <button id="findBtn" title="Find (Ctrl+F)">Find</button>
+            <button id="replaceBtn" title="Replace (Ctrl+H)">Replace</button>
+            <button id="gotoBtn" title="Go to line (Ctrl+G)">Go&nbsp;to</button>
+        </div>
+        <div class="toolbar-sep"></div>
+        <div class="toolbar-group">
+            <button id="wrapBtn" title="Toggle word wrap" aria-pressed="false">Wrap</button>
+            <button id="themeBtn" title="Switch to dark theme">🌙 Dark</button>
+            <button id="zoomOutBtn" title="Zoom out (Ctrl+-)">A&minus;</button>
+            <button id="zoomResetBtn" title="Reset zoom (Ctrl+0)">A</button>
+            <button id="zoomInBtn" title="Zoom in (Ctrl++)">A+</button>
+        </div>
     </div>
-    
+
     <div class="tabs-container" id="tabsContainer"></div>
     <div id="editor-container"></div>
 
-    <script src="main.js" defer></script>
+    <div class="statusbar" id="statusBar">
+        <span id="statusPos">Ln 1, Col 1</span>
+        <span id="statusSel">Sel 0</span>
+        <span id="statusLen">Length 0, Lines 1</span>
+        <span class="status-spacer"></span>
+        <span id="statusMode">Plain Text</span>
+        <span id="statusEol">LF</span>
+        <span id="statusEnc">UTF-8</span>
+    </div>
+
+    <!-- Find / Replace popup (floating, non-modal) -->
+    <div id="findPanel" class="popup-panel hidden" role="dialog" aria-label="Find and replace">
+        <div class="popup-row">
+            <input id="findInput" type="text" placeholder="Find" autocomplete="off" spellcheck="false">
+            <button id="findPrevBtn" title="Find previous (Shift+F3)">&#9650;</button>
+            <button id="findNextBtn" title="Find next (F3)">&#9660;</button>
+            <button id="findCloseBtn" class="popup-close" title="Close (Esc)">&times;</button>
+        </div>
+        <div class="popup-row" id="replaceRow">
+            <input id="replaceInput" type="text" placeholder="Replace with" autocomplete="off" spellcheck="false">
+            <button id="replaceOneBtn">Replace</button>
+            <button id="replaceAllBtn">All</button>
+        </div>
+        <div class="popup-row popup-options">
+            <label><input type="checkbox" id="optCase"> Match case</label>
+            <label><input type="checkbox" id="optRegex"> Regex</label>
+            <span id="findStatus" class="popup-status"></span>
+        </div>
+    </div>
+
+    <!-- Go to line popup (modal) -->
+    <div id="gotoOverlay" class="popup-overlay hidden">
+        <div class="popup-modal" role="dialog" aria-label="Go to line">
+            <label for="gotoInput">Go to line:</label>
+            <input id="gotoInput" type="number" min="1" autocomplete="off">
+            <div class="popup-row">
+                <button id="gotoGoBtn">Go</button>
+                <button id="gotoCancelBtn">Cancel</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="logic.js"></script>
+    <script src="main.js"></script>
 </body>
 </html>

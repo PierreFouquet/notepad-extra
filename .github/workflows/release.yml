@@ -1,0 +1,81 @@
+name: "release"
+
+# Builds and publishes installers when a version tag is pushed (e.g. v0.2.0),
+# or when triggered manually. Each matrix job attaches its bundles to the same
+# draft GitHub release.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  publish-tauri:
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS — Intel
+          - platform: "macos-15-intel"
+            rust-target: "x86_64-apple-darwin"
+            args: "--target x86_64-apple-darwin"
+          # macOS — Apple Silicon
+          - platform: "macos-latest"
+            rust-target: "aarch64-apple-darwin"
+            args: "--target aarch64-apple-darwin"
+          # Windows — x64 (msi + nsis)
+          - platform: "windows-latest"
+            rust-target: ""
+            args: ""
+          # Windows — ARM64 (nsis)
+          - platform: "windows-11-arm"
+            rust-target: "aarch64-pc-windows-msvc"
+            args: ""
+          # Linux — x86_64 (deb + rpm + AppImage)
+          - platform: "ubuntu-22.04"
+            rust-target: ""
+            args: ""
+          # Linux — aarch64 (deb + rpm + AppImage), native ARM runner
+          - platform: "ubuntu-22.04-arm"
+            rust-target: ""
+            args: ""
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-target }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.platform }}
+
+      - name: install dependencies (Linux only)
+        if: startsWith(matrix.platform, 'ubuntu')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential curl wget file \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libfuse2
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: v__VERSION__
+          releaseName: "Notepad Extra v__VERSION__"
+          releaseBody: "See the assets below to download and install Notepad Extra."
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.args }}

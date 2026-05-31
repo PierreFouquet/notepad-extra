@@ -82,8 +82,35 @@
         return eol === 'CRLF' ? String(text).replace(/\n/g, '\r\n') : String(text);
     }
 
+    // Escape a literal string so it can be embedded in a RegExp.
+    function escapeRegExp(text) {
+        return String(text).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    }
+
+    // Build the RegExp used by the Find/Replace popup. Returns null for empty
+    // input or an invalid user-supplied pattern (so callers can no-op safely).
+    function buildSearchQuery(text, opts) {
+        opts = opts || {};
+        if (!text) return null;
+        const flags = opts.caseSensitive ? '' : 'i';
+        const source = opts.regex ? String(text) : escapeRegExp(text);
+        try {
+            return new RegExp(source, flags);
+        } catch (e) {
+            return null;
+        }
+    }
+
+    // Clamp a 1-based line number to a document of `lineCount` lines.
+    function clampLine(n, lineCount) {
+        const v = parseInt(n, 10);
+        if (!Number.isFinite(v)) return null;
+        return Math.max(1, Math.min(lineCount, v));
+    }
+
     return {
         LANG_LABELS, EXT_MODE,
         modeLabel, resolveMode, extToMode, modeForFilename, basename, detectEol, eolJoin,
+        escapeRegExp, buildSearchQuery, clampLine,
     };
 });

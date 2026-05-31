@@ -25,6 +25,26 @@ const statusLen = document.getElementById('statusLen');
 const statusMode = document.getElementById('statusMode');
 const statusEol = document.getElementById('statusEol');
 
+// Find/Replace popup
+const findPanel = document.getElementById('findPanel');
+const findInput = document.getElementById('findInput');
+const replaceRow = document.getElementById('replaceRow');
+const replaceInput = document.getElementById('replaceInput');
+const findPrevBtn = document.getElementById('findPrevBtn');
+const findNextBtn = document.getElementById('findNextBtn');
+const findCloseBtn = document.getElementById('findCloseBtn');
+const replaceOneBtn = document.getElementById('replaceOneBtn');
+const replaceAllBtn = document.getElementById('replaceAllBtn');
+const optCase = document.getElementById('optCase');
+const optRegex = document.getElementById('optRegex');
+const findStatus = document.getElementById('findStatus');
+
+// Go-to-line popup
+const gotoOverlay = document.getElementById('gotoOverlay');
+const gotoInput = document.getElementById('gotoInput');
+const gotoGoBtn = document.getElementById('gotoGoBtn');
+const gotoCancelBtn = document.getElementById('gotoCancelBtn');
+
 // --- Persisted settings ---
 let theme = localStorage.getItem('ne.theme') || 'default'; // 'default' (light) | 'monokai' (dark)
 let wrap = localStorage.getItem('ne.wrap') === '1';
@@ -43,18 +63,16 @@ const editor = CodeMirror(document.getElementById('editor-container'), {
     lineWrapping: wrap,
     matchBrackets: true,
     styleActiveLine: true,
-    extraKeys: {
-        'Ctrl-F': 'find', 'Cmd-F': 'find',
-        'Ctrl-H': 'replace', 'Cmd-H': 'replace',
-        'Ctrl-G': 'jumpToLine', 'Cmd-G': 'jumpToLine',
-        'F3': 'findNext', 'Shift-F3': 'findPrev',
-    },
 });
 
 // --- Settings appliers ---
 function applyTheme() {
     editor.setOption('theme', theme);
-    document.body.classList.toggle('dark', theme === 'monokai');
+    const dark = theme === 'monokai';
+    document.body.classList.toggle('dark', dark);
+    // Label shows the theme you'll switch TO, so the toggle is self-explanatory.
+    themeBtn.textContent = dark ? '☀ Light' : '🌙 Dark';
+    themeBtn.title = dark ? 'Switch to light theme' : 'Switch to dark theme';
     localStorage.setItem('ne.theme', theme);
 }
 function applyWrap() {
@@ -202,6 +220,107 @@ async function doSaveAs() {
     }
 }
 
+// --- Find / Replace popup ---
+function findIsOpen() { return !findPanel.classList.contains('hidden'); }
+
+function openFind(showReplace) {
+    replaceRow.classList.toggle('hidden', !showReplace);
+    const sel = editor.getSelection();
+    if (sel && sel.indexOf('\n') === -1) findInput.value = sel;
+    findPanel.classList.remove('hidden');
+    findStatus.textContent = '';
+    findInput.focus();
+    findInput.select();
+}
+
+function closeFind() {
+    findPanel.classList.add('hidden');
+    editor.focus();
+}
+
+function currentQuery() {
+    return L.buildSearchQuery(findInput.value, {
+        regex: optRegex.checked,
+        caseSensitive: optCase.checked,
+    });
+}
+
+function doFind(forward) {
+    const query = currentQuery();
+    if (!query) { findStatus.textContent = ''; return false; }
+
+    const start = forward ? editor.getCursor('to') : editor.getCursor('from');
+    let cursor = editor.getSearchCursor(query, start);
+    let found = forward ? cursor.findNext() : cursor.findPrevious();
+
+    if (!found) {
+        // Wrap around to the other end of the document.
+        const last = editor.lastLine();
+        const wrapStart = forward
+            ? { line: 0, ch: 0 }
+            : { line: last, ch: editor.getLine(last).length };
+        cursor = editor.getSearchCursor(query, wrapStart);
+        found = forward ? cursor.findNext() : cursor.findPrevious();
+    }
+
+    if (found) {
+        editor.setSelection(cursor.from(), cursor.to());
+        editor.scrollIntoView({ from: cursor.from(), to: cursor.to() }, 80);
+        findStatus.textContent = '';
+    } else {
+        findStatus.textContent = 'No matches';
+    }
+    return found;
+}
+
+function doReplaceOne() {
+    const query = currentQuery();
+    if (!query) return;
+    const cursor = editor.getSearchCursor(query, editor.getCursor('from'));
+    if (cursor.findNext()) {
+        editor.setSelection(cursor.from(), cursor.to());
+        cursor.replace(replaceInput.value);
+    }
+    doFind(true);
+}
+
+function doReplaceAll() {
+    const query = currentQuery();
+    if (!query) return;
+    let count = 0;
+    editor.operation(() => {
+        const cursor = editor.getSearchCursor(query, { line: 0, ch: 0 });
+        while (cursor.findNext()) {
+            cursor.replace(replaceInput.value);
+            count++;
+        }
+    });
+    findStatus.textContent = `Replaced ${count}`;
+}
+
+// --- Go-to-line popup ---
+function openGoto() {
+    gotoInput.value = String(editor.getCursor().line + 1);
+    gotoOverlay.classList.remove('hidden');
+    gotoInput.focus();
+    gotoInput.select();
+}
+
+function closeGoto() {
+    gotoOverlay.classList.add('hidden');
+    editor.focus();
+}
+
+function doGoto() {
+    const line = L.clampLine(gotoInput.value, editor.lineCount());
+    if (line !== null) {
+        const pos = { line: line - 1, ch: 0 };
+        editor.setCursor(pos);
+        editor.scrollIntoView(pos, 100);
+    }
+    closeGoto();
+}
+
 // --- Event listeners ---
 languageSelect.addEventListener('change', () => {
     const tab = getActiveTab();
@@ -217,9 +336,32 @@ openBtn.addEventListener('click', doOpen);
 saveBtn.addEventListener('click', doSave);
 saveAsBtn.addEventListener('click', doSaveAs);
 
-findBtn.addEventListener('click', () => { editor.focus(); editor.execCommand('find'); });
-replaceBtn.addEventListener('click', () => { editor.focus(); editor.execCommand('replace'); });
-gotoBtn.addEventListener('click', () => { editor.focus(); editor.execCommand('jumpToLine'); });
+findBtn.addEventListener('click', () => openFind(false));
+replaceBtn.addEventListener('click', () => openFind(true));
+gotoBtn.addEventListener('click', openGoto);
+
+findNextBtn.addEventListener('click', () => doFind(true));
+findPrevBtn.addEventListener('click', () => doFind(false));
+findCloseBtn.addEventListener('click', closeFind);
+replaceOneBtn.addEventListener('click', doReplaceOne);
+replaceAllBtn.addEventListener('click', doReplaceAll);
+
+findInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); doFind(!e.shiftKey); }
+    else if (e.key === 'Escape') { e.preventDefault(); closeFind(); }
+});
+replaceInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); doReplaceOne(); }
+    else if (e.key === 'Escape') { e.preventDefault(); closeFind(); }
+});
+
+gotoGoBtn.addEventListener('click', doGoto);
+gotoCancelBtn.addEventListener('click', closeGoto);
+gotoInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); doGoto(); }
+    else if (e.key === 'Escape') { e.preventDefault(); closeGoto(); }
+});
+gotoOverlay.addEventListener('mousedown', (e) => { if (e.target === gotoOverlay) closeGoto(); });
 
 wrapBtn.addEventListener('click', () => { wrap = !wrap; applyWrap(); });
 themeBtn.addEventListener('click', () => { theme = theme === 'monokai' ? 'default' : 'monokai'; applyTheme(); });
@@ -227,16 +369,25 @@ zoomInBtn.addEventListener('click', () => { fontSize += 1; applyFontSize(); });
 zoomOutBtn.addEventListener('click', () => { fontSize -= 1; applyFontSize(); });
 zoomResetBtn.addEventListener('click', () => { fontSize = 14; applyFontSize(); });
 
-// Global shortcuts for file ops and zoom (find/replace/goto live in editor extraKeys).
+// Global shortcuts.
 document.addEventListener('keydown', (e) => {
+    if (e.key === 'F3') { e.preventDefault(); doFind(!e.shiftKey); return; }
+    if (e.key === 'Escape') {
+        if (findIsOpen()) { closeFind(); return; }
+        if (!gotoOverlay.classList.contains('hidden')) { closeGoto(); return; }
+    }
     if (!(e.ctrlKey || e.metaKey)) return;
-    const key = e.key.toLowerCase();
-    if (key === 's') { e.preventDefault(); e.shiftKey ? doSaveAs() : doSave(); }
-    else if (key === 'o') { e.preventDefault(); doOpen(); }
-    else if (key === 'n') { e.preventDefault(); newBtn.click(); }
-    else if (key === '=' || key === '+') { e.preventDefault(); fontSize += 1; applyFontSize(); }
-    else if (key === '-' || key === '_') { e.preventDefault(); fontSize -= 1; applyFontSize(); }
-    else if (key === '0') { e.preventDefault(); fontSize = 14; applyFontSize(); }
+    switch (e.key.toLowerCase()) {
+        case 's': e.preventDefault(); e.shiftKey ? doSaveAs() : doSave(); break;
+        case 'o': e.preventDefault(); doOpen(); break;
+        case 'n': e.preventDefault(); newBtn.click(); break;
+        case 'f': e.preventDefault(); openFind(false); break;
+        case 'h': e.preventDefault(); openFind(true); break;
+        case 'g': e.preventDefault(); openGoto(); break;
+        case '=': case '+': e.preventDefault(); fontSize += 1; applyFontSize(); break;
+        case '-': case '_': e.preventDefault(); fontSize -= 1; applyFontSize(); break;
+        case '0': e.preventDefault(); fontSize = 14; applyFontSize(); break;
+    }
 });
 
 // --- Init ---

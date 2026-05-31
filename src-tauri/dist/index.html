@@ -8,7 +8,6 @@
     <!-- CodeMirror is vendored locally so the app works fully offline -->
     <link rel="stylesheet" href="vendor/codemirror/codemirror.min.css">
     <link rel="stylesheet" href="vendor/codemirror/theme/monokai.min.css">
-    <link rel="stylesheet" href="vendor/codemirror/addon/dialog/dialog.min.css">
 
     <script src="vendor/codemirror/codemirror.min.js"></script>
     <!-- xml must load before htmlmixed -->
@@ -22,11 +21,8 @@
     <script src="vendor/codemirror/mode/python/python.min.js"></script>
     <script src="vendor/codemirror/mode/shell/shell.min.js"></script>
     <script src="vendor/codemirror/mode/yaml/yaml.min.js"></script>
-    <!-- search / replace / go-to-line addons -->
-    <script src="vendor/codemirror/addon/dialog/dialog.min.js"></script>
+    <!-- searchcursor powers our custom Find/Replace popup; the others are editor niceties -->
     <script src="vendor/codemirror/addon/search/searchcursor.min.js"></script>
-    <script src="vendor/codemirror/addon/search/search.min.js"></script>
-    <script src="vendor/codemirror/addon/search/jump-to-line.min.js"></script>
     <script src="vendor/codemirror/addon/edit/matchbrackets.min.js"></script>
     <script src="vendor/codemirror/addon/selection/active-line.min.js"></script>
 
@@ -68,7 +64,7 @@
         <div class="toolbar-sep"></div>
         <div class="toolbar-group">
             <button id="wrapBtn" title="Toggle word wrap" aria-pressed="false">Wrap</button>
-            <button id="themeBtn" title="Toggle light/dark theme">Theme</button>
+            <button id="themeBtn" title="Switch to dark theme">🌙 Dark</button>
             <button id="zoomOutBtn" title="Zoom out (Ctrl+-)">A&minus;</button>
             <button id="zoomResetBtn" title="Reset zoom (Ctrl+0)">A</button>
             <button id="zoomInBtn" title="Zoom in (Ctrl++)">A+</button>
@@ -86,6 +82,38 @@
         <span id="statusMode">Plain Text</span>
         <span id="statusEol">LF</span>
         <span id="statusEnc">UTF-8</span>
+    </div>
+
+    <!-- Find / Replace popup (floating, non-modal) -->
+    <div id="findPanel" class="popup-panel hidden" role="dialog" aria-label="Find and replace">
+        <div class="popup-row">
+            <input id="findInput" type="text" placeholder="Find" autocomplete="off" spellcheck="false">
+            <button id="findPrevBtn" title="Find previous (Shift+F3)">&#9650;</button>
+            <button id="findNextBtn" title="Find next (F3)">&#9660;</button>
+            <button id="findCloseBtn" class="popup-close" title="Close (Esc)">&times;</button>
+        </div>
+        <div class="popup-row" id="replaceRow">
+            <input id="replaceInput" type="text" placeholder="Replace with" autocomplete="off" spellcheck="false">
+            <button id="replaceOneBtn">Replace</button>
+            <button id="replaceAllBtn">All</button>
+        </div>
+        <div class="popup-row popup-options">
+            <label><input type="checkbox" id="optCase"> Match case</label>
+            <label><input type="checkbox" id="optRegex"> Regex</label>
+            <span id="findStatus" class="popup-status"></span>
+        </div>
+    </div>
+
+    <!-- Go to line popup (modal) -->
+    <div id="gotoOverlay" class="popup-overlay hidden">
+        <div class="popup-modal" role="dialog" aria-label="Go to line">
+            <label for="gotoInput">Go to line:</label>
+            <input id="gotoInput" type="number" min="1" autocomplete="off">
+            <div class="popup-row">
+                <button id="gotoGoBtn">Go</button>
+                <button id="gotoCancelBtn">Cancel</button>
+            </div>
+        </div>
     </div>
 
     <script src="logic.js"></script>

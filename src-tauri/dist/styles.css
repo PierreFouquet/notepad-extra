@@ -12,6 +12,9 @@
     --status-fg: #333333;
     --status-border: #c8c8c8;
     --app-bg: #ffffff;
+    --popup-bg: #ffffff;
+    --popup-fg: #1a1a1a;
+    --popup-border: #bcbcbc;
 }
 
 /* Dark chrome to match the Monokai editor theme. */
@@ -27,6 +30,9 @@ body.dark {
     --status-fg: #d4d4d4;
     --status-border: #1d1e19;
     --app-bg: #272822;
+    --popup-bg: #3a3b34;
+    --popup-fg: #f1f1eb;
+    --popup-border: #1d1e19;
 }
 
 * { box-sizing: border-box; }
@@ -68,13 +74,19 @@ button,
 select {
     font: inherit;
     font-size: 13px;
-    padding: 4px 9px;
+    height: 28px;
+    padding: 0 9px;
     background-color: #fdfdfd;
     color: #1a1a1a;
     border: 1px solid #bcbcbc;
     border-radius: 4px;
     cursor: pointer;
+    vertical-align: middle;
+    line-height: normal;
 }
+
+/* Keep the language dropdown the same height as the buttons. */
+select { padding-right: 6px; }
 
 button:hover { background-color: #eaeaea; }
 button:active { background-color: #dcdcdc; }
@@ -143,3 +155,89 @@ button.active { background-color: #4a90d9; border-color: #2f6fb0; color: #ffffff
 }
 
 .statusbar .status-spacer { flex: 1; }
+
+/* --- Popups (Find/Replace + Go to line) --- */
+.hidden { display: none !important; }
+
+.popup-panel {
+    position: fixed;
+    top: 88px;
+    right: 18px;
+    z-index: 50;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    min-width: 340px;
+    padding: 10px;
+    background-color: var(--popup-bg);
+    color: var(--popup-fg);
+    border: 1px solid var(--popup-border);
+    border-radius: 7px;
+    box-shadow: 0 8px 28px rgba(0, 0, 0, 0.32);
+}
+
+.popup-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.popup-panel input[type="text"],
+.popup-modal input {
+    flex: 1;
+    height: 28px;
+    padding: 0 8px;
+    font: inherit;
+    font-size: 13px;
+    background-color: #ffffff;
+    color: #1a1a1a;
+    border: 1px solid var(--popup-border);
+    border-radius: 4px;
+}
+
+.popup-options {
+    font-size: 12px;
+    gap: 14px;
+}
+
+.popup-options label {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    cursor: pointer;
+}
+
+.popup-status {
+    margin-left: auto;
+    font-size: 12px;
+    opacity: 0.85;
+}
+
+.popup-close { color: #999; }
+.popup-close:hover { color: #ff5555; }
+
+/* Go-to-line modal */
+.popup-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 60;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background-color: rgba(0, 0, 0, 0.35);
+}
+
+.popup-modal {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    min-width: 240px;
+    padding: 18px;
+    background-color: var(--popup-bg);
+    color: var(--popup-fg);
+    border: 1px solid var(--popup-border);
+    border-radius: 8px;
+    box-shadow: 0 12px 34px rgba(0, 0, 0, 0.4);
+}
+
+.popup-modal .popup-row { justify-content: flex-end; }

@@ -74,3 +74,35 @@ test('every EXT_MODE target has a human label', () => {
         assert.ok(L.LANG_LABELS[value], `missing label for language value "${value}"`);
     }
 });
+
+test('escapeRegExp escapes regex metacharacters', () => {
+    assert.equal(L.escapeRegExp('a.b*c'), 'a\\.b\\*c');
+    assert.equal(L.escapeRegExp('(x)[y]{z}'), '\\(x\\)\\[y\\]\\{z\\}');
+    assert.equal(L.escapeRegExp('plain'), 'plain');
+});
+
+test('buildSearchQuery treats plain text literally', () => {
+    const q = L.buildSearchQuery('a.b', { regex: false });
+    assert.ok(q instanceof RegExp);
+    assert.ok(q.test('a.b'));
+    assert.ok(!q.test('axb')); // the dot is literal, not "any char"
+});
+
+test('buildSearchQuery honours case sensitivity', () => {
+    assert.ok(L.buildSearchQuery('abc', { caseSensitive: false }).test('ABC'));
+    assert.ok(!L.buildSearchQuery('abc', { caseSensitive: true }).test('ABC'));
+});
+
+test('buildSearchQuery compiles regex mode and rejects empties/invalid patterns', () => {
+    assert.ok(L.buildSearchQuery('a.c', { regex: true }).test('abc'));
+    assert.equal(L.buildSearchQuery('', {}), null);
+    assert.equal(L.buildSearchQuery('(unclosed', { regex: true }), null);
+});
+
+test('clampLine bounds the target line and rejects non-numbers', () => {
+    assert.equal(L.clampLine(5, 10), 5);
+    assert.equal(L.clampLine(0, 10), 1);     // floor at 1
+    assert.equal(L.clampLine(999, 10), 10);  // ceil at lineCount
+    assert.equal(L.clampLine('3', 10), 3);   // numeric strings ok
+    assert.equal(L.clampLine('abc', 10), null);
+});

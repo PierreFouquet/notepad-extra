@@ -1,50 +1,110 @@
 /* src-tauri/dist/styles.css */
 
+:root {
+    --toolbar-bg: #f0f0f0;
+    --toolbar-border: #c8c8c8;
+    --tabs-bg: #e4e4e4;
+    --tab-bg: #ececec;
+    --tab-active-bg: #ffffff;
+    --tab-active-fg: #1a1a1a;
+    --tab-border: #cccccc;
+    --status-bg: #f0f0f0;
+    --status-fg: #333333;
+    --status-border: #c8c8c8;
+    --app-bg: #ffffff;
+}
+
+/* Dark chrome to match the Monokai editor theme. */
+body.dark {
+    --toolbar-bg: #333333;
+    --toolbar-border: #1d1e19;
+    --tabs-bg: #2d2e28;
+    --tab-bg: #3a3b34;
+    --tab-active-bg: #272822;
+    --tab-active-fg: #f8f8f2;
+    --tab-border: #1d1e19;
+    --status-bg: #333333;
+    --status-fg: #d4d4d4;
+    --status-border: #1d1e19;
+    --app-bg: #272822;
+}
+
+* { box-sizing: border-box; }
+
 body {
     margin: 0;
-    font-family: Arial, sans-serif;
-    background-color: #272822; /* Match Monokai background */
+    font-family: -apple-system, "Segoe UI", Arial, sans-serif;
+    background-color: var(--app-bg);
     display: flex;
     flex-direction: column;
     height: 100vh;
 }
 
 .toolbar {
-    background-color: #e0e0e0;
-    padding: 5px;
-    border-bottom: 1px solid #ccc;
+    background-color: var(--toolbar-bg);
+    border-bottom: 1px solid var(--toolbar-border);
+    padding: 4px 6px;
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 4px;
     flex-shrink: 0;
 }
 
-button, select { 
-    margin: 0 5px; 
-    padding: 5px 10px; 
+.toolbar-group {
+    display: flex;
+    align-items: center;
+    gap: 2px;
 }
 
-/* Tab Styles */
+.toolbar-sep {
+    width: 1px;
+    align-self: stretch;
+    background-color: var(--toolbar-border);
+    margin: 2px 4px;
+}
+
+button,
+select {
+    font: inherit;
+    font-size: 13px;
+    padding: 4px 9px;
+    background-color: #fdfdfd;
+    color: #1a1a1a;
+    border: 1px solid #bcbcbc;
+    border-radius: 4px;
+    cursor: pointer;
+}
+
+button:hover { background-color: #eaeaea; }
+button:active { background-color: #dcdcdc; }
+button.active { background-color: #4a90d9; border-color: #2f6fb0; color: #ffffff; }
+
+/* Tab bar */
 .tabs-container {
     display: flex;
-    background-color: #d0d0d0;
+    background-color: var(--tabs-bg);
     overflow-x: auto;
-    border-bottom: 1px solid #272822;
-    min-height: 0;
+    border-bottom: 1px solid var(--tab-border);
+    flex-shrink: 0;
 }
 
 .tab {
-    padding: 8px 15px;
-    background-color: #e0e0e0;
-    border-right: 1px solid #ccc;
+    padding: 6px 14px;
+    background-color: var(--tab-bg);
+    border-right: 1px solid var(--tab-border);
     cursor: pointer;
     user-select: none;
     display: flex;
     align-items: center;
-    font-size: 14px;
+    white-space: nowrap;
+    font-size: 13px;
+    color: var(--status-fg);
 }
 
 .tab.active {
-    background-color: #272822;
-    color: #f8f8f2;
-    border-bottom: none;
+    background-color: var(--tab-active-bg);
+    color: var(--tab-active-fg);
 }
 
 .tab-close {
@@ -54,17 +114,32 @@ button, select {
     cursor: pointer;
 }
 
-.tab-close:hover { 
-    color: #ff5555; 
-}
+.tab-close:hover { color: #ff5555; }
 
-#editor-container { 
+#editor-container {
     flex-grow: 1;
     min-height: 0;
+    overflow: hidden;
 }
 
-.CodeMirror { 
-    height: 100%; 
-    font-family: 'Courier New', monospace; 
-    font-size: 14px; 
+.CodeMirror {
+    height: 100%;
+    font-family: "Cascadia Code", "Consolas", "Courier New", monospace;
 }
+
+/* Status bar */
+.statusbar {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    background-color: var(--status-bg);
+    color: var(--status-fg);
+    border-top: 1px solid var(--status-border);
+    padding: 3px 12px;
+    font-size: 12px;
+    flex-shrink: 0;
+    white-space: nowrap;
+    overflow: hidden;
+}
+
+.statusbar .status-spacer { flex: 1; }

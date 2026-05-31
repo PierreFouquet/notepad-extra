@@ -1,39 +1,101 @@
 // src-tauri/dist/main.js
 
 const { invoke } = window.__TAURI__.core;
+const L = window.NotepadLogic; // pure helpers from logic.js
 
+// --- DOM ---
 const openBtn = document.getElementById('openBtn');
 const saveBtn = document.getElementById('saveBtn');
+const saveAsBtn = document.getElementById('saveAsBtn');
 const newBtn = document.getElementById('newBtn');
+const findBtn = document.getElementById('findBtn');
+const replaceBtn = document.getElementById('replaceBtn');
+const gotoBtn = document.getElementById('gotoBtn');
+const wrapBtn = document.getElementById('wrapBtn');
+const themeBtn = document.getElementById('themeBtn');
+const zoomInBtn = document.getElementById('zoomInBtn');
+const zoomOutBtn = document.getElementById('zoomOutBtn');
+const zoomResetBtn = document.getElementById('zoomResetBtn');
 const languageSelect = document.getElementById('languageSelect');
 const tabsContainer = document.getElementById('tabsContainer');
 
-// Tab State Management
+const statusPos = document.getElementById('statusPos');
+const statusSel = document.getElementById('statusSel');
+const statusLen = document.getElementById('statusLen');
+const statusMode = document.getElementById('statusMode');
+const statusEol = document.getElementById('statusEol');
+
+// --- Persisted settings ---
+let theme = localStorage.getItem('ne.theme') || 'default'; // 'default' (light) | 'monokai' (dark)
+let wrap = localStorage.getItem('ne.wrap') === '1';
+let fontSize = parseInt(localStorage.getItem('ne.fontSize') || '14', 10);
+if (!Number.isFinite(fontSize)) fontSize = 14;
+
+// --- Tab state ---
 let tabs = [];
 let activeTabId = null;
 let tabCounter = 0;
 
-// Initialize CodeMirror 
+// --- Editor ---
 const editor = CodeMirror(document.getElementById('editor-container'), {
     lineNumbers: true,
-    theme: 'monokai'
+    theme: theme,
+    lineWrapping: wrap,
+    matchBrackets: true,
+    styleActiveLine: true,
+    extraKeys: {
+        'Ctrl-F': 'find', 'Cmd-F': 'find',
+        'Ctrl-H': 'replace', 'Cmd-H': 'replace',
+        'Ctrl-G': 'jumpToLine', 'Cmd-G': 'jumpToLine',
+        'F3': 'findNext', 'Shift-F3': 'findPrev',
+    },
 });
 
-// Tab Functions
-function createTab(name, path, content, mode) {
+// --- Settings appliers ---
+function applyTheme() {
+    editor.setOption('theme', theme);
+    document.body.classList.toggle('dark', theme === 'monokai');
+    localStorage.setItem('ne.theme', theme);
+}
+function applyWrap() {
+    editor.setOption('lineWrapping', wrap);
+    wrapBtn.setAttribute('aria-pressed', wrap ? 'true' : 'false');
+    wrapBtn.classList.toggle('active', wrap);
+    localStorage.setItem('ne.wrap', wrap ? '1' : '0');
+}
+function applyFontSize() {
+    fontSize = Math.max(8, Math.min(40, fontSize));
+    editor.getWrapperElement().style.fontSize = fontSize + 'px';
+    editor.refresh();
+    localStorage.setItem('ne.fontSize', String(fontSize));
+}
+
+// --- Status bar ---
+function updatePos() {
+    const c = editor.getCursor();
+    statusPos.textContent = `Ln ${c.line + 1}, Col ${c.ch + 1}`;
+    statusSel.textContent = `Sel ${editor.getSelections().join('').length}`;
+}
+function updateDocStats() {
+    statusLen.textContent = `Length ${editor.getValue().length}, Lines ${editor.lineCount()}`;
+}
+function updateMeta() {
+    const tab = getActiveTab();
+    statusMode.textContent = tab ? L.modeLabel(tab.mode) : 'Plain Text';
+    statusEol.textContent = tab ? tab.eol : 'LF';
+}
+
+editor.on('cursorActivity', updatePos);
+editor.on('changes', updateDocStats);
+
+// --- Tabs ---
+function createTab(name, path, content, modeValue, eol) {
     tabCounter++;
     const id = tabCounter;
-    const doc = CodeMirror.Doc(content, mode);
-    
-    // Mark the document as unmodified from the start
+    const doc = CodeMirror.Doc(content, L.resolveMode(modeValue));
     doc.markClean();
-    
-    // Listen for typing so we can update the tab to show the "Unsaved" indicator
-    CodeMirror.on(doc, 'change', () => {
-        renderTabs();
-    });
-
-    tabs.push({ id, name, path, doc, mode });
+    CodeMirror.on(doc, 'change', renderTabs);
+    tabs.push({ id, name, path, doc, mode: modeValue, eol: eol || 'LF' });
     switchTab(id);
 }
 
@@ -42,27 +104,27 @@ function switchTab(id) {
     const tab = tabs.find(t => t.id === id);
     if (tab) {
         editor.swapDoc(tab.doc);
+        editor.setOption('mode', L.resolveMode(tab.mode));
         languageSelect.value = tab.mode;
         document.title = tab.path ? `Notepad Extra - ${tab.path}` : 'Notepad Extra - Untitled';
+        updatePos();
+        updateDocStats();
+        updateMeta();
     }
     renderTabs();
 }
 
 function closeTab(id, event) {
-    event.stopPropagation(); // Prevent switching to the tab while closing it
-    
+    event.stopPropagation();
     const tab = tabs.find(t => t.id === id);
     if (!tab) return;
-
-    // THE FIX: Unsaved Changes Warning
     if (!tab.doc.isClean()) {
-        const confirmClose = confirm(`"${tab.name}" has unsaved changes. Are you sure you want to close it without saving?`);
-        if (!confirmClose) return; // Abort the close if they click Cancel
+        const confirmClose = confirm(`"${tab.name}" has unsaved changes. Close without saving?`);
+        if (!confirmClose) return;
     }
-
     tabs = tabs.filter(t => t.id !== id);
     if (tabs.length === 0) {
-        createTab('Untitled', null, '', 'plaintext');
+        createTab('Untitled', null, '', 'plaintext', 'LF');
     } else if (activeTabId === id) {
         switchTab(tabs[tabs.length - 1].id);
     } else {
@@ -75,8 +137,6 @@ function renderTabs() {
     tabs.forEach(tab => {
         const tabEl = document.createElement('div');
         tabEl.className = `tab ${tab.id === activeTabId ? 'active' : ''}`;
-        
-        // Add a visual indicator (•) if the document has unsaved changes
         const isDirty = !tab.doc.isClean();
         tabEl.textContent = tab.name + (isDirty ? ' •' : '');
 
@@ -91,81 +151,96 @@ function renderTabs() {
     });
 }
 
-function getActiveTab() {
-    return tabs.find(t => t.id === activeTabId);
+function getActiveTab() { return tabs.find(t => t.id === activeTabId); }
+
+function applySaveResult(tab, result) {
+    if (result && result.path) {
+        tab.path = result.path;
+        tab.name = L.basename(result.path);
+        document.title = `Notepad Extra - ${tab.path}`;
+        tab.doc.markClean();
+        renderTabs();
+    }
 }
 
-// Event Listeners
-languageSelect.addEventListener('change', () => {
-    const tab = getActiveTab();
-    if (tab) {
-        tab.mode = languageSelect.value;
-        editor.setOption('mode', tab.mode);
-    }
-});
-
-newBtn.addEventListener('click', () => {
-    createTab('Untitled', null, '', 'plaintext');
-});
-
-openBtn.addEventListener('click', async () => {
+// --- File commands ---
+async function doOpen() {
     try {
         const result = await invoke('open_file');
         if (result) {
-            const ext = result.path.split('.').pop().toLowerCase();
-            const modeMap = {
-                'js': 'javascript', 'rs': 'rust', 'md': 'markdown',
-                'html': 'htmlmixed', 'css': 'css', 'txt': 'plaintext'
-            };
-            const mode = modeMap[ext] || 'plaintext';
-            const filename = result.path.split(/[/\\]/).pop();
-            
-            createTab(filename, result.path, result.content, mode);
+            createTab(
+                L.basename(result.path), result.path, result.content,
+                L.modeForFilename(result.path), L.detectEol(result.content),
+            );
         }
     } catch (error) {
         console.error('Error opening file:', error);
     }
-});
+}
 
-saveBtn.addEventListener('click', async () => {
+async function doSave() {
     const tab = getActiveTab();
     if (!tab) return;
-    
     try {
-        const content = editor.getValue();
+        const content = L.eolJoin(editor.getValue(), tab.eol);
         const result = await invoke('save_file', { content, path: tab.path });
-        if (result && result.path) {
-            tab.path = result.path;
-            tab.name = result.path.split(/[/\\]/).pop();
-            document.title = `Notepad Extra - ${tab.path}`;
-            
-            // Mark the document as clean so the warning disappears
-            tab.doc.markClean(); 
-            renderTabs();
-        }
+        applySaveResult(tab, result);
     } catch (error) {
         console.error('Error saving file:', error);
     }
-});
+}
 
-// IMPROVEMENT: Global Keyboard Shortcuts
-document.addEventListener('keydown', (e) => {
-    // Check for Ctrl (Windows/Linux) or Cmd (Mac)
-    if (e.ctrlKey || e.metaKey) {
-        if (e.key === 's' || e.key === 'S') {
-            e.preventDefault(); // Stop the browser's default "Save Webpage" dialog
-            saveBtn.click();
-        }
-        if (e.key === 'o' || e.key === 'O') {
-            e.preventDefault();
-            openBtn.click();
-        }
-        if (e.key === 'n' || e.key === 'N') {
-            e.preventDefault();
-            newBtn.click();
-        }
+async function doSaveAs() {
+    const tab = getActiveTab();
+    if (!tab) return;
+    try {
+        const content = L.eolJoin(editor.getValue(), tab.eol);
+        const result = await invoke('save_file_as', { content });
+        applySaveResult(tab, result);
+    } catch (error) {
+        console.error('Error saving file:', error);
+    }
+}
+
+// --- Event listeners ---
+languageSelect.addEventListener('change', () => {
+    const tab = getActiveTab();
+    if (tab) {
+        tab.mode = languageSelect.value;
+        editor.setOption('mode', L.resolveMode(tab.mode));
+        updateMeta();
     }
 });
 
-// Start with one empty tab
-createTab('Untitled', null, '', 'plaintext');
+newBtn.addEventListener('click', () => createTab('Untitled', null, '', 'plaintext', 'LF'));
+openBtn.addEventListener('click', doOpen);
+saveBtn.addEventListener('click', doSave);
+saveAsBtn.addEventListener('click', doSaveAs);
+
+findBtn.addEventListener('click', () => { editor.focus(); editor.execCommand('find'); });
+replaceBtn.addEventListener('click', () => { editor.focus(); editor.execCommand('replace'); });
+gotoBtn.addEventListener('click', () => { editor.focus(); editor.execCommand('jumpToLine'); });
+
+wrapBtn.addEventListener('click', () => { wrap = !wrap; applyWrap(); });
+themeBtn.addEventListener('click', () => { theme = theme === 'monokai' ? 'default' : 'monokai'; applyTheme(); });
+zoomInBtn.addEventListener('click', () => { fontSize += 1; applyFontSize(); });
+zoomOutBtn.addEventListener('click', () => { fontSize -= 1; applyFontSize(); });
+zoomResetBtn.addEventListener('click', () => { fontSize = 14; applyFontSize(); });
+
+// Global shortcuts for file ops and zoom (find/replace/goto live in editor extraKeys).
+document.addEventListener('keydown', (e) => {
+    if (!(e.ctrlKey || e.metaKey)) return;
+    const key = e.key.toLowerCase();
+    if (key === 's') { e.preventDefault(); e.shiftKey ? doSaveAs() : doSave(); }
+    else if (key === 'o') { e.preventDefault(); doOpen(); }
+    else if (key === 'n') { e.preventDefault(); newBtn.click(); }
+    else if (key === '=' || key === '+') { e.preventDefault(); fontSize += 1; applyFontSize(); }
+    else if (key === '-' || key === '_') { e.preventDefault(); fontSize -= 1; applyFontSize(); }
+    else if (key === '0') { e.preventDefault(); fontSize = 14; applyFontSize(); }
+});
+
+// --- Init ---
+applyTheme();
+applyWrap();
+applyFontSize();
+createTab('Untitled', null, '', 'plaintext', 'LF');

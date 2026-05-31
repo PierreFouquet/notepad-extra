@@ -65,20 +65,23 @@ Both suites also run automatically in CI (`.github/workflows/ci.yml`).
 
 ## Releases
 
-Pushing a version tag builds and publishes installers for every platform via
-`.github/workflows/release.yml`:
+Installers are built and attached automatically **when you publish a GitHub
+Release** (`.github/workflows/release.yml`, triggered on `release: published`):
 
-```bash
-# bump the version in Cargo.toml and tauri.conf.json first, then:
-git tag v0.2.0
-git push origin v0.2.0
-```
+1. Bump the version in `Cargo.toml` and `tauri.conf.json`.
+2. On GitHub, **Releases → Draft a new release**, create the tag (e.g. `v0.2.0`),
+   and click **Publish**.
+3. CI builds every platform and uploads the bundles onto that release.
 
-The workflow produces, as a draft GitHub release:
+> A manual `workflow_dispatch` run is also available; it builds into a fresh draft release instead.
 
-- **Linux**: `.deb`, `.rpm`, `.AppImage` (x86_64 and aarch64)
-- **macOS**: `.dmg` / `.app` (Intel and Apple Silicon)
-- **Windows**: `.msi` / `.exe` NSIS installer (x64 and ARM64)
+Artifacts produced:
+
+| Platform | Files | Covers |
+| --- | --- | --- |
+| Linux x86_64 + aarch64 | `.deb`, `.rpm`, `.AppImage` | Debian/Ubuntu (deb), Fedora/RHEL/openSUSE (rpm), **any distro incl. Arch** (AppImage) |
+| macOS Intel + Apple Silicon | `.dmg` / `.app` | macOS 10.15+ |
+| Windows x64 + ARM64 | `.msi` / NSIS `.exe` | Windows 10/11 |
 
 > GitHub-hosted ARM runners (`*-arm`) are free for public repositories; on private repos those jobs are billable.
 

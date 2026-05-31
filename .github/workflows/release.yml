@@ -1,13 +1,17 @@
 name: "release"
 
-# Builds and publishes installers when a version tag is pushed (e.g. v0.2.0),
-# or when triggered manually. Each matrix job attaches its bundles to the same
-# draft GitHub release.
+# Builds installers for every platform when a GitHub Release is *published*,
+# and uploads them straight onto that release. `workflow_dispatch` is kept as a
+# manual fallback (it creates a draft release instead).
 on:
-  push:
-    tags:
-      - "v*"
+  release:
+    types: [published]
   workflow_dispatch:
+
+# Opt JS actions that still ship on Node.js 20 (rust-cache, tauri-action) onto
+# Node.js 24 now, ahead of the June 2026 forced cutover.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
   publish-tauri:
@@ -25,26 +29,26 @@ jobs:
           - platform: "macos-latest"
             rust-target: "aarch64-apple-darwin"
             args: "--target aarch64-apple-darwin"
-          # Windows — x64 (msi + nsis)
-          - platform: "windows-latest"
+          # Windows — x64 (msi + nsis). Pinned to avoid the windows-latest image redirect.
+          - platform: "windows-2025"
             rust-target: ""
             args: ""
           # Windows — ARM64 (nsis)
           - platform: "windows-11-arm"
             rust-target: "aarch64-pc-windows-msvc"
-            args: ""
-          # Linux — x86_64 (deb + rpm + AppImage)
+            args: "--bundles nsis"
+          # Linux — x86_64 (Debian/Ubuntu .deb, Fedora .rpm, universal AppImage)
           - platform: "ubuntu-22.04"
             rust-target: ""
-            args: ""
+            args: "--bundles deb,rpm,appimage"
           # Linux — aarch64 (deb + rpm + AppImage), native ARM runner
           - platform: "ubuntu-22.04-arm"
             rust-target: ""
-            args: ""
+            args: "--bundles deb,rpm,appimage"
 
     runs-on: ${{ matrix.platform }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -73,9 +77,35 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: v__VERSION__
-          releaseName: "Notepad Extra v__VERSION__"
+          # On a published release, upload the bundles straight onto it.
+          releaseId: ${{ github.event.release.id }}
+          # Fallback for manual workflow_dispatch runs (no release event):
+          tagName: ${{ github.event.release.tag_name || 'v__VERSION__' }}
+          releaseName: "Notepad Extra ${{ github.event.release.tag_name || 'v__VERSION__' }}"
           releaseBody: "See the assets below to download and install Notepad Extra."
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
+
+  # Adds a "which file do I download?" table to the published release notes so
+  # users can pick the right bundle. Runs once, independent of the build jobs.
+  downloads-guide:
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+      - name: Append the downloads guide to the release notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.event.release.tag_name }}
+          BODY: ${{ github.event.release.body }}
+        run: |
+          if printf '%s' "$BODY" | grep -qF '<!-- downloads-table -->'; then
+            echo "Downloads table already present; nothing to do."
+            exit 0
+          fi
+          { printf '%s\n\n' "$BODY"; cat .github/release-downloads.md; } > "$RUNNER_TEMP/notes.md"
+          gh release edit "$TAG" --repo "$REPO" --notes-file "$RUNNER_TEMP/notes.md"

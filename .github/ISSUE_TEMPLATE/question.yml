@@ -34,3 +34,54 @@ body:
         - N/A
     validations:
       required: false
+  - type: dropdown
+    id: windows-version
+    attributes:
+      label: Windows version (if relevant)
+      options:
+        - N/A (not on Windows)
+        - Windows 11
+        - Windows 10
+        - Windows 8.1 or older
+        - Other / not listed
+    validations:
+      required: false
+  - type: dropdown
+    id: macos-version
+    attributes:
+      label: macOS version (if relevant)
+      options:
+        - N/A (not on macOS)
+        - macOS 26 (Tahoe)
+        - macOS 15 (Sequoia)
+        - macOS 14 (Sonoma)
+        - macOS 13 (Ventura)
+        - macOS 12 (Monterey)
+        - macOS 11 (Big Sur)
+        - Older (10.15 Catalina)
+        - Other / not listed
+    validations:
+      required: false
+  - type: dropdown
+    id: distro
+    attributes:
+      label: Linux distribution (if relevant)
+      options:
+        - N/A (not on Linux)
+        - Ubuntu
+        - Debian
+        - Linux Mint
+        - Fedora
+        - RHEL / CentOS / Rocky / AlmaLinux
+        - openSUSE
+        - Arch / Manjaro
+        - Other / not listed
+    validations:
+      required: false
+  - type: input
+    id: os-version-detail
+    attributes:
+      label: Exact OS version / build (if relevant)
+      placeholder: "e.g. Windows 11 24H2, macOS 26.1, Ubuntu 24.04.1, Fedora 41"
+    validations:
+      required: false

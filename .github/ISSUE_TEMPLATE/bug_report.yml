@@ -1,0 +1,96 @@
+name: Bug Report
+description: Report a problem or unexpected behavior in Notepad Extra
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug! Please fill out the sections below so we can reproduce and fix it quickly.
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Before you start
+      options:
+        - label: I searched existing issues and didn't find a duplicate
+          required: true
+        - label: I'm using the latest release
+          required: false
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug, including what you expected to happen instead.
+      placeholder: When I ..., I expected ..., but instead ...
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open '...'
+        2. Click '...'
+        3. See the problem
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: App version
+      description: See the release you downloaded, or the title bar / About.
+      placeholder: "0.2.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Windows
+        - macOS
+        - Linux
+    validations:
+      required: true
+  - type: dropdown
+    id: arch
+    attributes:
+      label: Architecture
+      options:
+        - x86_64 / x64
+        - ARM64 / aarch64
+        - Apple Silicon (M-series)
+        - Not sure
+    validations:
+      required: false
+  - type: dropdown
+    id: install
+    attributes:
+      label: Install format
+      description: Which bundle did you download?
+      options:
+        - ".msi (Windows)"
+        - ".exe / NSIS (Windows)"
+        - ".dmg (macOS)"
+        - ".app (macOS)"
+        - ".deb (Debian/Ubuntu)"
+        - ".rpm (Fedora/RHEL/openSUSE)"
+        - ".AppImage (any Linux)"
+        - Built from source
+        - Other / not sure
+    validations:
+      required: false
+  - type: input
+    id: os-version
+    attributes:
+      label: OS version
+      placeholder: "e.g. Windows 11 23H2, macOS 14.5, Ubuntu 24.04"
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs, screenshots, or sample file
+      description: Paste any error output, screenshots, or a snippet of a file that triggers the issue. Please don't include anything sensitive.
+    validations:
+      required: false

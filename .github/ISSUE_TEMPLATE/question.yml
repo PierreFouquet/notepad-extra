@@ -1,0 +1,36 @@
+name: Question / Support
+description: Ask how to do something or get help using Notepad Extra
+title: "[Question]: "
+labels: ["question"]
+body:
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Before you ask
+      options:
+        - label: I checked the README and existing issues
+          required: true
+  - type: textarea
+    id: question
+    attributes:
+      label: Your question
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: App version (if relevant)
+      placeholder: "0.2.0"
+    validations:
+      required: false
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system (if relevant)
+      options:
+        - Windows
+        - macOS
+        - Linux
+        - N/A
+    validations:
+      required: false

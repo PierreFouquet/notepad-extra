@@ -48,7 +48,7 @@ jobs:
 
     runs-on: ${{ matrix.platform }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -73,7 +73,7 @@ jobs:
             patchelf \
             libfuse2
 
-      - uses: tauri-apps/tauri-action@v0
+      - uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
@@ -83,7 +83,10 @@ jobs:
           tagName: ${{ github.event.release.tag_name || 'v__VERSION__' }}
           releaseName: "Notepad Extra ${{ github.event.release.tag_name || 'v__VERSION__' }}"
           releaseBody: "See the assets below to download and install Notepad Extra."
-          releaseDraft: true
+          # tauri-action v1 fails if releaseDraft is true but the release isn't a
+          # draft, so only draft on the manual (workflow_dispatch) path — the
+          # published-release path uploads onto the existing non-draft release.
+          releaseDraft: ${{ github.event_name == 'workflow_dispatch' }}
           prerelease: false
           args: ${{ matrix.args }}
 
@@ -95,7 +98,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Append the downloads guide to the release notes
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

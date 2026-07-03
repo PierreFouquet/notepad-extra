@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Copyright 2026 Pierre Fouquet -->
+<component type="desktop-application">
+  <id>io.github.PierreFouquet.NotepadExtra</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+
+  <name>Notepad Extra</name>
+  <summary>Small, fast, fully offline text and code editor</summary>
+
+  <description>
+    <p>
+      Notepad Extra is a small, fast, fully offline text and code editor for
+      Windows, macOS and Linux, built with Rust and Tauri and inspired by
+      Notepad++.
+    </p>
+    <p>Features:</p>
+    <ul>
+      <li>Tabbed editing with unsaved-change indicators</li>
+      <li>Syntax highlighting for 80+ languages, with automatic detection from the file extension</li>
+      <li>Find, Replace and Go-to-line, with regex and case options</li>
+      <li>Word wrap toggle, editor zoom, and light and dark themes</li>
+      <li>Preserves each file's original line endings (LF or CRLF) on save</li>
+      <li>Works fully offline and makes no network requests</li>
+    </ul>
+  </description>
+
+  <launchable type="desktop-id">io.github.PierreFouquet.NotepadExtra.desktop</launchable>
+
+  <url type="homepage">https://github.com/PierreFouquet/notepad-extra</url>
+  <url type="bugtracker">https://github.com/PierreFouquet/notepad-extra/issues</url>
+  <url type="vcs-browser">https://github.com/PierreFouquet/notepad-extra</url>
+
+  <developer id="io.github.pierrefouquet">
+    <name>Pierre Fouquet</name>
+  </developer>
+
+  <categories>
+    <category>Utility</category>
+    <category>TextEditor</category>
+    <category>Development</category>
+  </categories>
+
+  <keywords>
+    <keyword>notepad</keyword>
+    <keyword>editor</keyword>
+    <keyword>text</keyword>
+    <keyword>code</keyword>
+  </keywords>
+
+  <content_rating type="oars-1.1"/>
+
+  <releases>
+    <release version="0.4.0" date="2026-07-03"/>
+  </releases>
+</component>

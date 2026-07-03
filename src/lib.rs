@@ -172,4 +172,27 @@ mod tests {
         fs::write(&file_path, [0xFF, 0xFE, 0x00, 0x01]).expect("write bytes");
         assert!(read_file_at(&file_path).is_err());
     }
+
+    #[test]
+    fn test_read_file_at_accepts_string_path() {
+        // Mirrors the `read_file` command (used by drag-and-drop), which receives
+        // the dropped path as a String and reads it via read_file_at(Path::new(..)).
+        let dir = tempdir().expect("tempdir");
+        let file_path = dir.path().join("dropped.txt");
+        write_file_at("dropped content", &file_path).expect("write");
+
+        let path_string: String = file_path.to_string_lossy().to_string();
+        let res = read_file_at(Path::new(&path_string)).expect("read via string path");
+        assert_eq!(res["content"], "dropped content");
+        assert_eq!(res["path"], path_string);
+    }
+
+    #[test]
+    fn test_read_file_at_string_path_missing_errors() {
+        // A dropped path that doesn't resolve (e.g. a directory or deleted file)
+        // must return an error the frontend can skip, not panic.
+        let dir = tempdir().expect("tempdir");
+        let missing = dir.path().join("nope.txt").to_string_lossy().to_string();
+        assert!(read_file_at(Path::new(&missing)).is_err());
+    }
 }

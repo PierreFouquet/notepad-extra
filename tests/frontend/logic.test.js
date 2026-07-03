@@ -106,3 +106,49 @@ test('clampLine bounds the target line and rejects non-numbers', () => {
     assert.equal(L.clampLine('3', 10), 3);   // numeric strings ok
     assert.equal(L.clampLine('abc', 10), null);
 });
+
+test('tabDescriptor maps a read result to createTab fields', () => {
+    const d = L.tabDescriptor({ path: '/home/u/main.rs', content: 'fn main() {}\n' });
+    assert.equal(d.name, 'main.rs');
+    assert.equal(d.path, '/home/u/main.rs');
+    assert.equal(d.content, 'fn main() {}\n');
+    assert.equal(d.mode, 'rust');
+    assert.equal(d.eol, 'LF');
+});
+
+test('tabDescriptor detects language and CRLF, and handles Windows paths', () => {
+    const d = L.tabDescriptor({ path: 'C:\\Users\\u\\notes.md', content: 'a\r\nb\r\n' });
+    assert.equal(d.name, 'notes.md');
+    assert.equal(d.mode, 'markdown');
+    assert.equal(d.eol, 'CRLF');
+});
+
+test('tabDescriptor falls back to plaintext for unknown extensions', () => {
+    const d = L.tabDescriptor({ path: '/tmp/file.unknownext', content: '' });
+    assert.equal(d.mode, 'plaintext');
+    assert.equal(d.eol, 'LF');
+});
+
+test('shouldReuseBlankTab: reuse a lone pristine Untitled tab', () => {
+    assert.equal(
+        L.shouldReuseBlankTab(1, { hasPath: false, isClean: true, isEmpty: true }),
+        true,
+    );
+});
+
+test('shouldReuseBlankTab: never reuse when other tabs are open', () => {
+    assert.equal(
+        L.shouldReuseBlankTab(2, { hasPath: false, isClean: true, isEmpty: true }),
+        false,
+    );
+});
+
+test('shouldReuseBlankTab: never reuse a saved, dirty, or non-empty tab', () => {
+    assert.equal(L.shouldReuseBlankTab(1, { hasPath: true, isClean: true, isEmpty: true }), false);
+    assert.equal(L.shouldReuseBlankTab(1, { hasPath: false, isClean: false, isEmpty: true }), false);
+    assert.equal(L.shouldReuseBlankTab(1, { hasPath: false, isClean: true, isEmpty: false }), false);
+});
+
+test('shouldReuseBlankTab: safe with a missing tab snapshot', () => {
+    assert.equal(L.shouldReuseBlankTab(1, null), false);
+});

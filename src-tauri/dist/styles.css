@@ -469,3 +469,32 @@ button.ext-link:hover { background: transparent; text-decoration: underline; }
     color: var(--text-muted);
     text-align: center;
 }
+
+/* Drag-and-drop overlay. pointer-events:none so it never intercepts the OS
+   drop — Tauri delivers the drop to the webview underneath. */
+.drop-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 100;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    background: var(--overlay);
+    pointer-events: none;
+}
+.drop-overlay.visible { display: flex; }
+.drop-overlay-inner {
+    padding: 28px 44px;
+    border: 3px dashed var(--accent);
+    border-radius: 14px;
+    background: var(--popup-bg);
+    color: var(--text);
+    box-shadow: var(--shadow);
+    text-align: center;
+}
+.drop-overlay-icon { font-size: 40px; line-height: 1; }
+.drop-overlay-text {
+    margin-top: 10px;
+    font-size: 15px;
+    font-weight: 600;
+}

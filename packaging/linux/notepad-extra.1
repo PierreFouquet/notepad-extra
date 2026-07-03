@@ -1,0 +1,67 @@
+.TH NOTEPAD-EXTRA 1 "2026-07-03" "notepad-extra 0.4.0" "User Commands"
+.SH NAME
+notepad-extra \- small, fast, fully offline text and code editor
+.SH SYNOPSIS
+.B notepad-extra
+.RI [ FILE ...]
+.SH DESCRIPTION
+.B Notepad Extra
+is a small, fast, fully offline text and code editor for Windows, macOS and
+Linux, built with Rust and Tauri and inspired by Notepad++.
+.PP
+It offers tabbed editing, syntax highlighting for over 80 languages with
+automatic detection from the file extension, find/replace/go\-to\-line with
+regex and case options, word wrap, editor zoom and light/dark themes. A file's
+original line endings (LF or CRLF) are preserved on save. The application works
+fully offline and makes no network requests.
+.PP
+Any
+.I FILE
+arguments are opened in new tabs on startup. Files can also be opened from the
+.B Open
+dialog or by dragging and dropping them onto the window.
+.SH OPTIONS
+.B Notepad Extra
+takes no command\-line options; non\-option arguments are treated as files to
+open.
+.SH KEYBOARD SHORTCUTS
+.TP
+.B Ctrl+N
+New tab.
+.TP
+.B Ctrl+O
+Open a file.
+.TP
+.B Ctrl+S
+Save the current file.
+.TP
+.B Ctrl+Shift+S
+Save As.
+.TP
+.B Ctrl+F
+Find.
+.TP
+.B Ctrl+H
+Replace.
+.TP
+.B F3 ", " Shift+F3
+Find next / previous.
+.TP
+.B Ctrl+G
+Go to line.
+.TP
+.B "Ctrl++ , Ctrl+- , Ctrl+0"
+Zoom in, out and reset.
+.SH FILES
+None. Editor preferences (theme, word wrap and zoom) are stored by the platform
+web view's local storage.
+.SH BUGS
+Report bugs at
+.UR https://github.com/PierreFouquet/notepad-extra/issues
+.UE .
+.SH AUTHOR
+Written by Pierre Fouquet.
+.SH COPYRIGHT
+Copyright \(co Pierre Fouquet. License GPLv3+: GNU GPL version 3 or later.
+This is free software: you are free to change and redistribute it. There is NO
+WARRANTY, to the extent permitted by law.

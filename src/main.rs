@@ -21,6 +21,15 @@ async fn open_file(app: tauri::AppHandle) -> Result<Option<serde_json::Value>, S
     }
 }
 
+/// Read a file at an explicit `path` and return `{ path, content }`.
+///
+/// Unlike `open_file`, this takes a path directly rather than showing a picker,
+/// so the frontend can open files dragged and dropped onto the window.
+#[command]
+async fn read_file(path: String) -> Result<serde_json::Value, String> {
+    read_file_at(std::path::Path::new(&path))
+}
+
 #[command]
 async fn save_file(
     app: tauri::AppHandle,
@@ -104,6 +113,7 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             open_file,
+            read_file,
             save_file,
             save_file_as,
             app_version,

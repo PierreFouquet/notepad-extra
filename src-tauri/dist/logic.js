@@ -292,9 +292,30 @@
         return Math.max(1, Math.min(lineCount, v));
     }
 
+    // Map a backend read result ({ path, content }) to the fields a tab needs.
+    // Shared by the Open command and drag-and-drop so both open files identically.
+    function tabDescriptor(result) {
+        return {
+            name: basename(result.path),
+            path: result.path,
+            content: result.content,
+            mode: modeForFilename(result.path),
+            eol: detectEol(result.content),
+        };
+    }
+
+    // Whether opening a file should reuse the current lone tab instead of adding
+    // a new one. True only when there's a single tab and it's still a pristine
+    // blank "Untitled" (no path, unmodified, empty) — so opening a file into a
+    // fresh window replaces the empty tab rather than leaving it behind.
+    // `tab` is a plain snapshot: { hasPath, isClean, isEmpty }.
+    function shouldReuseBlankTab(tabCount, tab) {
+        return tabCount === 1 && !!tab && !tab.hasPath && !!tab.isClean && !!tab.isEmpty;
+    }
+
     return {
         LANGUAGES, MODE_SCRIPTS, LANG_LABELS, EXT_MODE,
         modeLabel, resolveMode, extToMode, modeForFilename, basename, detectEol, eolJoin,
-        escapeRegExp, buildSearchQuery, clampLine,
+        escapeRegExp, buildSearchQuery, clampLine, tabDescriptor, shouldReuseBlankTab,
     };
 });

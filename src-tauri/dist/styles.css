@@ -1,98 +1,198 @@
 /* src-tauri/dist/styles.css */
 
 :root {
-    --toolbar-bg: #f0f0f0;
-    --toolbar-border: #c8c8c8;
-    --tabs-bg: #e4e4e4;
-    --tab-bg: #ececec;
+    --accent: #2563eb;
+    --accent-hover: #1d4ed8;
+    --accent-fg: #ffffff;
+
+    --app-bg: #ffffff;
+    --toolbar-bg: #f6f7f9;
+    --toolbar-border: #dfe3e8;
+    --divider: #e2e6eb;
+
+    --text: #1f2328;
+    --text-muted: #626a73;
+
+    --btn-bg: #ffffff;
+    --btn-border: #d4d9df;
+    --btn-hover: #eef1f5;
+    --btn-active: #e2e7ee;
+
+    --tabs-bg: #eceff3;
+    --tab-fg: #5c636b;
     --tab-active-bg: #ffffff;
     --tab-active-fg: #1a1a1a;
-    --tab-border: #cccccc;
-    --status-bg: #f0f0f0;
-    --status-fg: #333333;
-    --status-border: #c8c8c8;
-    --app-bg: #ffffff;
+    --tab-border: #dfe3e8;
+
+    --status-bg: #f6f7f9;
+    --status-fg: #4b5259;
+    --status-border: #dfe3e8;
+    --pill-bg: #e7ecf2;
+
     --popup-bg: #ffffff;
-    --popup-fg: #1a1a1a;
-    --popup-border: #bcbcbc;
+    --popup-fg: #1f2328;
+    --popup-border: #d4d9df;
+    --input-bg: #ffffff;
+    --overlay: rgba(17, 24, 39, 0.38);
+    --shadow: 0 10px 30px rgba(17, 24, 39, 0.18);
+    --focus-ring: rgba(37, 99, 235, 0.35);
 }
 
-/* Dark chrome to match the Monokai editor theme. */
+/* Dark chrome tuned to sit next to the Monokai editor theme. */
 body.dark {
-    --toolbar-bg: #333333;
-    --toolbar-border: #1d1e19;
-    --tabs-bg: #2d2e28;
-    --tab-bg: #3a3b34;
+    --accent: #4a90e2;
+    --accent-hover: #5b9de8;
+    --accent-fg: #ffffff;
+
+    --app-bg: #272822;
+    --toolbar-bg: #2f312a;
+    --toolbar-border: #1c1d18;
+    --divider: #3d3f36;
+
+    --text: #f2f2ea;
+    --text-muted: #a6a89b;
+
+    --btn-bg: #3a3c33;
+    --btn-border: #4a4c40;
+    --btn-hover: #45473c;
+    --btn-active: #4f5144;
+
+    --tabs-bg: #23241f;
+    --tab-fg: #b0b2a4;
     --tab-active-bg: #272822;
     --tab-active-fg: #f8f8f2;
-    --tab-border: #1d1e19;
-    --status-bg: #333333;
-    --status-fg: #d4d4d4;
-    --status-border: #1d1e19;
-    --app-bg: #272822;
-    --popup-bg: #3a3b34;
-    --popup-fg: #f1f1eb;
-    --popup-border: #1d1e19;
+    --tab-border: #1c1d18;
+
+    --status-bg: #2f312a;
+    --status-fg: #c3c5b8;
+    --status-border: #1c1d18;
+    --pill-bg: #3d3f36;
+
+    --popup-bg: #33352d;
+    --popup-fg: #f2f2ea;
+    --popup-border: #14150f;
+    --input-bg: #24251f;
+    --overlay: rgba(0, 0, 0, 0.5);
+    --shadow: 0 12px 34px rgba(0, 0, 0, 0.5);
+    --focus-ring: rgba(74, 144, 226, 0.45);
 }
 
 * { box-sizing: border-box; }
 
 body {
     margin: 0;
-    font-family: -apple-system, "Segoe UI", Arial, sans-serif;
+    font-family: -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+    font-size: 13px;
+    color: var(--text);
     background-color: var(--app-bg);
     display: flex;
     flex-direction: column;
     height: 100vh;
+    /* Tell the webview to theme native controls (the GTK <select> popup on
+       Linux, scrollbars, etc.) to match the current theme. */
+    color-scheme: light;
 }
+body.dark { color-scheme: dark; }
 
+/* --- Toolbar --- */
 .toolbar {
     background-color: var(--toolbar-bg);
     border-bottom: 1px solid var(--toolbar-border);
-    padding: 4px 6px;
+    padding: 6px 8px;
     display: flex;
     align-items: center;
     flex-wrap: wrap;
-    gap: 4px;
+    gap: 6px;
     flex-shrink: 0;
 }
 
 .toolbar-group {
     display: flex;
     align-items: center;
-    gap: 2px;
+    gap: 4px;
 }
 
 .toolbar-sep {
     width: 1px;
     align-self: stretch;
-    background-color: var(--toolbar-border);
-    margin: 2px 4px;
+    background-color: var(--divider);
+    margin: 3px 3px;
 }
+
+/* Pushes everything after it to the right edge. */
+.toolbar-spacer { flex: 1 1 auto; }
 
 button,
 select {
     font: inherit;
-    font-size: 13px;
-    height: 28px;
-    padding: 0 9px;
-    background-color: #fdfdfd;
-    color: #1a1a1a;
-    border: 1px solid #bcbcbc;
-    border-radius: 4px;
+    height: 30px;
+    padding: 0 11px;
+    color: var(--text);
+    background-color: var(--btn-bg);
+    border: 1px solid var(--btn-border);
+    border-radius: 6px;
     cursor: pointer;
     vertical-align: middle;
     line-height: normal;
+    transition: background-color 0.12s ease, border-color 0.12s ease;
 }
 
-/* Keep the language dropdown the same height as the buttons. */
-select { padding-right: 6px; }
+/* Render the language dropdown from our CSS instead of the native GTK/Cocoa/
+   WinRT control, so it follows the light/dark theme on every platform. The
+   chevron is an inline SVG (offline-safe) in a neutral grey that reads on both
+   themes. */
+select {
+    max-width: 220px;
+    padding-right: 28px;
+    appearance: none;
+    -webkit-appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='none' stroke='%238a8f98' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round' d='M2.5 4.5 6 8l3.5-3.5'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 9px center;
+}
 
-button:hover { background-color: #eaeaea; }
-button:active { background-color: #dcdcdc; }
-button.active { background-color: #4a90d9; border-color: #2f6fb0; color: #ffffff; }
+button:hover { background-color: var(--btn-hover); }
+button:active { background-color: var(--btn-active); }
 
-/* Tab bar */
+/* Secondary/utility buttons read a touch lighter than the primary file actions. */
+.btn-ghost {
+    background-color: transparent;
+    border-color: transparent;
+    color: var(--text-muted);
+}
+.btn-ghost:hover { background-color: var(--btn-hover); color: var(--text); }
+.btn-ghost:active { background-color: var(--btn-active); }
+
+button.active {
+    background-color: var(--accent);
+    border-color: var(--accent);
+    color: var(--accent-fg);
+}
+button.active:hover { background-color: var(--accent-hover); }
+
+/* Keyboard focus is always visible for accessibility. */
+:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+}
+
+/* Segmented zoom control */
+.zoom-group {
+    display: inline-flex;
+    border: 1px solid var(--btn-border);
+    border-radius: 6px;
+    overflow: hidden;
+}
+.zoom-group button {
+    border: none;
+    border-radius: 0;
+    height: 28px;
+    padding: 0 9px;
+    background-color: var(--btn-bg);
+}
+.zoom-group button + button { border-left: 1px solid var(--btn-border); }
+
+/* --- Tab bar --- */
 .tabs-container {
     display: flex;
     background-color: var(--tabs-bg);
@@ -102,32 +202,39 @@ button.active { background-color: #4a90d9; border-color: #2f6fb0; color: #ffffff
 }
 
 .tab {
-    padding: 6px 14px;
-    background-color: var(--tab-bg);
+    padding: 7px 14px;
     border-right: 1px solid var(--tab-border);
+    border-top: 2px solid transparent;
     cursor: pointer;
     user-select: none;
     display: flex;
     align-items: center;
     white-space: nowrap;
-    font-size: 13px;
-    color: var(--status-fg);
+    color: var(--tab-fg);
+    transition: background-color 0.12s ease, color 0.12s ease;
 }
+
+.tab:hover { color: var(--tab-active-fg); }
 
 .tab.active {
     background-color: var(--tab-active-bg);
     color: var(--tab-active-fg);
+    border-top-color: var(--accent);
 }
 
 .tab-close {
     margin-left: 10px;
-    color: #888;
+    width: 16px;
+    height: 16px;
+    line-height: 15px;
+    text-align: center;
+    border-radius: 4px;
+    color: var(--text-muted);
     font-weight: bold;
-    cursor: pointer;
 }
+.tab-close:hover { color: #fff; background-color: #e5534b; }
 
-.tab-close:hover { color: #ff5555; }
-
+/* --- Editor --- */
 #editor-container {
     flex-grow: 1;
     min-height: 0;
@@ -136,10 +243,11 @@ button.active { background-color: #4a90d9; border-color: #2f6fb0; color: #ffffff
 
 .CodeMirror {
     height: 100%;
-    font-family: "Cascadia Code", "Consolas", "Courier New", monospace;
+    font-family: "Cascadia Code", "JetBrains Mono", "Consolas", "Courier New", monospace;
+    line-height: 1.5;
 }
 
-/* Status bar */
+/* --- Status bar --- */
 .statusbar {
     display: flex;
     align-items: center;
@@ -147,7 +255,7 @@ button.active { background-color: #4a90d9; border-color: #2f6fb0; color: #ffffff
     background-color: var(--status-bg);
     color: var(--status-fg);
     border-top: 1px solid var(--status-border);
-    padding: 3px 12px;
+    padding: 4px 12px;
     font-size: 12px;
     flex-shrink: 0;
     white-space: nowrap;
@@ -156,24 +264,32 @@ button.active { background-color: #4a90d9; border-color: #2f6fb0; color: #ffffff
 
 .statusbar .status-spacer { flex: 1; }
 
-/* --- Popups (Find/Replace + Go to line) --- */
+.status-pill {
+    padding: 1px 9px;
+    border-radius: 999px;
+    background-color: var(--pill-bg);
+    color: var(--text);
+    font-size: 11px;
+}
+
+/* --- Popups (Find/Replace + Go to line + About) --- */
 .hidden { display: none !important; }
 
 .popup-panel {
     position: fixed;
-    top: 88px;
+    top: 92px;
     right: 18px;
     z-index: 50;
     display: flex;
     flex-direction: column;
-    gap: 6px;
-    min-width: 340px;
-    padding: 10px;
+    gap: 8px;
+    min-width: 350px;
+    padding: 12px;
     background-color: var(--popup-bg);
     color: var(--popup-fg);
     border: 1px solid var(--popup-border);
-    border-radius: 7px;
-    box-shadow: 0 8px 28px rgba(0, 0, 0, 0.32);
+    border-radius: 10px;
+    box-shadow: var(--shadow);
 }
 
 .popup-row {
@@ -185,25 +301,31 @@ button.active { background-color: #4a90d9; border-color: #2f6fb0; color: #ffffff
 .popup-panel input[type="text"],
 .popup-modal input {
     flex: 1;
-    height: 28px;
-    padding: 0 8px;
+    height: 30px;
+    padding: 0 9px;
     font: inherit;
-    font-size: 13px;
-    background-color: #ffffff;
-    color: #1a1a1a;
+    color: var(--popup-fg);
+    background-color: var(--input-bg);
     border: 1px solid var(--popup-border);
-    border-radius: 4px;
+    border-radius: 6px;
+}
+.popup-panel input:focus,
+.popup-modal input:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px var(--focus-ring);
 }
 
 .popup-options {
     font-size: 12px;
     gap: 14px;
+    color: var(--text-muted);
 }
 
 .popup-options label {
     display: flex;
     align-items: center;
-    gap: 4px;
+    gap: 5px;
     cursor: pointer;
 }
 
@@ -213,10 +335,14 @@ button.active { background-color: #4a90d9; border-color: #2f6fb0; color: #ffffff
     opacity: 0.85;
 }
 
-.popup-close { color: #999; }
-.popup-close:hover { color: #ff5555; }
+.popup-close {
+    color: var(--text-muted);
+    background: transparent;
+    border-color: transparent;
+}
+.popup-close:hover { color: #fff; background-color: #e5534b; }
 
-/* Go-to-line modal */
+/* Overlays (Go-to-line + About) */
 .popup-overlay {
     position: fixed;
     inset: 0;
@@ -224,20 +350,122 @@ button.active { background-color: #4a90d9; border-color: #2f6fb0; color: #ffffff
     display: flex;
     align-items: center;
     justify-content: center;
-    background-color: rgba(0, 0, 0, 0.35);
+    background-color: var(--overlay);
 }
 
 .popup-modal {
     display: flex;
     flex-direction: column;
-    gap: 10px;
-    min-width: 240px;
-    padding: 18px;
+    gap: 12px;
+    min-width: 260px;
+    padding: 20px;
     background-color: var(--popup-bg);
     color: var(--popup-fg);
     border: 1px solid var(--popup-border);
-    border-radius: 8px;
-    box-shadow: 0 12px 34px rgba(0, 0, 0, 0.4);
+    border-radius: 12px;
+    box-shadow: var(--shadow);
 }
 
 .popup-modal .popup-row { justify-content: flex-end; }
+
+/* --- About dialog --- */
+.about-modal {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    width: 420px;
+    max-width: calc(100vw - 32px);
+    padding: 24px;
+    background-color: var(--popup-bg);
+    color: var(--popup-fg);
+    border: 1px solid var(--popup-border);
+    border-radius: 14px;
+    box-shadow: var(--shadow);
+}
+
+.about-close {
+    position: absolute;
+    top: 12px;
+    right: 12px;
+    height: 26px;
+    padding: 0 8px;
+}
+
+.about-header {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+}
+
+.about-icon {
+    font-size: 40px;
+    line-height: 1;
+}
+
+.about-name {
+    margin: 0;
+    font-size: 21px;
+    font-weight: 650;
+}
+
+.about-version {
+    margin: 3px 0 0;
+    font-size: 12px;
+    color: var(--text-muted);
+}
+
+.about-tagline {
+    margin: 0;
+    color: var(--text-muted);
+    line-height: 1.5;
+}
+
+.about-meta {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 6px 14px;
+    margin: 2px 0 0;
+    font-size: 13px;
+}
+.about-meta dt { color: var(--text-muted); }
+.about-meta dd { margin: 0; }
+
+.about-modal a.ext-link {
+    color: var(--accent);
+    text-decoration: none;
+    cursor: pointer;
+}
+.about-modal a.ext-link:hover { text-decoration: underline; }
+
+.about-actions {
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+    margin-top: 4px;
+}
+
+/* "Report a bug" is a button styled as a link so it can trigger open_external. */
+button.ext-link {
+    background: transparent;
+    border-color: transparent;
+    color: var(--accent);
+    padding: 0 4px;
+}
+button.ext-link:hover { background: transparent; text-decoration: underline; }
+
+#aboutOkBtn {
+    background-color: var(--accent);
+    border-color: var(--accent);
+    color: var(--accent-fg);
+}
+#aboutOkBtn:hover { background-color: var(--accent-hover); }
+
+.about-copyright {
+    margin: 0;
+    padding-top: 12px;
+    border-top: 1px solid var(--divider);
+    font-size: 11px;
+    color: var(--text-muted);
+    text-align: center;
+}

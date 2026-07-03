@@ -102,6 +102,23 @@ test('every deb/rpm bundle file source exists and desktopTemplate resolves', () 
     }
 });
 
+test('AppImage installs app-id-named icons so linuxdeploy can resolve Icon=', () => {
+    // Regression guard: Tauri sets the AppImage .desktop Icon= to the app-id, but
+    // names the icons it copies after the binary/product. Without app-id-named
+    // icons in the AppDir, linuxdeploy aborts with "Could not find suitable icon".
+    const appimage = tauriConf.bundle.linux.appimage;
+    assert.ok(appimage && appimage.files, 'bundle.linux.appimage.files must exist');
+    const entries = Object.entries(appimage.files);
+    assert.ok(entries.length > 0, 'appimage must install at least one icon');
+    for (const [dest, src] of entries) {
+        assert.ok(fs.existsSync(path.join(ROOT, src)), `appimage icon source missing: ${src}`);
+        assert.ok(
+            dest.includes('/icons/hicolor/') && dest.endsWith(`/${APP_ID}.png`),
+            `appimage icon must be app-id-named under hicolor: ${dest}`,
+        );
+    }
+});
+
 test('Cargo.toml declares the GPL-3.0-or-later license', () => {
     assert.match(cargoToml, /^license\s*=\s*"GPL-3\.0-or-later"/m);
 });

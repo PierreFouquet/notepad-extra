@@ -37,14 +37,6 @@ jobs:
           - platform: "windows-11-arm"
             rust-target: "aarch64-pc-windows-msvc"
             args: "--bundles nsis"
-          # Linux — x86_64 (Debian/Ubuntu .deb, Fedora .rpm, universal AppImage)
-          - platform: "ubuntu-22.04"
-            rust-target: ""
-            args: "--bundles deb,rpm,appimage"
-          # Linux — aarch64 (deb + rpm + AppImage), native ARM runner
-          - platform: "ubuntu-22.04-arm"
-            rust-target: ""
-            args: "--bundles deb,rpm,appimage"
 
     runs-on: ${{ matrix.platform }}
     steps:
@@ -59,19 +51,6 @@ jobs:
         uses: swatinem/rust-cache@v2
         with:
           key: ${{ matrix.platform }}
-
-      - name: install dependencies (Linux only)
-        if: startsWith(matrix.platform, 'ubuntu')
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev \
-            build-essential curl wget file \
-            libssl-dev \
-            libayatana-appindicator3-dev \
-            librsvg2-dev \
-            patchelf \
-            libfuse2
 
       - uses: tauri-apps/tauri-action@v1
         env:
@@ -89,6 +68,87 @@ jobs:
           releaseDraft: ${{ github.event_name == 'workflow_dispatch' }}
           prerelease: false
           args: ${{ matrix.args }}
+
+  # Linux is split out so each bundle is produced by its own step. A single
+  # `tauri build --bundles deb,rpm,appimage` is all-or-nothing: if AppImage fails,
+  # tauri-action exits non-zero and uploads *nothing*, discarding the deb/rpm that
+  # already built. Splitting keeps deb/rpm shipping even when AppImage breaks
+  # (AppImage leans on linuxdeploy + plugins fetched from upstream master/continuous,
+  # which can regress independently of this repo). One compile is shared across the
+  # three steps via the cargo target dir.
+  publish-linux:
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: ["ubuntu-22.04", "ubuntu-22.04-arm"]
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.platform }}
+
+      - name: install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential curl wget file \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libfuse2
+
+      - name: Bundle .deb
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          releaseId: ${{ github.event.release.id }}
+          tagName: ${{ github.event.release.tag_name || 'v__VERSION__' }}
+          releaseName: "Notepad Extra ${{ github.event.release.tag_name || 'v__VERSION__' }}"
+          releaseBody: "See the assets below to download and install Notepad Extra."
+          releaseDraft: ${{ github.event_name == 'workflow_dispatch' }}
+          prerelease: false
+          args: --bundles deb
+
+      - name: Bundle .rpm
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          releaseId: ${{ github.event.release.id }}
+          tagName: ${{ github.event.release.tag_name || 'v__VERSION__' }}
+          releaseName: "Notepad Extra ${{ github.event.release.tag_name || 'v__VERSION__' }}"
+          releaseBody: "See the assets below to download and install Notepad Extra."
+          releaseDraft: ${{ github.event_name == 'workflow_dispatch' }}
+          prerelease: false
+          args: --bundles rpm
+
+      # Isolated: a linuxdeploy failure here must not fail the job or discard the
+      # deb/rpm uploaded above. Still visible as a failed step in the Actions UI.
+      - name: Bundle AppImage
+        continue-on-error: true
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          releaseId: ${{ github.event.release.id }}
+          tagName: ${{ github.event.release.tag_name || 'v__VERSION__' }}
+          releaseName: "Notepad Extra ${{ github.event.release.tag_name || 'v__VERSION__' }}"
+          releaseBody: "See the assets below to download and install Notepad Extra."
+          releaseDraft: ${{ github.event_name == 'workflow_dispatch' }}
+          prerelease: false
+          args: --bundles appimage
 
   # Adds a "which file do I download?" table to the published release notes so
   # users can pick the right bundle. Runs once, independent of the build jobs.

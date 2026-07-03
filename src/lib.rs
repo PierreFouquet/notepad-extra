@@ -1,6 +1,17 @@
 use std::fs;
 use std::path::Path;
 
+/// Whether `url` is safe to hand to the OS URL handler for the About dialog's
+/// external links. It must be an `https` URL with an actual host and no control
+/// characters or whitespace — belt-and-braces even though the URL is passed to
+/// the launcher as a single argument (never through a shell).
+pub fn is_safe_external_url(url: &str) -> bool {
+    const PREFIX: &str = "https://";
+    url.starts_with(PREFIX)
+        && url.len() > PREFIX.len()
+        && !url.chars().any(|c| c.is_control() || c.is_whitespace())
+}
+
 /// Read a file at `path` and return a JSON object with `path` and `content`.
 pub fn read_file_at(path: &Path) -> Result<serde_json::Value, String> {
     match fs::read_to_string(path) {
@@ -120,6 +131,37 @@ mod tests {
         let raw = fs::read(&file_path).expect("read raw bytes");
         assert_eq!(raw, content.as_bytes());
         assert_eq!(read_file_at(&file_path).unwrap()["content"], content);
+    }
+
+    #[test]
+    fn test_is_safe_external_url_accepts_https() {
+        assert!(is_safe_external_url("https://github.com/PierreFouquet/notepad-extra"));
+        assert!(is_safe_external_url(
+            "https://github.com/PierreFouquet/notepad-extra/issues/new/choose"
+        ));
+    }
+
+    #[test]
+    fn test_is_safe_external_url_rejects_non_https_schemes() {
+        assert!(!is_safe_external_url("http://example.com"));
+        assert!(!is_safe_external_url("file:///etc/passwd"));
+        assert!(!is_safe_external_url("javascript:alert(1)"));
+        assert!(!is_safe_external_url("ftp://example.com"));
+        assert!(!is_safe_external_url("HTTPS://example.com")); // scheme is case-sensitive here
+    }
+
+    #[test]
+    fn test_is_safe_external_url_rejects_empty_and_bare_scheme() {
+        assert!(!is_safe_external_url(""));
+        assert!(!is_safe_external_url("https://")); // no host
+    }
+
+    #[test]
+    fn test_is_safe_external_url_rejects_whitespace_and_control_chars() {
+        assert!(!is_safe_external_url("https://exa mple.com"));
+        assert!(!is_safe_external_url("https://example.com\n"));
+        assert!(!is_safe_external_url("https://example.com\t/x"));
+        assert!(!is_safe_external_url("https://example.com\u{0000}"));
     }
 
     #[test]

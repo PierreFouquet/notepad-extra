@@ -45,6 +45,13 @@ const gotoInput = document.getElementById('gotoInput');
 const gotoGoBtn = document.getElementById('gotoGoBtn');
 const gotoCancelBtn = document.getElementById('gotoCancelBtn');
 
+// About dialog
+const aboutBtn = document.getElementById('aboutBtn');
+const aboutOverlay = document.getElementById('aboutOverlay');
+const aboutCloseBtn = document.getElementById('aboutCloseBtn');
+const aboutOkBtn = document.getElementById('aboutOkBtn');
+const aboutVersion = document.getElementById('aboutVersion');
+
 // --- Persisted settings ---
 let theme = localStorage.getItem('ne.theme') || 'default'; // 'default' (light) | 'monokai' (dark)
 let wrap = localStorage.getItem('ne.wrap') === '1';
@@ -321,6 +328,48 @@ function doGoto() {
     closeGoto();
 }
 
+// --- About dialog ---
+let aboutVersionLoaded = false;
+
+async function openAbout() {
+    aboutOverlay.classList.remove('hidden');
+    if (!aboutVersionLoaded) {
+        try {
+            aboutVersion.textContent = await invoke('app_version');
+        } catch (error) {
+            aboutVersion.textContent = 'unknown';
+            console.error('Could not read app version:', error);
+        }
+        aboutVersionLoaded = true;
+    }
+    aboutOkBtn.focus();
+}
+
+function closeAbout() {
+    aboutOverlay.classList.add('hidden');
+    editor.focus();
+}
+
+function aboutIsOpen() { return !aboutOverlay.classList.contains('hidden'); }
+
+// Open external https links in the user's own browser (the app never fetches
+// anything itself). URLs are declared via data-url on .ext-link elements.
+async function openExternal(url) {
+    try {
+        await invoke('open_external', { url });
+    } catch (error) {
+        console.error('Could not open URL:', url, error);
+    }
+}
+
+document.querySelectorAll('.ext-link').forEach((el) => {
+    el.addEventListener('click', (e) => {
+        e.preventDefault();
+        const url = el.getAttribute('data-url');
+        if (url) openExternal(url);
+    });
+});
+
 // --- Event listeners ---
 languageSelect.addEventListener('change', () => {
     const tab = getActiveTab();
@@ -363,6 +412,11 @@ gotoInput.addEventListener('keydown', (e) => {
 });
 gotoOverlay.addEventListener('mousedown', (e) => { if (e.target === gotoOverlay) closeGoto(); });
 
+aboutBtn.addEventListener('click', openAbout);
+aboutCloseBtn.addEventListener('click', closeAbout);
+aboutOkBtn.addEventListener('click', closeAbout);
+aboutOverlay.addEventListener('mousedown', (e) => { if (e.target === aboutOverlay) closeAbout(); });
+
 wrapBtn.addEventListener('click', () => { wrap = !wrap; applyWrap(); });
 themeBtn.addEventListener('click', () => { theme = theme === 'monokai' ? 'default' : 'monokai'; applyTheme(); });
 zoomInBtn.addEventListener('click', () => { fontSize += 1; applyFontSize(); });
@@ -373,6 +427,7 @@ zoomResetBtn.addEventListener('click', () => { fontSize = 14; applyFontSize(); }
 document.addEventListener('keydown', (e) => {
     if (e.key === 'F3') { e.preventDefault(); doFind(!e.shiftKey); return; }
     if (e.key === 'Escape') {
+        if (aboutIsOpen()) { closeAbout(); return; }
         if (findIsOpen()) { closeFind(); return; }
         if (!gotoOverlay.classList.contains('hidden')) { closeGoto(); return; }
     }

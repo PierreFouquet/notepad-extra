@@ -8,15 +8,24 @@ built with Rust and [Tauri](https://tauri.app/). Inspired by Notepad++.
 - Cross-platform: Windows (x64 + ARM64), macOS (Intel + Apple Silicon), Linux (x64 + ARM64)
 - **Works fully offline** — CodeMirror is vendored locally, no network access at runtime
 - Tabbed editing with unsaved-change indicators
-- Syntax highlighting: Plain Text, JavaScript, JSON, Rust, Python, C, C++, Java, Markdown, HTML, XML, CSS, Shell, YAML
+- **Syntax highlighting for 80+ languages** — C/C++/C#, Java, JavaScript/TypeScript/JSX, Python, Go, Rust, Ruby, PHP, Swift, Kotlin, HTML/CSS/SCSS, Markdown, SQL, YAML/TOML, shell, PowerShell, Haskell, and many more, grouped in the language menu (all modes vendored locally)
+- Automatic language detection from the file extension
 - **Find / Replace / Go-to-line** (`Ctrl+F` / `Ctrl+H` / `Ctrl+G`, `F3` for next) with regex & case options
 - **Word wrap** toggle
 - **Zoom** the editor font (`Ctrl++` / `Ctrl+-` / `Ctrl+0`)
 - **Light / Dark theme** toggle (remembers your choice, along with wrap & zoom)
 - **Status bar**: line/column, selection length, document length & line count, EOL style, encoding
+- **About dialog** with version, license and links (opens in your own browser; the app never fetches anything itself)
 - Preserves a file's original line endings (LF / CRLF) on save
 - Open / Save / **Save As** with broad file-type filters
 - Line numbers, bracket matching, active-line highlight
+
+### Adding a language
+
+All languages are defined in one table — `LANGUAGES` in [`src-tauri/dist/logic.js`](src-tauri/dist/logic.js).
+Add a row (value, label, group, extensions), drop the matching CodeMirror mode file
+under `src-tauri/dist/vendor/codemirror/mode/`, add it to `MODE_SCRIPTS`, then run
+`node scripts/gen-index.js` to regenerate the dropdown and `<script>` tags in `index.html`.
 
 ## Keyboard shortcuts
 

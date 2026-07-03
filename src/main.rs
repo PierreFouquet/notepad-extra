@@ -1,23 +1,15 @@
 use tauri::command;
 use tauri_plugin_dialog::DialogExt;
-use notepad_extra::{read_file_at, write_file_at};
-
-/// Extensions offered in the "Text & Code" dialog filter.
-const TEXT_EXTS: &[&str] = &[
-    "txt", "md", "markdown", "rs", "js", "mjs", "cjs", "ts", "jsx", "json",
-    "py", "pyw", "c", "h", "cpp", "cc", "cxx", "hpp", "hxx", "java",
-    "html", "htm", "xml", "svg", "xaml", "css", "sh", "bash", "zsh",
-    "yml", "yaml", "log", "ini", "toml", "cfg", "conf",
-];
+use notepad_extra::{is_safe_external_url, read_file_at, write_file_at};
 
 #[command]
 async fn open_file(app: tauri::AppHandle) -> Result<Option<serde_json::Value>, String> {
     // Because this command is `async`, it runs on a background thread.
     // blocking_pick_file will safely pause this thread without freezing the UI!
+    // No filter is applied, so every file is shown (including extension-less
+    // ones like `Dockerfile` that a glob filter could never match).
     let file_path = app.dialog()
         .file()
-        .add_filter("Text & Code Files", TEXT_EXTS)
-        .add_filter("All Files", &["*"])
         .blocking_pick_file();
 
     match file_path {
@@ -63,16 +55,60 @@ async fn save_file_as(
 fn prompt_save_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
     app.dialog()
         .file()
-        .add_filter("Text & Code Files", TEXT_EXTS)
-        .add_filter("All Files", &["*"])
         .blocking_save_file()
         .and_then(|fp| fp.into_path().ok())
+}
+
+/// The application version, taken from Cargo.toml at compile time so the About
+/// dialog never drifts from the real build.
+#[command]
+fn app_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
+}
+
+/// Hand an https URL to the operating system so it opens in the user's own
+/// browser. The app itself makes no network requests — this only launches the
+/// platform URL handler. Only `https` links are accepted, and the URL is passed
+/// as a single argument (never through a shell), so it cannot inject commands.
+#[command]
+fn open_external(url: String) -> Result<(), String> {
+    if !is_safe_external_url(&url) {
+        return Err("refusing to open unsafe or non-https URL".into());
+    }
+
+    #[cfg(target_os = "linux")]
+    let mut cmd = {
+        let mut c = std::process::Command::new("xdg-open");
+        c.arg(&url);
+        c
+    };
+    #[cfg(target_os = "macos")]
+    let mut cmd = {
+        let mut c = std::process::Command::new("open");
+        c.arg(&url);
+        c
+    };
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        // rundll32 passes the URL straight to the default handler without a shell.
+        let mut c = std::process::Command::new("rundll32.exe");
+        c.arg("url.dll,FileProtocolHandler").arg(&url);
+        c
+    };
+
+    cmd.spawn().map(|_| ()).map_err(|e| format!("Failed to open URL: {}", e))
 }
 
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![open_file, save_file, save_file_as])
+        .invoke_handler(tauri::generate_handler![
+            open_file,
+            save_file,
+            save_file_as,
+            app_version,
+            open_external
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

@@ -39,7 +39,7 @@ body:
     attributes:
       label: App version
       description: See the release you downloaded, or the title bar / About.
-      placeholder: "0.2.0"
+      placeholder: "0.3.4"
     validations:
       required: true
   - type: dropdown

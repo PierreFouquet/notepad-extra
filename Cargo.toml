@@ -1,7 +1,13 @@
 [package]
 name = "notepad-extra"
-version = "0.3.4"
+version = "0.4.0"
 edition = "2024"
+description = "Small, fast, fully offline text and code editor. Inspired by Notepad++."
+authors = ["Pierre Fouquet"]
+license = "GPL-3.0-or-later"
+homepage = "https://github.com/PierreFouquet/notepad-extra"
+repository = "https://github.com/PierreFouquet/notepad-extra"
+readme = "README.md"
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }

@@ -108,4 +108,4 @@ tests/                # Rust integration tests + frontend logic tests
 
 ## License
 
-Licensed under the GPL-3.0 License — see [LICENSE](LICENSE) for details.
+Licensed under the GPL-3.0-or-later License — see [LICENSE](LICENSE) for details.

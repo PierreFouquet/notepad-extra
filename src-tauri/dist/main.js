@@ -189,17 +189,42 @@ function applySaveResult(tab, result) {
 }
 
 // --- File commands ---
+// Open a tab from a backend read result ({ path, content }). Shared by the Open
+// command and drag-and-drop so both produce identical tabs.
+// If the only open tab is a pristine blank "Untitled", the opened file replaces
+// it instead of being added alongside it.
+function openTabFromResult(result) {
+    const d = L.tabDescriptor(result);
+    const only = tabs.length === 1 ? tabs[0] : null;
+    if (only && L.shouldReuseBlankTab(tabs.length, {
+        hasPath: !!only.path,
+        isClean: only.doc.isClean(),
+        isEmpty: only.doc.getValue() === '',
+    })) {
+        tabs = tabs.filter(t => t.id !== only.id);
+    }
+    createTab(d.name, d.path, d.content, d.mode, d.eol);
+}
+
 async function doOpen() {
     try {
         const result = await invoke('open_file');
-        if (result) {
-            createTab(
-                L.basename(result.path), result.path, result.content,
-                L.modeForFilename(result.path), L.detectEol(result.content),
-            );
-        }
+        if (result) openTabFromResult(result);
     } catch (error) {
         console.error('Error opening file:', error);
+    }
+}
+
+// Open each dropped filesystem path in its own tab. Paths that can't be read
+// (directories, binary/non-UTF-8 files) are skipped, not fatal to the batch.
+async function openPaths(paths) {
+    for (const path of paths) {
+        try {
+            const result = await invoke('read_file', { path });
+            if (result) openTabFromResult(result);
+        } catch (error) {
+            console.error('Could not open dropped file:', path, error);
+        }
     }
 }
 
@@ -444,6 +469,30 @@ document.addEventListener('keydown', (e) => {
         case '0': e.preventDefault(); fontSize = 14; applyFontSize(); break;
     }
 });
+
+// --- Drag & drop ---
+// Tauri delivers OS file drops to the webview with real filesystem paths; the
+// overlay gives visual feedback while dragging. onDragDropEvent is the canonical
+// Tauri v2 API and reports enter/over/leave/drop phases.
+(function initDragDrop() {
+    const wv = window.__TAURI__ && window.__TAURI__.webview;
+    if (!wv || typeof wv.getCurrentWebview !== 'function') return;
+    const overlay = document.getElementById('dropOverlay');
+    const showOverlay = (on) => { if (overlay) overlay.classList.toggle('visible', on); };
+
+    wv.getCurrentWebview().onDragDropEvent((event) => {
+        const p = event.payload || {};
+        if (p.type === 'enter' || p.type === 'over') {
+            showOverlay(true);
+        } else if (p.type === 'leave') {
+            showOverlay(false);
+        } else if (p.type === 'drop') {
+            showOverlay(false);
+            const paths = p.paths || [];
+            if (paths.length) openPaths(paths);
+        }
+    }).catch((error) => console.error('Could not init drag-and-drop:', error));
+})();
 
 // --- Init ---
 applyTheme();

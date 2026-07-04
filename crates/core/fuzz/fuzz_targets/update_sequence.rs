@@ -11,19 +11,21 @@ use std::path::PathBuf;
 // Built here rather than deriving `Arbitrary` on the core types, so the core
 // stays dependency-free.
 fn arb_message(u: &mut Unstructured) -> arbitrary::Result<Message> {
-    Ok(match u.int_in_range(0u8..=9)? {
+    Ok(match u.int_in_range(0u8..=11)? {
         0 => Message::NewTab,
         1 => Message::OpenRequested,
         2 => Message::SaveRequested,
         3 => Message::SaveAsRequested,
         4 => Message::Edited(String::arbitrary(u)?),
-        5 => Message::TabSelected(u.int_in_range(0usize..=8)?),
-        6 => Message::TabClosed(u.int_in_range(0usize..=8)?),
-        7 => Message::FileLoaded {
+        5 => Message::Undo,
+        6 => Message::Redo,
+        7 => Message::TabSelected(u.int_in_range(0usize..=8)?),
+        8 => Message::TabClosed(u.int_in_range(0usize..=8)?),
+        9 => Message::FileLoaded {
             path: PathBuf::from(String::arbitrary(u)?),
             content: String::arbitrary(u)?,
         },
-        8 => Message::SavePathChosen {
+        10 => Message::SavePathChosen {
             id: TabId::arbitrary(u)?,
             path: PathBuf::from(String::arbitrary(u)?),
         },

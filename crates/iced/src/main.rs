@@ -35,6 +35,8 @@ enum Message {
     Open,
     Save,
     SaveAs,
+    Undo,
+    Redo,
     TabSelected(usize),
     TabClosed(usize),
     /// The `text_editor` widget produced an action (typing, cursor move, …).
@@ -94,6 +96,10 @@ impl Shell {
             Message::Open => self.apply_core(core::Message::OpenRequested, false),
             Message::Save => self.apply_core(core::Message::SaveRequested, false),
             Message::SaveAs => self.apply_core(core::Message::SaveAsRequested, false),
+            // Undo/redo rewrite the buffer in the core, so resync the editor from
+            // it. Keyboard accelerators (Ctrl+Z / Ctrl+Y) are wired in #39.
+            Message::Undo => self.apply_core(core::Message::Undo, true),
+            Message::Redo => self.apply_core(core::Message::Redo, true),
             Message::TabSelected(i) => self.apply_core(core::Message::TabSelected(i), true),
             Message::TabClosed(i) => self.apply_core(core::Message::TabClosed(i), true),
 
@@ -205,12 +211,14 @@ impl Shell {
             button("Open").on_press(Message::Open),
             button("Save").on_press(Message::Save),
             button("Save As").on_press(Message::SaveAs),
+            button("Undo").on_press(Message::Undo),
+            button("Redo").on_press(Message::Redo),
         ]
         .spacing(6);
 
         let mut tabs = row![].spacing(4);
         for (i, doc) in self.core.docs.iter().enumerate() {
-            let label = if doc.dirty {
+            let label = if doc.dirty() {
                 format!("{} \u{2022}", doc.title())
             } else {
                 doc.title().to_string()
@@ -256,7 +264,7 @@ impl Shell {
 /// is only the initial value.
 fn window_title(core: &core::State) -> String {
     let doc = core.active_doc();
-    let dot = if doc.dirty { "\u{2022} " } else { "" };
+    let dot = if doc.dirty() { "\u{2022} " } else { "" };
     format!("{dot}{} — Notepad Extra", doc.title())
 }
 
@@ -307,9 +315,9 @@ mod tests {
     #[test]
     fn typing_marks_the_document_dirty() {
         let (mut shell, _) = Shell::new();
-        assert!(!shell.core.active_doc().dirty);
+        assert!(!shell.core.active_doc().dirty());
         let _ = shell.update(Message::Edit(paste("hello")));
-        assert!(shell.core.active_doc().dirty);
+        assert!(shell.core.active_doc().dirty());
         assert_eq!(shell.core.active_doc().content.trim_end(), "hello");
     }
 
@@ -318,7 +326,7 @@ mod tests {
         let (mut shell, _) = Shell::new();
         let move_action = text_editor::Action::Move(text_editor::Motion::Right);
         let _ = shell.update(Message::Edit(move_action));
-        assert!(!shell.core.active_doc().dirty);
+        assert!(!shell.core.active_doc().dirty());
     }
 
     #[test]
@@ -370,7 +378,32 @@ mod tests {
             path: PathBuf::from("/tmp/new.py"),
             result: Ok(()),
         });
-        assert!(!shell.core.active_doc().dirty);
+        assert!(!shell.core.active_doc().dirty());
         assert_eq!(shell.core.active_doc().language, "Python");
+    }
+
+    #[test]
+    fn undo_then_redo_resyncs_the_editor_buffer() {
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::Edit(paste("hello")));
+        assert_eq!(shell.editor.text().trim_end(), "hello");
+
+        let _ = shell.update(Message::Undo);
+        assert_eq!(shell.editor.text().trim_end(), "");
+        assert!(!shell.core.active_doc().dirty());
+
+        let _ = shell.update(Message::Redo);
+        assert_eq!(shell.editor.text().trim_end(), "hello");
+        assert!(shell.core.active_doc().dirty());
+    }
+
+    #[test]
+    fn undo_with_nothing_to_undo_is_harmless() {
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::Undo);
+        let _ = shell.update(Message::Redo);
+        assert_eq!(shell.editor.text().trim_end(), "");
+        assert!(!shell.core.active_doc().dirty());
+        assert_eq!(shell.core.docs.len(), 1);
     }
 }

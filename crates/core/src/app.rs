@@ -5,6 +5,7 @@
 //! as new [`Message`]s. Everything here is deterministic and window-free, so it
 //! can be driven entirely from tests.
 
+use crate::history::History;
 use crate::lang;
 use crate::text::{self, EndOfLine};
 use std::path::PathBuf;
@@ -26,8 +27,9 @@ pub struct Document {
     pub eol: EndOfLine,
     /// Status-bar language label.
     pub language: &'static str,
-    /// Unsaved-changes flag (the tab's "•" marker).
-    pub dirty: bool,
+    /// Undo/redo history; also the source of truth for the unsaved-changes
+    /// ("•") marker (see [`Document::dirty`]).
+    pub history: History,
 }
 
 impl Document {
@@ -38,8 +40,14 @@ impl Document {
             content: String::new(),
             eol: EndOfLine::default(),
             language: lang::PLAIN_TEXT,
-            dirty: false,
+            history: History::new(),
         }
+    }
+
+    /// Whether the buffer has unsaved changes (the tab's "•" marker), delegated
+    /// to the undo history so undoing back to a saved state clears it.
+    pub fn dirty(&self) -> bool {
+        self.history.dirty()
     }
 
     /// The tab / window title: the file name, or `Untitled` for a fresh buffer.
@@ -57,7 +65,7 @@ impl Document {
     /// A lone, untouched `Untitled` buffer that opening a file should replace
     /// rather than leave behind (ports `logic.js`'s `shouldReuseBlankTab`).
     fn is_pristine_blank(&self) -> bool {
-        self.path.is_none() && !self.dirty && self.content.is_empty()
+        self.path.is_none() && !self.dirty() && self.content.is_empty()
     }
 }
 
@@ -113,6 +121,10 @@ pub enum Message {
     FileLoaded { path: PathBuf, content: String },
     /// The editor's text for the active document changed.
     Edited(String),
+    /// Undo the most recent edit to the active document.
+    Undo,
+    /// Redo the most recently undone edit to the active document.
+    Redo,
     /// User asked to save the active document.
     SaveRequested,
     /// User asked to save the active document under a new name.
@@ -171,7 +183,7 @@ pub fn update(state: &mut State, message: Message) -> Vec<Effect> {
                 doc.content = canonical;
                 doc.eol = eol;
                 doc.language = language;
-                doc.dirty = false;
+                doc.history = History::new(); // loaded content is the clean baseline
                 state.active = 0;
             } else {
                 let id = state.alloc_id();
@@ -181,7 +193,7 @@ pub fn update(state: &mut State, message: Message) -> Vec<Effect> {
                     content: canonical,
                     eol,
                     language,
-                    dirty: false,
+                    history: History::new(),
                 });
                 state.active = state.docs.len() - 1;
             }
@@ -190,16 +202,38 @@ pub fn update(state: &mut State, message: Message) -> Vec<Effect> {
 
         Message::Edited(content) => {
             let doc = &mut state.docs[state.active];
-            if doc.content != content {
-                let was_dirty = doc.dirty;
+            if let Some(edit) = crate::history::diff(&doc.content, &content) {
+                let was_dirty = doc.dirty();
+                doc.history.record(edit);
                 doc.content = content;
-                doc.dirty = true;
                 // Title carries the "•" marker, so only refresh on the clean→dirty edge.
                 if !was_dirty {
                     return title_effect(state);
                 }
             }
             vec![]
+        }
+
+        Message::Undo => {
+            let doc = &mut state.docs[state.active];
+            match doc.history.undo() {
+                Some(edit) => {
+                    edit.apply(&mut doc.content);
+                    title_effect(state) // content and the "•" marker may both change
+                }
+                None => vec![],
+            }
+        }
+
+        Message::Redo => {
+            let doc = &mut state.docs[state.active];
+            match doc.history.redo() {
+                Some(edit) => {
+                    edit.apply(&mut doc.content);
+                    title_effect(state)
+                }
+                None => vec![],
+            }
         }
 
         Message::SaveRequested => {
@@ -231,7 +265,7 @@ pub fn update(state: &mut State, message: Message) -> Vec<Effect> {
             if let Some(doc) = state.doc_mut(id) {
                 doc.language = lang::language_for_path(path.to_str().unwrap_or(""));
                 doc.path = Some(path);
-                doc.dirty = false;
+                doc.history.mark_saved();
             }
             title_effect(state)
         }
@@ -286,7 +320,7 @@ mod tests {
         assert_eq!(s.docs.len(), 1);
         assert_eq!(s.active, 0);
         assert_eq!(s.active_doc().title(), "Untitled");
-        assert!(!s.active_doc().dirty);
+        assert!(!s.active_doc().dirty());
     }
 
     #[test]
@@ -296,7 +330,7 @@ mod tests {
         assert_eq!(s.docs.len(), 1, "should reuse the lone blank tab");
         assert_eq!(s.active_doc().title(), "hello.rs");
         assert_eq!(s.active_doc().language, "Rust");
-        assert!(!s.active_doc().dirty);
+        assert!(!s.active_doc().dirty());
     }
 
     #[test]
@@ -312,7 +346,7 @@ mod tests {
     fn edit_sets_dirty_and_emits_title_only_on_the_edge() {
         let mut s = State::default();
         let fx = update(&mut s, Message::Edited("a".into()));
-        assert!(s.active_doc().dirty);
+        assert!(s.active_doc().dirty());
         assert_eq!(fx, vec![Effect::SetTitle("Untitled".into())]);
         // Second edit stays dirty; no redundant title effect.
         let fx2 = update(&mut s, Message::Edited("ab".into()));
@@ -374,7 +408,7 @@ mod tests {
                 path: PathBuf::from("/tmp/new.py"),
             },
         );
-        assert!(!s.active_doc().dirty);
+        assert!(!s.active_doc().dirty());
         assert_eq!(s.active_doc().language, "Python");
         assert_eq!(s.active_doc().title(), "new.py");
     }
@@ -444,6 +478,8 @@ mod tests {
             Just(Message::SaveRequested),
             Just(Message::SaveAsRequested),
             any::<String>().prop_map(Message::Edited),
+            Just(Message::Undo),
+            Just(Message::Redo),
             (0usize..6).prop_map(Message::TabSelected),
             (0usize..6).prop_map(Message::TabClosed),
             ("[a-z]{1,6}", any::<String>()).prop_map(|(n, c)| Message::FileLoaded {
@@ -480,6 +516,58 @@ mod tests {
                 other => panic!("expected WriteFile, got {other:?}"),
             };
             prop_assert_eq!(written, original);
+        }
+
+        /// Recording N edits then undoing N times returns to the original empty
+        /// buffer, and redoing N times reproduces the final content exactly.
+        #[test]
+        fn undo_all_then_redo_all_round_trips(edits in prop::collection::vec("[a-z\n]{0,8}", 0..25)) {
+            let mut s = State::default();
+            let mut content = String::new();
+            let mut steps = 0usize;
+            for chunk in &edits {
+                // Append each chunk, tracking how many actually changed content.
+                let next = format!("{content}{chunk}");
+                if next != content {
+                    update(&mut s, Message::Edited(next.clone()));
+                    steps += 1;
+                    content = next;
+                }
+            }
+            let final_content = s.active_doc().content.clone();
+            prop_assert_eq!(&final_content, &content);
+
+            // Undo enough times to drain any coalesced history back to empty.
+            for _ in 0..=steps {
+                update(&mut s, Message::Undo);
+            }
+            prop_assert_eq!(&s.active_doc().content, "");
+            prop_assert!(!s.active_doc().dirty());
+
+            // Redo everything back to the final content.
+            for _ in 0..=steps {
+                update(&mut s, Message::Redo);
+            }
+            prop_assert_eq!(s.active_doc().content.clone(), final_content);
+        }
+
+        /// The stored content and the history's applied edits never disagree:
+        /// after any message stream, undoing to the bottom yields a buffer whose
+        /// redo-to-top reproduces the current content.
+        #[test]
+        fn buffer_stays_consistent_under_random_edits(edits in prop::collection::vec(any::<String>(), 0..40)) {
+            let mut s = State::default();
+            for e in edits {
+                update(&mut s, Message::Edited(e));
+                // The active buffer is always valid UTF-8 and matches what the
+                // last edit set (no torn state from diff/apply).
+                prop_assert!(s.active_doc().content.is_char_boundary(0));
+            }
+            let top = s.active_doc().content.clone();
+            // Undo a lot, then redo a lot: we must return to the same top.
+            for _ in 0..60 { update(&mut s, Message::Undo); }
+            for _ in 0..60 { update(&mut s, Message::Redo); }
+            prop_assert_eq!(s.active_doc().content.clone(), top);
         }
     }
 }

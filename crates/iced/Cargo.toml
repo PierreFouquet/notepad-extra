@@ -1,0 +1,28 @@
+[package]
+name = "notepad-iced"
+version = "0.1.0"
+edition = "2024"
+description = "Thin iced render shell for notepad-extra's native rewrite: executes the pure core's Effects (#28)."
+authors = ["Pierre Fouquet"]
+license = "GPL-3.0-or-later"
+homepage = "https://github.com/PierreFouquet/notepad-extra"
+repository = "https://github.com/PierreFouquet/notepad-extra"
+
+# The shell is deliberately *thin*: all behaviour lives in `notepad-core`'s pure
+# `update(State, Message) -> Vec<Effect>`. This crate only renders `view`s and
+# executes the returned `Effect`s (dialogs via `rfd`, file I/O via
+# `notepad-core::io`, the window title). Syntax highlighting is a separate
+# concern tracked in #32; the software-renderer / no-GPU choice is #26.
+[dependencies]
+notepad-core = { path = "../core" }
+
+# Software renderer only (`tiny-skia`) — no wgpu, no GPU requirement (#26).
+iced = { version = "0.14", default-features = false, features = ["tiny-skia"] }
+
+# Native file dialogs. `xdg-portal` keeps us off GTK/webkit build deps (the whole
+# point of the migration); `async-std` gives rfd its own executor so it works
+# regardless of iced's runtime.
+rfd = { version = "0.15", default-features = false, features = [
+    "xdg-portal",
+    "async-std",
+] }

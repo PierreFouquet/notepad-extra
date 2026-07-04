@@ -1,0 +1,119 @@
+name: "native-ci"
+
+# Test infrastructure for the native (iced) rewrite crates — issue #27.
+# Deliberately scoped to the workspace's native crates so it does not build the
+# Tauri app (no webkit needed). The existing `ci.yml` stays as-is until the #45
+# CI migration / #46 cutover fold these together.
+on:
+  push:
+    branches: [main, feat/iced-migration]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  core:
+    name: "core — fmt · clippy · test"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: swatinem/rust-cache@v2
+      - name: rustfmt
+        run: cargo fmt --package notepad-core -- --check
+      - name: clippy (deny warnings)
+        run: cargo clippy --package notepad-core --all-targets -- -D warnings
+      - name: test (unit + proptest + stress)
+        run: cargo test --package notepad-core --all-targets --verbose
+
+  shell:
+    # Windows & macOS are first-class for this epic (#25), so the shell is built
+    # and its headless wiring tested on all three desktop OSes. The software
+    # renderer (tiny-skia) needs no GPU anywhere; only Linux gets the extra
+    # windowed launch under a virtual display (xvfb).
+    name: "iced shell — ${{ matrix.os }}"
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: swatinem/rust-cache@v2
+      # Linux is the only target that dlopens X11/Wayland libs and needs a
+      # virtual display; macOS (AppKit) and Windows (Win32) use their native,
+      # always-compiled window + dialog backends — no extra packages.
+      - name: install virtual display + runtime libs (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          # libxkbcommon0 + the X11 companion (libxkbcommon-x11-0) that winit
+          # dlopens as libxkbcommon-x11.so; xvfb provides the virtual display.
+          sudo apt-get install -y --no-install-recommends \
+            xvfb libxkbcommon0 libxkbcommon-x11-0
+      - name: rustfmt
+        if: runner.os == 'Linux'
+        run: cargo fmt --package notepad-iced -- --check
+      - name: clippy (deny warnings)
+        run: cargo clippy --package notepad-iced --all-targets -- -D warnings
+      - name: build
+        run: cargo build --package notepad-iced
+      - name: test (headless shell wiring)
+        run: cargo test --package notepad-iced --all-targets --verbose
+      - name: windowed smoke (xvfb, software renderer)
+        if: runner.os == 'Linux'
+        run: |
+          # A clean startup that stays alive until `timeout` kills it (exit 124)
+          # is success; any earlier exit means the window failed to come up.
+          set +e
+          xvfb-run -a timeout 10 ./target/debug/notepad-iced
+          code=$?
+          set -e
+          if [ "$code" != "124" ]; then
+            echo "shell exited early (code $code) — startup failed"
+            exit 1
+          fi
+          echo "shell started and ran under xvfb"
+
+  coverage:
+    name: "core — coverage gate"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v1
+        with:
+          tool: cargo-llvm-cov
+      - name: coverage gate
+        run: bash scripts/coverage.sh --summary-only
+
+  fuzz:
+    name: "core — fuzz targets"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v1
+        with:
+          tool: cargo-fuzz
+      # Pin the gnu target: cargo-fuzz otherwise defaults to musl on this runner,
+      # whose statically linked libc is incompatible with the sanitizer (and its
+      # std isn't installed) — `error: sanitizer is incompatible with statically
+      # linked libc` / `E0463: can't find crate for std`.
+      - name: build fuzz targets
+        run: cargo fuzz build --fuzz-dir crates/core/fuzz --target x86_64-unknown-linux-gnu
+      - name: smoke-run each target (15s)
+        run: |
+          cargo fuzz run --fuzz-dir crates/core/fuzz --target x86_64-unknown-linux-gnu update_sequence -- -max_total_time=15
+          cargo fuzz run --fuzz-dir crates/core/fuzz --target x86_64-unknown-linux-gnu text_helpers   -- -max_total_time=15

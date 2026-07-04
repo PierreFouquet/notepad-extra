@@ -1,5 +1,5 @@
 <!-- downloads-table -->
-### Which file do I download?
+# Which file do I download?
 
 | Your system | Download |
 | --- | --- |

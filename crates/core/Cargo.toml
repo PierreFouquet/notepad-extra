@@ -1,0 +1,18 @@
+[package]
+name = "notepad-core"
+version = "0.1.0"
+edition = "2024"
+description = "Pure, UI-free editor core (update / State / Message / Effect) for notepad-extra's native rewrite."
+authors = ["Pierre Fouquet"]
+license = "GPL-3.0-or-later"
+homepage = "https://github.com/PierreFouquet/notepad-extra"
+repository = "https://github.com/PierreFouquet/notepad-extra"
+
+# Deliberately dependency-free: the core is toolkit-agnostic and must build
+# offline with no C libraries. Side effects (file I/O, dialogs) are described as
+# `Effect` values and executed by the render shell, never here.
+[dependencies]
+
+[dev-dependencies]
+proptest = "1"
+tempfile = "3.6"

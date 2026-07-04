@@ -50,9 +50,7 @@ impl EndOfLine {
 /// The final path segment, splitting on both `/` and `\` so a Windows path
 /// opened on Linux (or vice-versa) still yields the bare file name.
 pub fn basename(path: &str) -> &str {
-    path.rsplit(|c| c == '/' || c == '\\')
-        .next()
-        .unwrap_or(path)
+    path.rsplit(['/', '\\']).next().unwrap_or(path)
 }
 
 /// The lower-relevant extension of a filename (no dot), or `None` for
@@ -107,5 +105,11 @@ mod tests {
         assert_eq!(extension_of("Dockerfile"), None);
         assert_eq!(extension_of(".bashrc"), None);
         assert_eq!(extension_of("ends.with.dot."), None);
+    }
+
+    #[test]
+    fn eol_label_strings() {
+        assert_eq!(EndOfLine::Lf.label(), "LF");
+        assert_eq!(EndOfLine::Crlf.label(), "CRLF");
     }
 }

@@ -26,10 +26,11 @@ pub fn read_file(path: &Path) -> Result<String, String> {
 /// Callers pass EOL-joined bytes (see [`crate::EndOfLine::join`]) so line
 /// endings round-trip exactly.
 pub fn write_file(path: &Path, content: &str) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() && !parent.exists() {
-            fs::create_dir_all(parent).map_err(|e| format!("Failed to create dir: {e}"))?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && !parent.exists()
+    {
+        fs::create_dir_all(parent).map_err(|e| format!("Failed to create dir: {e}"))?;
     }
     fs::write(path, content).map_err(|e| format!("Failed to save file: {e}"))
 }
@@ -101,5 +102,16 @@ mod tests {
         assert!(!is_safe_external_url("https://exa mple.com")); // whitespace
         assert!(!is_safe_external_url("https://example.com\n")); // control
         assert!(!is_safe_external_url("")); // empty
+    }
+
+    #[test]
+    fn write_through_a_file_as_directory_errors() {
+        let dir = tempdir().expect("tempdir");
+        let file = dir.path().join("iamafile");
+        fs::write(&file, "x").expect("seed file");
+        // A regular file cannot be a parent directory: create_dir_all must fail
+        // and surface an error rather than panicking.
+        let nested = file.join("sub").join("child.txt");
+        assert!(write_file(&nested, "data").is_err());
     }
 }

@@ -1,0 +1,59 @@
+name: "native-ci"
+
+# Test infrastructure for the native (iced) rewrite crates — issue #27.
+# Deliberately scoped to the workspace's native crates so it does not build the
+# Tauri app (no webkit needed). The existing `ci.yml` stays as-is until the #45
+# CI migration / #46 cutover fold these together.
+on:
+  push:
+    branches: [main, feat/iced-migration]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  core:
+    name: "core — fmt · clippy · test"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: swatinem/rust-cache@v2
+      - name: rustfmt
+        run: cargo fmt --package notepad-core -- --check
+      - name: clippy (deny warnings)
+        run: cargo clippy --package notepad-core --all-targets -- -D warnings
+      - name: test (unit + proptest + stress)
+        run: cargo test --package notepad-core --all-targets --verbose
+
+  coverage:
+    name: "core — coverage gate"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: coverage gate
+        run: bash scripts/coverage.sh --summary-only
+
+  fuzz:
+    name: "core — fuzz targets"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-fuzz
+      - name: build fuzz targets
+        run: cargo fuzz build --fuzz-dir crates/core/fuzz
+      - name: smoke-run each target (15s)
+        run: |
+          cargo fuzz run --fuzz-dir crates/core/fuzz update_sequence -- -max_total_time=15
+          cargo fuzz run --fuzz-dir crates/core/fuzz text_helpers   -- -max_total_time=15

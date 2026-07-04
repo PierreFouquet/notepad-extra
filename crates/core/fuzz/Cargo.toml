@@ -1,0 +1,36 @@
+[package]
+name = "notepad-core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = "1"
+
+[dependencies.notepad-core]
+path = ".."
+
+# Detach from the parent workspace on purpose: fuzz builds need nightly and a
+# sanitizer runtime, so they must never be pulled into the normal `cargo test`.
+[workspace]
+
+[[bin]]
+name = "update_sequence"
+path = "fuzz_targets/update_sequence.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "text_helpers"
+path = "fuzz_targets/text_helpers.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1

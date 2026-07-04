@@ -399,6 +399,42 @@ mod tests {
         assert_eq!(s.active, 1, "focus should follow the same document");
     }
 
+    #[test]
+    fn save_path_chosen_for_unknown_id_is_a_noop() {
+        let mut s = State::default();
+        let fx = update(
+            &mut s,
+            Message::SavePathChosen {
+                id: 9999,
+                path: PathBuf::from("/tmp/x"),
+            },
+        );
+        assert!(fx.is_empty());
+    }
+
+    #[test]
+    fn file_saved_for_unknown_id_refreshes_title_only() {
+        let mut s = State::default();
+        let fx = update(
+            &mut s,
+            Message::FileSaved {
+                id: 9999,
+                path: PathBuf::from("/tmp/x.rs"),
+            },
+        );
+        assert_eq!(fx, vec![Effect::SetTitle("Untitled".into())]);
+        assert_eq!(s.active_doc().language, "Plain Text"); // untouched
+    }
+
+    #[test]
+    fn out_of_range_tab_ops_are_ignored() {
+        let mut s = State::default();
+        update(&mut s, Message::TabSelected(42));
+        assert_eq!(s.active, 0);
+        update(&mut s, Message::TabClosed(42));
+        assert_eq!(s.docs.len(), 1);
+    }
+
     // ---- Property-based invariants (epic #25 Definition of Done) ----
 
     fn arb_message() -> impl Strategy<Value = Message> {

@@ -1,6 +1,6 @@
+use notepad_extra::{is_safe_external_url, read_file_at, write_file_at};
 use tauri::command;
 use tauri_plugin_dialog::DialogExt;
-use notepad_extra::{is_safe_external_url, read_file_at, write_file_at};
 
 #[command]
 async fn open_file(app: tauri::AppHandle) -> Result<Option<serde_json::Value>, String> {
@@ -8,9 +8,7 @@ async fn open_file(app: tauri::AppHandle) -> Result<Option<serde_json::Value>, S
     // blocking_pick_file will safely pause this thread without freezing the UI!
     // No filter is applied, so every file is shown (including extension-less
     // ones like `Dockerfile` that a glob filter could never match).
-    let file_path = app.dialog()
-        .file()
-        .blocking_pick_file();
+    let file_path = app.dialog().file().blocking_pick_file();
 
     match file_path {
         Some(fp) => {
@@ -105,7 +103,9 @@ fn open_external(url: String) -> Result<(), String> {
         c
     };
 
-    cmd.spawn().map(|_| ()).map_err(|e| format!("Failed to open URL: {}", e))
+    cmd.spawn()
+        .map(|_| ())
+        .map_err(|e| format!("Failed to open URL: {}", e))
 }
 
 fn main() {

@@ -45,7 +45,10 @@ jobs:
       - name: install virtual display + runtime libs
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends xvfb libxkbcommon0
+          # libxkbcommon0 + the X11 companion (libxkbcommon-x11-0) that winit
+          # dlopens as libxkbcommon-x11.so; xvfb provides the virtual display.
+          sudo apt-get install -y --no-install-recommends \
+            xvfb libxkbcommon0 libxkbcommon-x11-0
       - name: rustfmt
         run: cargo fmt --package notepad-iced -- --check
       - name: clippy (deny warnings)
@@ -92,9 +95,13 @@ jobs:
       - uses: taiki-e/install-action@v1
         with:
           tool: cargo-fuzz
+      # Pin the gnu target: cargo-fuzz otherwise defaults to musl on this runner,
+      # whose statically linked libc is incompatible with the sanitizer (and its
+      # std isn't installed) — `error: sanitizer is incompatible with statically
+      # linked libc` / `E0463: can't find crate for std`.
       - name: build fuzz targets
-        run: cargo fuzz build --fuzz-dir crates/core/fuzz
+        run: cargo fuzz build --fuzz-dir crates/core/fuzz --target x86_64-unknown-linux-gnu
       - name: smoke-run each target (15s)
         run: |
-          cargo fuzz run --fuzz-dir crates/core/fuzz update_sequence -- -max_total_time=15
-          cargo fuzz run --fuzz-dir crates/core/fuzz text_helpers   -- -max_total_time=15
+          cargo fuzz run --fuzz-dir crates/core/fuzz --target x86_64-unknown-linux-gnu update_sequence -- -max_total_time=15
+          cargo fuzz run --fuzz-dir crates/core/fuzz --target x86_64-unknown-linux-gnu text_helpers   -- -max_total_time=15

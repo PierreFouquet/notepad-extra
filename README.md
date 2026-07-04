@@ -3,6 +3,11 @@
 Notepad but extra. A small, fast, **fully offline** text/code editor for Windows, macOS and Linux,
 built with Rust and [Tauri](https://tauri.app/). Inspired by Notepad++.
 
+> **Heads-up — a native rewrite is in progress.** Notepad Extra is migrating from
+> Tauri/WebView to a native Rust GUI ([iced](https://iced.rs/)). The app described
+> below is the current Tauri build; see [Native rewrite](#native-rewrite-in-progress)
+> for the in-flight work.
+
 ## Features
 
 - Cross-platform: Windows (x64 + ARM64), macOS (Intel + Apple Silicon), Linux (x64 + ARM64)
@@ -41,6 +46,24 @@ under `src-tauri/dist/vendor/codemirror/mode/`, add it to `MODE_SCRIPTS`, then r
 | Go to line | `Ctrl/Cmd + G` |
 | Zoom in / out / reset | `Ctrl/Cmd + +` / `-` / `0` |
 
+## Native rewrite (in progress)
+
+To qualify for official inclusion in Debian, Fedora/RHEL and downstream distros —
+and to drop the `webkit2gtk` runtime dependency — Notepad Extra is moving off
+Tauri/WebView + CodeMirror to a **native Rust GUI built with [iced](https://iced.rs/)**.
+It stays **fully offline** and cross-platform (Windows/macOS/Linux remain first-class).
+
+- **Epic:** [#25](https://github.com/PierreFouquet/notepad-extra/issues/25) ·
+  **Toolkit RFC (decided → iced):** [#26](https://github.com/PierreFouquet/notepad-extra/issues/26)
+- The rewrite lands incrementally as a Cargo workspace under `crates/`. The root
+  crate stays the Tauri app until the final cutover (#46), so today's released
+  build is unaffected.
+  - `crates/core` — the pure, UI-free `update(State, Message) -> Effect` core: all
+    editor behaviour with **no window and no GPU**, so it is exhaustively testable
+    (unit + property + fuzz + stress).
+- Test standard and how to run each layer: [docs/testing.md](docs/testing.md).
+  Native CI lives in [`.github/workflows/native-ci.yml`](.github/workflows/native-ci.yml).
+
 ## Development
 
 ### Prerequisites
@@ -66,11 +89,18 @@ cargo tauri build   # build optimized installers for the current platform
 ### Tests
 
 ```bash
-cargo test                          # Rust backend (file I/O, EOL handling, error cases)
+# Current Tauri app
+cargo test -p notepad-extra            # Rust backend (file I/O, EOL handling, error cases)
 node --test tests/frontend/*.test.js   # frontend logic (language/EOL/path helpers)
+
+# Native rewrite core (no window / no GPU)
+cargo test -p notepad-core             # unit + property + stress tests
+scripts/coverage.sh                    # coverage gate (needs `cargo install cargo-llvm-cov`)
 ```
 
-Both suites also run automatically in CI (`.github/workflows/ci.yml`).
+The Tauri suites run in `.github/workflows/ci.yml`; the native crates run in
+`.github/workflows/native-ci.yml`. See [docs/testing.md](docs/testing.md) for
+fuzzing and the full test standard.
 
 ## Releases
 
@@ -97,12 +127,15 @@ Artifacts produced:
 ## Project layout
 
 ```text
-Cargo.toml            # Rust crate (root)
+Cargo.toml            # Cargo workspace root (still the Tauri app crate)
 build.rs              # Tauri build script
 tauri.conf.json       # Tauri app configuration
 capabilities/         # Tauri v2 capability/permission files
 src/                  # Rust: main.rs (commands) + lib.rs (file I/O)
 src-tauri/dist/       # Frontend (HTML/CSS/JS) + vendored CodeMirror (offline)
+crates/core/          # Native rewrite: pure update core (iced shell to follow)
+docs/testing.md       # Native rewrite: test standard
+scripts/              # Helper scripts (coverage gate, index generation)
 tests/                # Rust integration tests + frontend logic tests
 ```
 

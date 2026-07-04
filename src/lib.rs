@@ -80,7 +80,10 @@ mod tests {
         let file_path = dir.path().join("out.txt");
         let res = write_file_at("x", &file_path).expect("write");
         assert_eq!(res["path"], file_path.to_string_lossy().to_string());
-        assert!(res.get("content").is_none(), "write result should not echo content");
+        assert!(
+            res.get("content").is_none(),
+            "write result should not echo content"
+        );
     }
 
     #[test]
@@ -135,7 +138,9 @@ mod tests {
 
     #[test]
     fn test_is_safe_external_url_accepts_https() {
-        assert!(is_safe_external_url("https://github.com/PierreFouquet/notepad-extra"));
+        assert!(is_safe_external_url(
+            "https://github.com/PierreFouquet/notepad-extra"
+        ));
         assert!(is_safe_external_url(
             "https://github.com/PierreFouquet/notepad-extra/issues/new/choose"
         ));

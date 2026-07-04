@@ -30,6 +30,43 @@ jobs:
       - name: test (unit + proptest + stress)
         run: cargo test --package notepad-core --all-targets --verbose
 
+  shell:
+    name: "iced shell — fmt · clippy · test · smoke"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: swatinem/rust-cache@v2
+      # The shell renders in software (tiny-skia) so it needs no GPU. Under CI it
+      # only needs a virtual X display plus the libraries winit/softbuffer dlopen
+      # at runtime — no webkit, no GTK (the whole point of the migration).
+      - name: install virtual display + runtime libs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends xvfb libxkbcommon0
+      - name: rustfmt
+        run: cargo fmt --package notepad-iced -- --check
+      - name: clippy (deny warnings)
+        run: cargo clippy --package notepad-iced --all-targets -- -D warnings
+      - name: test (headless shell wiring)
+        run: cargo test --package notepad-iced --all-targets --verbose
+      - name: windowed smoke (xvfb, software renderer)
+        run: |
+          cargo build --package notepad-iced
+          # A clean startup that stays alive until `timeout` kills it (exit 124)
+          # is success; any earlier exit means the window failed to come up.
+          set +e
+          xvfb-run -a timeout 10 ./target/debug/notepad-iced
+          code=$?
+          set -e
+          if [ "$code" != "124" ]; then
+            echo "shell exited early (code $code) — startup failed"
+            exit 1
+          fi
+          echo "shell started and ran under xvfb"
+
   coverage:
     name: "core — coverage gate"
     runs-on: ubuntu-latest

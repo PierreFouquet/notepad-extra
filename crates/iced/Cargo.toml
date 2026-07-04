@@ -16,8 +16,15 @@ repository = "https://github.com/PierreFouquet/notepad-extra"
 [dependencies]
 notepad-core = { path = "../core" }
 
-# Software renderer only (`tiny-skia`) — no wgpu, no GPU requirement (#26).
-iced = { version = "0.14", default-features = false, features = ["tiny-skia"] }
+# Software renderer only (`tiny-skia`) — no wgpu, no GPU requirement (#26). The
+# `x11`/`wayland` features wire the software surface (softbuffer) to the Linux
+# display servers; without them softbuffer builds with no backend.
+iced = { version = "0.14", default-features = false, features = [
+    "tiny-skia",
+    "x11",
+    "wayland",
+    "thread-pool",
+] }
 
 # Native file dialogs. `xdg-portal` keeps us off GTK/webkit build deps (the whole
 # point of the migration); `async-std` gives rfd its own executor so it works

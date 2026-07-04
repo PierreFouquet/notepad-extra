@@ -25,7 +25,7 @@ tempfile = "3.6"
 # The root package stays the existing Tauri app and keeps building until the
 # Phase 4 cutover (#46). New native-GUI crates live under `crates/`:
 #   * notepad-core — pure, UI-free `update(State, Message) -> Effect` core (#28)
-#   * notepad-iced — thin iced render shell (added with the validation spike)
+#   * notepad-iced — thin iced render shell that executes the core's Effects (#28)
 [workspace]
-members = ["crates/core"]
+members = ["crates/core", "crates/iced"]
 resolver = "2"

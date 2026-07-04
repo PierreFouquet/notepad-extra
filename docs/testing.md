@@ -63,6 +63,19 @@ COVERAGE_GATE=100 scripts/coverage.sh --html   # write an HTML report
 Requires `cargo install cargo-llvm-cov`. The gate rises toward the ~100% DoD
 target as the core grows; pure logic with no I/O has little excuse to miss it.
 
+## Render shell (`crates/iced`)
+
+The thin iced shell (#28) does no application logic of its own — it renders the
+core's `State` and executes the `Effect`s it returns. Its wiring to the core is
+tested **headlessly** (no window, no GPU) in `crates/iced` `mod tests`: driving
+`Shell::update` with synthetic messages and asserting the core state and editor
+buffer, e.g. typing marks the document dirty, switching tabs swaps the buffer, a
+failed read surfaces an error without touching the docs.
+
+The `view` needs a real renderer, so it is not unit-tested; instead the CI
+`shell` job launches the built binary under `xvfb` (software renderer) and treats
+a clean startup as success — proving the window actually comes up.
+
 ## Definition of Done — coverage map
 
 | DoD requirement | Covered by |
@@ -74,4 +87,6 @@ target as the core grows; pure logic with no I/O has little excuse to miss it.
 | Edge & error paths | `io.rs` (bad UTF-8, missing file), `text.rs` |
 | Fuzz targets (`cargo-fuzz`) | `fuzz/fuzz_targets/*` |
 | CI coverage gate (~100% logic) | `native-ci.yml` → `scripts/coverage.sh` |
-| Packaged install/launch under `xvfb` | deferred — needs the render shell (#28+) |
+| Render-shell wiring (headless) | `crates/iced` `mod tests` |
+| Windowed launch under `xvfb` | `native-ci.yml` → `shell` job smoke |
+| Packaged install/launch under `xvfb` | deferred — needs packaging (#43/#44) |

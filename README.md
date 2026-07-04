@@ -61,6 +61,10 @@ It stays **fully offline** and cross-platform (Windows/macOS/Linux remain first-
   - `crates/core` — the pure, UI-free `update(State, Message) -> Effect` core: all
     editor behaviour with **no window and no GPU**, so it is exhaustively testable
     (unit + property + fuzz + stress).
+  - `crates/iced` — the thin [iced](https://iced.rs/) render shell: renders the
+    core's state and executes its `Effect`s (native dialogs, file I/O, window
+    title). Software-rendered (`tiny-skia`, no GPU); its core wiring is tested
+    headlessly and CI smoke-launches it under `xvfb`.
 - Test standard and how to run each layer: [docs/testing.md](docs/testing.md).
   Native CI lives in [`.github/workflows/native-ci.yml`](.github/workflows/native-ci.yml).
 
@@ -133,7 +137,8 @@ tauri.conf.json       # Tauri app configuration
 capabilities/         # Tauri v2 capability/permission files
 src/                  # Rust: main.rs (commands) + lib.rs (file I/O)
 src-tauri/dist/       # Frontend (HTML/CSS/JS) + vendored CodeMirror (offline)
-crates/core/          # Native rewrite: pure update core (iced shell to follow)
+crates/core/          # Native rewrite: pure update core (no window / no GPU)
+crates/iced/          # Native rewrite: thin iced render shell (executes Effects)
 docs/testing.md       # Native rewrite: test standard
 scripts/              # Helper scripts (coverage gate, index generation)
 tests/                # Rust integration tests + frontend logic tests

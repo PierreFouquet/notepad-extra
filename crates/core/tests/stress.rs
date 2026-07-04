@@ -31,7 +31,7 @@ fn million_line_paste_round_trips() {
     let mut s = State::default();
     let huge: String = "x\n".repeat(1_000_000); // ~2 MB, 1M newlines
     update(&mut s, Message::Edited(huge.clone()));
-    assert!(s.active_doc().dirty);
+    assert!(s.active_doc().dirty());
 
     let id = s.active_doc().id;
     let fx = update(
@@ -48,6 +48,71 @@ fn million_line_paste_round_trips() {
         }
         other => panic!("expected WriteFile, got {other:?}"),
     }
+}
+
+#[test]
+fn million_line_paste_is_a_single_undo_step() {
+    // The diff-based history stores the whole paste as one Edit, so a single
+    // undo must wipe it and a single redo must restore it — no per-line churn.
+    let mut s = State::default();
+    let huge: String = "x\n".repeat(1_000_000);
+    update(&mut s, Message::Edited(huge.clone()));
+    assert_eq!(s.active_doc().content.len(), huge.len());
+
+    update(&mut s, Message::Undo);
+    assert_eq!(
+        s.active_doc().content,
+        "",
+        "one undo removes the whole paste"
+    );
+    assert!(!s.active_doc().dirty());
+
+    update(&mut s, Message::Redo);
+    assert_eq!(s.active_doc().content, huge, "one redo restores it");
+    assert!(s.active_doc().dirty());
+}
+
+#[test]
+fn huge_single_line_edit_then_undo() {
+    // A multi-hundred-MB one-liner: edit inside it, then undo, panic-free. The
+    // in-place replacement is its own history step (not coalesced), so we get two.
+    let mut s = State::default();
+    let base: String = "a".repeat(5_000_000);
+    update(&mut s, Message::Edited(base.clone()));
+    let mut edited = base.clone();
+    edited.replace_range(0..1, "B"); // replace the first char — a replacement, not an insert
+    update(&mut s, Message::Edited(edited.clone()));
+    assert_eq!(s.active_doc().content, edited);
+
+    update(&mut s, Message::Undo);
+    assert_eq!(s.active_doc().content, base);
+    update(&mut s, Message::Undo);
+    assert_eq!(s.active_doc().content, "");
+}
+
+#[test]
+fn edit_storm_then_full_undo_walks_back_consistently() {
+    // Thousands of newline-terminated appends (each its own history step), then
+    // undo every step: the buffer must stay internally consistent and the depth
+    // cap must keep the history bounded without ever panicking.
+    let mut s = State::default();
+    let mut content = String::new();
+    for i in 0..3000 {
+        content = format!("{content}line{i}\n");
+        update(&mut s, Message::Edited(content.clone()));
+        assert_eq!(s.active_doc().content, content);
+    }
+    // Undo far more times than the (capped) history depth; each step must leave a
+    // valid buffer and never panic.
+    for _ in 0..4000 {
+        update(&mut s, Message::Undo);
+        assert!(!s.docs.is_empty());
+    }
+    // The oldest edits were capped away, so undo can't reach the empty buffer;
+    // what matters is it stayed panic-free and consistent throughout.
+    let remaining = s.active_doc().content.clone();
+    update(&mut s, Message::Redo);
+    assert!(s.active_doc().content.starts_with(&remaining));
 }
 
 #[test]

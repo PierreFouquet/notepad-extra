@@ -16,9 +16,11 @@
 #![forbid(unsafe_code)]
 
 pub mod app;
+pub mod history;
 pub mod io;
 pub mod lang;
 pub mod text;
 
 pub use app::{Document, Effect, Message, State, TabId, update};
+pub use history::{Edit, History, diff};
 pub use text::EndOfLine;

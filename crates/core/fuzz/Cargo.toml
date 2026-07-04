@@ -32,5 +32,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "edit_diff"
+path = "fuzz_targets/edit_diff.rs"
+test = false
+doc = false
+bench = false
+
 [profile.release]
 debug = 1

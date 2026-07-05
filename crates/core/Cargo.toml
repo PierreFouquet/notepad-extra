@@ -8,10 +8,16 @@ license = "GPL-3.0-or-later"
 homepage = "https://github.com/PierreFouquet/notepad-extra"
 repository = "https://github.com/PierreFouquet/notepad-extra"
 
-# Deliberately dependency-free: the core is toolkit-agnostic and must build
-# offline with no C libraries. Side effects (file I/O, dialogs) are described as
-# `Effect` values and executed by the render shell, never here.
+# The core is toolkit-agnostic and must build offline with no C libraries. Side
+# effects (file I/O, dialogs) are described as `Effect` values and executed by
+# the render shell, never here.
 [dependencies]
+# Find / Replace (#33). `regex` is a finite-automaton engine: matching is
+# linear-time with no backtracking, so no pattern can hang the UI — that is the
+# epic's "catastrophic-regex guard", achieved by construction rather than with a
+# timeout. Pure Rust, no C dependency, and already present in the locked tree
+# (zero new crates to vendor for #17).
+regex = { version = "1", default-features = false, features = ["std", "unicode"] }
 
 [dev-dependencies]
 proptest = "1"

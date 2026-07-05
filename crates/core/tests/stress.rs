@@ -1,11 +1,20 @@
 //! Adversarial / stress tests for the update core (epic #25 Definition of Done).
 //!
 //! These assert the core stays correct and panic-free under abuse: hundreds of
-//! opens, million-line pastes, and rapid tab churn. Regex-catastrophe cases
-//! land here once find/replace (#33) exists.
+//! opens, million-line pastes, rapid tab churn, and — for find/replace (#33) —
+//! catastrophic regexes, huge-document replace-all, and thousands of Find Next.
 
-use notepad_core::{Effect, Message, State, update};
+use notepad_core::find::{self, goto_line_offset};
+use notepad_core::{Effect, Matcher, Message, SearchOptions, State, update};
 use std::path::PathBuf;
+
+/// A regex-mode [`SearchOptions`].
+fn regex_opts() -> SearchOptions {
+    SearchOptions {
+        regex: true,
+        ..SearchOptions::default()
+    }
+}
 
 #[test]
 fn hundreds_of_open_operations_stay_bounded() {
@@ -129,4 +138,91 @@ fn rapid_tab_churn_never_underflows() {
         assert!(s.active < s.docs.len());
     }
     assert_eq!(s.docs.len(), 1);
+}
+
+// ---- Find / Replace / Go-to-line adversarial cases (#33) ----
+
+#[test]
+fn catastrophic_regex_pattern_stays_linear() {
+    // `(a+)+$` is the textbook exponential-backtracking bomb: a backtracking
+    // engine hangs for effectively forever on a long run of 'a' that fails the
+    // trailing anchor. The `regex` crate is a finite automaton, so this returns
+    // at once — completing at all *is* the assertion (no hang, no panic).
+    let m = Matcher::new(r"(a+)+$", regex_opts()).expect("compiles");
+    let evil = format!("{}!", "a".repeat(100_000)); // the '!' defeats the `$`
+    assert_eq!(m.count(&evil), 0);
+    // A second classic, run for its side effect of simply terminating.
+    let m2 = Matcher::new(r"(x+x+)+y", regex_opts()).expect("compiles");
+    let _ = m2.count(&"x".repeat(100_000));
+}
+
+#[test]
+fn replace_all_on_a_huge_document_is_bounded_and_undoable() {
+    let mut s = State::default();
+    let huge = "foo bar\n".repeat(500_000); // ~3.5 MB, half a million matches
+    update(&mut s, Message::Edited(huge));
+    update(&mut s, Message::FindOpened);
+    update(&mut s, Message::FindQueryChanged("foo".into()));
+    assert_eq!(s.find.count, 500_000);
+    update(&mut s, Message::ReplaceTextChanged("qux".into()));
+    update(&mut s, Message::ReplaceAll);
+    assert_eq!(s.find.count, 0);
+    assert!(s.active_doc().content.starts_with("qux bar\n"));
+    // The whole replace-all collapses to a single undo step.
+    update(&mut s, Message::Undo);
+    assert!(s.active_doc().content.starts_with("foo bar\n"));
+}
+
+#[test]
+fn search_a_million_line_document() {
+    let mut s = State::default();
+    update(&mut s, Message::Edited("needle\n".repeat(1_000_000)));
+    update(&mut s, Message::FindOpened);
+    update(&mut s, Message::FindQueryChanged("needle".into()));
+    assert_eq!(s.find.count, 1_000_000);
+    update(&mut s, Message::FindNext);
+    let hit = s.find.current.expect("a match");
+    assert!(hit.end <= s.active_doc().content.len());
+}
+
+#[test]
+fn find_in_a_single_enormous_line() {
+    // One line, no newlines, ~2 MB — catches off-by-one line handling on big
+    // input and proves go-to clamps when there is only one line.
+    let line = "ab".repeat(1_000_000);
+    let m = Matcher::new("ab", SearchOptions::default()).expect("compiles");
+    assert_eq!(m.count(&line), 1_000_000);
+    assert_eq!(goto_line_offset(&line, 5), 0);
+    // The last match's end is exactly the buffer length.
+    let last = m.find_last(&line).expect("a match");
+    assert_eq!(last.end, line.len());
+}
+
+#[test]
+fn thousands_of_find_next_calls_stay_in_bounds() {
+    let mut s = State::default();
+    update(&mut s, Message::Edited("x.x.x.x.x".into()));
+    update(&mut s, Message::FindOpened);
+    update(&mut s, Message::FindQueryChanged("x".into()));
+    for _ in 0..10_000 {
+        update(&mut s, Message::FindNext);
+        let hit = s.find.current.expect("always on a match");
+        assert!(hit.end <= s.active_doc().content.len());
+    }
+}
+
+#[test]
+fn go_to_line_never_leaves_the_buffer_on_a_huge_document() {
+    let content = "line\n".repeat(200_000);
+    // Way past the end clamps to the final line's start; the offset is always a
+    // valid, in-bounds char boundary.
+    for line in [0, 1, 100_000, 200_000, 5_000_000] {
+        let off = goto_line_offset(&content, line);
+        assert!(off <= content.len());
+        assert!(content.is_char_boundary(off));
+    }
+    // Sanity against a known position: line 3 starts after two "line\n" chunks.
+    assert_eq!(goto_line_offset(&content, 3), 10);
+    // `line_col_of` round-trips that offset back to (line 2, column 0).
+    assert_eq!(find::line_col_of(&content, 10), (2, 0));
 }

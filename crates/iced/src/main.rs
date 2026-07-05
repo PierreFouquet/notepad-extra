@@ -439,10 +439,9 @@ impl Shell {
             Effect::SavePreferences(prefs) => match config_path() {
                 Some(path) => {
                     let json = prefs.to_json();
-                    Task::perform(
-                        async move { core::io::write_file(&path, &json) },
-                        |_| Message::PreferencesSaved,
-                    )
+                    Task::perform(async move { core::io::write_file(&path, &json) }, |_| {
+                        Message::PreferencesSaved
+                    })
                 }
                 None => Task::none(),
             },
@@ -1207,14 +1206,20 @@ mod tests {
         let _ = session1.update(Message::ZoomIn);
         let _ = session1.update(Message::ZoomIn);
         let saved_size = session1.core.font_size();
-        assert_ne!(saved_size, core::State::DEFAULT_FONT_SIZE, "zoom actually moved");
+        assert_ne!(
+            saved_size,
+            core::State::DEFAULT_FONT_SIZE,
+            "zoom actually moved"
+        );
         core::io::write_file(&path, &session1.core.preferences().to_json())
             .expect("persist preferences");
 
         // --- Session 2 ("restart"): a brand-new shell loads that file, exactly as
         // `boot` does, and must come up with the persisted settings — not defaults.
         let (mut session2, _) = Shell::new();
-        session2.core.apply_preferences(&load_preferences_from(&path));
+        session2
+            .core
+            .apply_preferences(&load_preferences_from(&path));
         assert_eq!(session2.core.font_size(), saved_size, "zoom restored");
         assert!(session2.core.word_wrap(), "word-wrap restored");
     }
@@ -1227,7 +1232,9 @@ mod tests {
         let missing = dir.path().join("does-not-exist.json");
 
         let (mut shell, _) = Shell::new();
-        shell.core.apply_preferences(&load_preferences_from(&missing));
+        shell
+            .core
+            .apply_preferences(&load_preferences_from(&missing));
         assert_eq!(shell.core.font_size(), core::State::DEFAULT_FONT_SIZE);
         assert!(!shell.core.word_wrap());
     }
@@ -1253,9 +1260,6 @@ mod tests {
         // per-user location. Fully offline: no network, just a filesystem path.
         let path = config_path().expect("a config path in the test environment");
         assert_eq!(path.file_name().unwrap(), "preferences.json");
-        assert_eq!(
-            path.parent().unwrap().file_name().unwrap(),
-            "notepad-extra"
-        );
+        assert_eq!(path.parent().unwrap().file_name().unwrap(), "notepad-extra");
     }
 }

@@ -143,6 +143,19 @@ enum Message {
     /// failure to persist a setting must never interrupt editing (see the core's
     /// `Effect::SavePreferences`).
     PreferencesSaved,
+
+    // ---- About dialog + external links (#40) ----
+    /// Show or hide the About panel.
+    ToggleAbout,
+    /// Close the About panel.
+    CloseAbout,
+    /// Open an About-panel link in the user's browser. The core vets the URL and
+    /// only then asks us to open it (see `core::Message::OpenUrl`).
+    OpenLink(String),
+    /// An external-link open finished. The result is intentionally ignored: the
+    /// app stays offline and a failed hand-off to the OS handler must not
+    /// interrupt editing (mirrors `PreferencesSaved`).
+    LinkOpened,
 }
 
 /// The user's answer to the close-with-unsaved prompt (#31).
@@ -344,6 +357,23 @@ impl Shell {
             // The preferences write landed (#38). Nothing to do: its result is
             // deliberately swallowed so a failed save never disrupts editing.
             Message::PreferencesSaved => Task::none(),
+
+            // ---- About dialog + external links (#40) ----
+            Message::ToggleAbout => {
+                let msg = if self.core.about_open() {
+                    core::Message::AboutClosed
+                } else {
+                    core::Message::AboutOpened
+                };
+                self.apply_core(msg, false)
+            }
+            Message::CloseAbout => self.apply_core(core::Message::AboutClosed, false),
+            // The core decides whether the URL is safe to open; an unsafe one
+            // yields no effect, so nothing reaches the OS handler.
+            Message::OpenLink(url) => self.apply_core(core::Message::OpenUrl(url), false),
+            // The external open finished; its result is swallowed (see the doc on
+            // `Message::LinkOpened`).
+            Message::LinkOpened => Task::none(),
         }
     }
 
@@ -445,6 +475,15 @@ impl Shell {
                 }
                 None => Task::none(),
             },
+            // Hand an About-panel link to the OS's browser off the UI thread
+            // (#40). The core already vetted the URL; `open_external` re-checks
+            // and spawns the handler detached. The result is dropped — the app
+            // stays offline and a failed hand-off never interrupts editing.
+            Effect::OpenUrl(url) => {
+                Task::perform(async move { core::io::open_external(&url) }, |_| {
+                    Message::LinkOpened
+                })
+            }
         }
     }
 
@@ -476,6 +515,12 @@ impl Shell {
         } else {
             button::secondary
         };
+        // The About button reads as "pressed" while the panel is showing (#40).
+        let about_style = if self.core.about_open() {
+            button::primary
+        } else {
+            button::secondary
+        };
         let toolbar = row![
             button("New").on_press(Message::NewTab),
             button("Open").on_press(Message::Open),
@@ -495,6 +540,10 @@ impl Shell {
             button("Wrap")
                 .style(wrap_style)
                 .on_press(Message::ToggleWordWrap),
+            // About panel toggle (#40): lit while the panel is showing.
+            button("About")
+                .style(about_style)
+                .on_press(Message::ToggleAbout),
         ]
         .spacing(6);
 
@@ -549,6 +598,9 @@ impl Shell {
         };
 
         let mut layout = column![toolbar, tabs].spacing(8).padding(10);
+        if self.core.about_open() {
+            layout = layout.push(self.about_panel());
+        }
         if self.confirm_close.is_some() {
             layout = layout.push(self.confirm_bar());
         }
@@ -593,6 +645,46 @@ impl Shell {
             .spacing(8),
         )
         .padding(6)
+        .into()
+    }
+
+    /// The About panel (#40), shown while `core.about_open()`. Renders the app
+    /// name, version, license, and the project links. The version is
+    /// `NOTEPAD_EXTRA_VERSION`, resolved from the release tag at build time (see
+    /// `build.rs`) so it tracks the GitHub release while the app stays offline.
+    /// The links dispatch [`Message::OpenLink`]; the core vets each URL and only
+    /// then asks the shell to hand it to the OS browser via
+    /// [`core::io::open_external`] — the app never makes a network request itself.
+    ///
+    /// Rendered as an in-app panel rather than a native dialog, for the same
+    /// reason as [`Shell::confirm_bar`]: the `xdg-portal` backend exposes no
+    /// message dialog, and an in-app panel stays fully offline and headlessly
+    /// testable.
+    fn about_panel(&self) -> Element<'_, Message> {
+        let heading = format!("{APP_NAME} {}", env!("NOTEPAD_EXTRA_VERSION"));
+        container(
+            column![
+                text(heading).size(20),
+                text(LICENSE),
+                row![
+                    button("Homepage")
+                        .style(button::secondary)
+                        .on_press(Message::OpenLink(HOMEPAGE_URL.to_string())),
+                    button("License")
+                        .style(button::secondary)
+                        .on_press(Message::OpenLink(LICENSE_URL.to_string())),
+                    button("Report an issue")
+                        .style(button::secondary)
+                        .on_press(Message::OpenLink(ISSUES_URL.to_string())),
+                    button("Close")
+                        .style(button::primary)
+                        .on_press(Message::CloseAbout),
+                ]
+                .spacing(8),
+            ]
+            .spacing(8),
+        )
+        .padding(10)
         .into()
     }
 
@@ -666,6 +758,19 @@ fn option_button<'a>(
         .style(style)
         .on_press(Message::ToggleOption(option))
 }
+
+/// The display name shown in the window title and the About panel (#40).
+const APP_NAME: &str = "Notepad Extra";
+/// The project license, shown in the About panel (matches the crate metadata and
+/// the packaging `metainfo.xml`).
+const LICENSE: &str = "GPL-3.0-or-later";
+/// The project homepage, opened from the About panel (#40).
+const HOMEPAGE_URL: &str = "https://github.com/PierreFouquet/notepad-extra";
+/// The project issue tracker, opened from the About panel (#40).
+const ISSUES_URL: &str = "https://github.com/PierreFouquet/notepad-extra/issues";
+/// The full licence text (the repo's `LICENSE` file), opened from the About
+/// panel (#40).
+const LICENSE_URL: &str = "https://github.com/PierreFouquet/notepad-extra/blob/main/LICENSE";
 
 /// The window title: the active document's, with a leading "• " when dirty and
 /// the app name appended. Kept in sync via [`Effect::SetTitle`] at runtime; this
@@ -1251,6 +1356,76 @@ mod tests {
         shell.core.apply_preferences(&load_preferences_from(&path));
         assert_eq!(shell.core.font_size(), core::State::DEFAULT_FONT_SIZE);
         assert!(!shell.core.word_wrap());
+    }
+
+    // ---- File open / save wiring gap-fill (#29) ----
+
+    #[test]
+    fn cancelling_the_open_dialog_leaves_everything_untouched() {
+        // A cancelled open picker (`OpenPicked(None)`) must be a clean no-op: no
+        // new tab, no error, the live buffer preserved.
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::Edit(paste("in progress")));
+        let _ = shell.update(Message::Open); // would show the picker
+        let _ = shell.update(Message::OpenPicked(None)); // user cancels
+        assert_eq!(shell.core.docs.len(), 1);
+        assert!(shell.error.is_none());
+        assert_eq!(shell.editor.text().trim_end(), "in progress");
+        assert!(shell.core.active_doc().dirty());
+    }
+
+    // ---- About dialog + external links wiring (#40) ----
+
+    #[test]
+    fn about_button_toggles_the_panel() {
+        let (mut shell, _) = Shell::new();
+        assert!(!shell.core.about_open());
+        let _ = shell.update(Message::ToggleAbout);
+        assert!(shell.core.about_open());
+        let _ = shell.update(Message::ToggleAbout);
+        assert!(!shell.core.about_open());
+        // Explicit close also clears it, and the panel renders while open.
+        let _ = shell.update(Message::ToggleAbout);
+        let _ = shell.view();
+        let _ = shell.update(Message::CloseAbout);
+        assert!(!shell.core.about_open());
+    }
+
+    #[test]
+    fn opening_a_link_is_harmless_to_the_document() {
+        // Whatever the link, dispatching it must never disturb the buffer or its
+        // tabs (the core vets the URL; the shell only forwards it). We drive both
+        // a safe and an unsafe URL to exercise the routing without launching a
+        // real browser in the test.
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::Edit(paste("body")));
+        for url in [HOMEPAGE_URL, LICENSE_URL, ISSUES_URL] {
+            // Every About link is a safe https URL the core will accept.
+            assert!(core::io::is_safe_external_url(url), "safe link: {url}");
+            let _ = shell.update(Message::OpenLink(url.to_string()));
+        }
+        let _ = shell.update(Message::OpenLink("javascript:alert(1)".to_string()));
+        let _ = shell.update(Message::LinkOpened);
+        assert_eq!(shell.core.docs.len(), 1);
+        assert_eq!(shell.core.active_doc().content.trim_end(), "body");
+        assert!(shell.error.is_none());
+    }
+
+    #[test]
+    fn about_version_is_resolved_from_the_release_tag() {
+        // The About panel's version is baked in at build time from the release
+        // tag (see `build.rs`). Whatever resolved it, the value must be a clean,
+        // offline, tag-shaped string: non-empty, no leading `v`, dotted numbers.
+        let version = env!("NOTEPAD_EXTRA_VERSION");
+        assert!(!version.is_empty(), "a version is always resolved");
+        assert!(
+            !version.starts_with('v'),
+            "the leading `v` from the git tag is stripped: {version:?}"
+        );
+        assert!(
+            version.contains('.') && version.chars().next().is_some_and(|c| c.is_ascii_digit()),
+            "looks like a dotted version: {version:?}"
+        );
     }
 
     #[test]

@@ -2758,6 +2758,7 @@ version = "0.1.0"
 dependencies = [
  "iced",
  "notepad-core",
+ "png 0.18.1",
  "rfd 0.15.4",
 ]
 

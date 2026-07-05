@@ -33,3 +33,10 @@ rfd = { version = "0.15", default-features = false, features = [
     "xdg-portal",
     "async-std",
 ] }
+
+# Decode the embedded `icons/icon.png` into RGBA for the window icon (#66). Pure
+# Rust and already in `Cargo.lock`, so it adds nothing to vendor for the
+# source-built packaging story (#17). iced's `from_file_data` needs its `image`
+# feature (off under our `default-features = false` build), so we decode here and
+# hand raw RGBA to `window::icon::from_rgba`.
+png = { version = "0.18", default-features = false }

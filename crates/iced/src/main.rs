@@ -23,9 +23,45 @@ use notepad_core::{Effect, FindOption, TabId};
 use std::path::PathBuf;
 
 pub fn main() -> iced::Result {
+    let window = iced::window::Settings {
+        icon: window_icon(),
+        ..iced::window::Settings::default()
+    };
     iced::application(Shell::new, Shell::update, Shell::view)
         .title(Shell::title)
+        .window(window)
         .run()
+}
+
+/// The window / taskbar icon, decoded from the embedded `icons/icon.png` (#66).
+///
+/// The PNG travels *inside* the binary via `include_bytes!`, so the icon needs
+/// no external file at runtime (portable, single source of truth). iced's
+/// `from_file_data` needs its `image` feature — off under our
+/// `default-features = false` build — so we decode to RGBA with the `png` crate
+/// (already in `Cargo.lock`) and hand raw pixels to `window::icon::from_rgba`.
+///
+/// Returns `None` (icon-less, never a panic) if the asset can't be decoded or
+/// isn't 8-bit RGBA, so a bad icon can never take the window down.
+///
+/// Platform note: this sets the icon on **Linux** (WM / taskbar) and **Windows**
+/// (titlebar / taskbar). **macOS ignores runtime window icons** — its dock icon
+/// comes from the `.app` bundle's `.icns` at packaging time (#43).
+fn window_icon() -> Option<iced::window::Icon> {
+    static PNG: &[u8] = include_bytes!("../../../icons/icon.png");
+
+    // png 0.18's `Decoder` needs `BufRead + Seek`; a `Cursor` over the embedded
+    // bytes provides both.
+    let mut reader = png::Decoder::new(std::io::Cursor::new(PNG))
+        .read_info()
+        .ok()?;
+    let mut buf = vec![0; reader.output_buffer_size()?];
+    let info = reader.next_frame(&mut buf).ok()?;
+    if info.color_type != png::ColorType::Rgba || info.bit_depth != png::BitDepth::Eight {
+        return None;
+    }
+    buf.truncate(info.buffer_size());
+    iced::window::icon::from_rgba(buf, info.width, info.height).ok()
 }
 
 /// Shell-level messages: direct user intents, editor actions, and the results of
@@ -487,6 +523,14 @@ mod tests {
 
     fn paste(s: &str) -> text_editor::Action {
         text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new(s.to_string())))
+    }
+
+    #[test]
+    fn window_icon_decodes_from_the_embedded_png() {
+        // The bundled `icons/icon.png` must decode to a real RGBA icon (#66),
+        // so the window never falls back to the generic cog.
+        let icon = window_icon();
+        assert!(icon.is_some(), "embedded icon.png should decode to an Icon");
     }
 
     #[test]

@@ -137,6 +137,12 @@ enum Message {
     /// Toggle soft word-wrap. Driven by the toolbar button; a key accelerator
     /// arrives with the rest in #39.
     ToggleWordWrap,
+
+    // ---- Preferences persistence (#38) ----
+    /// A preferences write finished. The result is intentionally ignored: a
+    /// failure to persist a setting must never interrupt editing (see the core's
+    /// `Effect::SavePreferences`).
+    PreferencesSaved,
 }
 
 /// The user's answer to the close-with-unsaved prompt (#31).

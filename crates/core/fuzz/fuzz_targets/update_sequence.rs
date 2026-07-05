@@ -11,7 +11,7 @@ use std::path::PathBuf;
 // Built here rather than deriving `Arbitrary` on the core types, so the core
 // stays free of the `arbitrary` dependency.
 fn arb_message(u: &mut Unstructured) -> arbitrary::Result<Message> {
-    Ok(match u.int_in_range(0u8..=21)? {
+    Ok(match u.int_in_range(0u8..=24)? {
         0 => Message::NewTab,
         1 => Message::OpenRequested,
         2 => Message::SaveRequested,
@@ -48,7 +48,14 @@ fn arb_message(u: &mut Unstructured) -> arbitrary::Result<Message> {
         18 => Message::FindPrev,
         19 => Message::ReplaceNext,
         20 => Message::ReplaceAll,
-        _ => Message::GoToLine(usize::arbitrary(u)?),
+        21 => Message::GoToLine(usize::arbitrary(u)?),
+        // Close-with-unsaved guard (#31): drive the discard / save-then-close /
+        // abandon paths with arbitrary ids so pending_close can never strand.
+        22 => Message::TabCloseDiscard(TabId::arbitrary(u)?),
+        23 => Message::TabCloseSave(TabId::arbitrary(u)?),
+        _ => Message::SaveAbandoned {
+            id: TabId::arbitrary(u)?,
+        },
     })
 }
 

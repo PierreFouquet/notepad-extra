@@ -11,7 +11,7 @@ use std::path::PathBuf;
 // Built here rather than deriving `Arbitrary` on the core types, so the core
 // stays free of the `arbitrary` dependency.
 fn arb_message(u: &mut Unstructured) -> arbitrary::Result<Message> {
-    Ok(match u.int_in_range(0u8..=24)? {
+    Ok(match u.int_in_range(0u8..=27)? {
         0 => Message::NewTab,
         1 => Message::OpenRequested,
         2 => Message::SaveRequested,
@@ -53,9 +53,14 @@ fn arb_message(u: &mut Unstructured) -> arbitrary::Result<Message> {
         // abandon paths with arbitrary ids so pending_close can never strand.
         22 => Message::TabCloseDiscard(TabId::arbitrary(u)?),
         23 => Message::TabCloseSave(TabId::arbitrary(u)?),
-        _ => Message::SaveAbandoned {
+        24 => Message::SaveAbandoned {
             id: TabId::arbitrary(u)?,
         },
+        // Editor zoom (#35): let a fuzzed stream storm the zoom controls so the
+        // font-size clamp is exercised alongside everything else.
+        25 => Message::ZoomIn,
+        26 => Message::ZoomOut,
+        _ => Message::ZoomReset,
     })
 }
 
@@ -73,6 +78,9 @@ fuzz_target!(|data: &[u8]| {
             state.active < state.docs.len(),
             "active index must stay in bounds"
         );
+        // Zoom (#35) must always leave the font size within its bounds.
+        assert!(state.font_size() >= State::MIN_FONT_SIZE);
+        assert!(state.font_size() <= State::MAX_FONT_SIZE);
         // A highlighted find match must never dangle past the active buffer.
         if let Some(hit) = state.find.current {
             let content = &state.active_doc().content;

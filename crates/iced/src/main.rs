@@ -123,6 +123,14 @@ enum Message {
     GoToInputChanged(String),
     /// Jump to the line typed in the go-to input.
     GoToSubmit,
+
+    // ---- Editor zoom / font size (#35) ----
+    /// Enlarge / shrink / reset the editor font. Key accelerators (Ctrl+ +/-/0)
+    /// are wired with the rest of the shortcuts in #39; these drive the toolbar
+    /// buttons for now.
+    ZoomIn,
+    ZoomOut,
+    ZoomReset,
 }
 
 /// The user's answer to the close-with-unsaved prompt (#31).
@@ -301,6 +309,12 @@ impl Shell {
                 Ok(line) => self.apply_core(core::Message::GoToLine(line), false),
                 Err(_) => Task::none(), // ignore non-numeric input, never panic
             },
+
+            // Zoom changes only the app-wide font size the view reads; it never
+            // rewrites the buffer, so resync=false leaves the editor untouched.
+            Message::ZoomIn => self.apply_core(core::Message::ZoomIn, false),
+            Message::ZoomOut => self.apply_core(core::Message::ZoomOut, false),
+            Message::ZoomReset => self.apply_core(core::Message::ZoomReset, false),
         }
     }
 
@@ -424,6 +438,11 @@ impl Shell {
             button("Find")
                 .style(find_style)
                 .on_press(Message::ToggleFind),
+            // Zoom group (#35): shrink / reset / enlarge. The middle button shows
+            // the current point size and resets it when clicked (Ctrl+0 in #39).
+            button("A\u{2212}").on_press(Message::ZoomOut),
+            button(text(format!("{} pt", self.core.font_size()))).on_press(Message::ZoomReset),
+            button("A+").on_press(Message::ZoomIn),
         ]
         .spacing(6);
 
@@ -449,6 +468,7 @@ impl Shell {
 
         let editor = text_editor(&self.editor)
             .on_action(Message::Edit)
+            .size(f32::from(self.core.font_size()))
             .height(Fill);
 
         let status: Element<'_, Message> = match &self.error {
@@ -997,5 +1017,23 @@ mod tests {
         assert_eq!(s.language, "Rust");
         assert_eq!(s.eol, "CRLF");
         assert_eq!(s.encoding, "UTF-8");
+    }
+
+    #[test]
+    fn zoom_messages_change_the_core_font_size_without_touching_the_buffer() {
+        // The shell wires the zoom buttons straight through to the core (#35) and
+        // must not resync/clear the editor: typed text survives a zoom.
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::Edit(paste("keep me")));
+        let base = shell.core.font_size();
+
+        let _ = shell.update(Message::ZoomIn);
+        assert_eq!(shell.core.font_size(), base + 1);
+        let _ = shell.update(Message::ZoomReset);
+        assert_eq!(shell.core.font_size(), core::State::DEFAULT_FONT_SIZE);
+
+        // Zooming left the live buffer and its dirty flag alone.
+        assert_eq!(shell.editor.text().trim_end(), "keep me");
+        assert!(shell.core.active_doc().dirty());
     }
 }

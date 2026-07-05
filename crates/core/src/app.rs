@@ -116,6 +116,11 @@ pub struct State {
     pub active: usize,
     /// Find / Replace / Go-to bar state (#33).
     pub find: FindState,
+    /// Editor font size in points, a single app-wide zoom level shared by every
+    /// tab (#35). Always within `[MIN_FONT_SIZE, MAX_FONT_SIZE]`; mutate only
+    /// through [`State::zoom_in`] / [`State::zoom_out`] / [`State::zoom_reset`],
+    /// which enforce that. Read via [`State::font_size`]. Persisted by #38.
+    font_size: u16,
     /// A document (by stable id) that must be closed once its in-flight
     /// "save before closing" write lands (#31). Set by [`Message::TabCloseSave`],
     /// consumed by [`Message::FileSaved`], and cleared by [`Message::SaveAbandoned`]
@@ -131,6 +136,7 @@ impl Default for State {
             docs: Vec::new(),
             active: 0,
             find: FindState::default(),
+            font_size: State::DEFAULT_FONT_SIZE,
             pending_close: None,
             next_id: 1,
         };
@@ -141,10 +147,51 @@ impl Default for State {
 }
 
 impl State {
+    /// Smallest editor font size the zoom controls allow — never zero or
+    /// negative, so text stays selectable and the layout never collapses (#35).
+    pub const MIN_FONT_SIZE: u16 = 6;
+    /// Largest editor font size the zoom controls allow. Bounded so a "zoom in"
+    /// storm can never overflow or blow the layout up (#35).
+    pub const MAX_FONT_SIZE: u16 = 96;
+    /// The font size a fresh window opens at, and the target of "reset zoom".
+    pub const DEFAULT_FONT_SIZE: u16 = 14;
+    /// How much one zoom step moves the font size, in points.
+    const FONT_SIZE_STEP: u16 = 1;
+
     fn alloc_id(&mut self) -> TabId {
         let id = self.next_id;
         self.next_id += 1;
         id
+    }
+
+    /// The current editor font size in points, always within
+    /// `[MIN_FONT_SIZE, MAX_FONT_SIZE]`.
+    pub fn font_size(&self) -> u16 {
+        self.font_size
+    }
+
+    /// Enlarge the editor font by one step, clamped to `MAX_FONT_SIZE` (Ctrl+ +).
+    /// `saturating_add` means the arithmetic itself can never overflow before the
+    /// clamp, so no input sequence can produce a bad size.
+    fn zoom_in(&mut self) {
+        self.set_font_size(self.font_size.saturating_add(Self::FONT_SIZE_STEP));
+    }
+
+    /// Shrink the editor font by one step, clamped to `MIN_FONT_SIZE` (Ctrl+ -).
+    fn zoom_out(&mut self) {
+        self.set_font_size(self.font_size.saturating_sub(Self::FONT_SIZE_STEP));
+    }
+
+    /// Restore the default font size (Ctrl+0).
+    fn zoom_reset(&mut self) {
+        self.set_font_size(Self::DEFAULT_FONT_SIZE);
+    }
+
+    /// The single choke point that writes `font_size`, clamping into the allowed
+    /// range so the invariant holds no matter who sets it (the zoom messages now,
+    /// a persisted preference later, #38).
+    fn set_font_size(&mut self, size: u16) {
+        self.font_size = size.clamp(Self::MIN_FONT_SIZE, Self::MAX_FONT_SIZE);
     }
 
     /// The focused document.
@@ -156,6 +203,15 @@ impl State {
         self.docs.iter_mut().find(|d| d.id == id)
     }
 }
+
+/// The zoom bounds (#35) must form a non-empty range with a default inside it.
+/// Checked at compile time so a bad edit to the constants never builds.
+const _: () = {
+    assert!(State::MIN_FONT_SIZE > 0);
+    assert!(State::MIN_FONT_SIZE < State::MAX_FONT_SIZE);
+    assert!(State::DEFAULT_FONT_SIZE >= State::MIN_FONT_SIZE);
+    assert!(State::DEFAULT_FONT_SIZE <= State::MAX_FONT_SIZE);
+};
 
 /// Everything that can happen: user intent (`OpenRequested`), shell results
 /// (`FileLoaded`), and editor signals (`Edited`).
@@ -219,6 +275,14 @@ pub enum Message {
     ReplaceAll,
     /// Move the caret to 1-based `line`, clamped into range.
     GoToLine(usize),
+
+    // ---- Editor zoom / font size (#35) ----
+    /// Enlarge the editor font by one step (Ctrl+ +), clamped to the maximum.
+    ZoomIn,
+    /// Shrink the editor font by one step (Ctrl+ -), clamped to the minimum.
+    ZoomOut,
+    /// Reset the editor font to the default size (Ctrl+0).
+    ZoomReset,
 }
 
 /// A side effect for the render shell to perform. `update` returns these instead
@@ -476,6 +540,22 @@ pub fn update(state: &mut State, message: Message) -> Vec<Effect> {
                 start: offset,
                 end: offset,
             }]
+        }
+
+        // ---- Editor zoom / font size (#35) ----
+        // Zoom only changes the app-wide font size, which the shell reads from
+        // `font_size()` when it renders — no effect, no buffer or title change.
+        Message::ZoomIn => {
+            state.zoom_in();
+            vec![]
+        }
+        Message::ZoomOut => {
+            state.zoom_out();
+            vec![]
+        }
+        Message::ZoomReset => {
+            state.zoom_reset();
+            vec![]
         }
     }
 }
@@ -1408,6 +1488,66 @@ mod tests {
         assert_eq!(s.find.current, Some(Match { start: 0, end: 5 }));
     }
 
+    // ---- Editor zoom / font size (#35) ----
+
+    #[test]
+    fn fresh_state_opens_at_the_default_font_size() {
+        let s = State::default();
+        assert_eq!(s.font_size(), State::DEFAULT_FONT_SIZE);
+    }
+
+    #[test]
+    fn zoom_in_and_out_step_by_a_point_and_emit_no_effect() {
+        let mut s = State::default();
+        let base = s.font_size();
+        let fx = update(&mut s, Message::ZoomIn);
+        assert_eq!(s.font_size(), base + 1);
+        assert!(fx.is_empty(), "zoom is pure state, no effect to run");
+        update(&mut s, Message::ZoomOut);
+        update(&mut s, Message::ZoomOut);
+        assert_eq!(s.font_size(), base - 1);
+    }
+
+    #[test]
+    fn zoom_reset_returns_to_the_default_from_either_side() {
+        let mut s = State::default();
+        for _ in 0..10 {
+            update(&mut s, Message::ZoomIn);
+        }
+        assert!(s.font_size() > State::DEFAULT_FONT_SIZE);
+        update(&mut s, Message::ZoomReset);
+        assert_eq!(s.font_size(), State::DEFAULT_FONT_SIZE);
+        for _ in 0..10 {
+            update(&mut s, Message::ZoomOut);
+        }
+        assert!(s.font_size() < State::DEFAULT_FONT_SIZE);
+        update(&mut s, Message::ZoomReset);
+        assert_eq!(s.font_size(), State::DEFAULT_FONT_SIZE);
+    }
+
+    #[test]
+    fn zoom_out_clamps_at_the_minimum_never_zero_or_negative() {
+        let mut s = State::default();
+        // Far more zoom-outs than the range is wide: must settle exactly at MIN,
+        // never underflow past it (the whole point of the u16 + clamp).
+        for _ in 0..1000 {
+            update(&mut s, Message::ZoomOut);
+        }
+        assert_eq!(s.font_size(), State::MIN_FONT_SIZE);
+        assert!(s.font_size() > 0);
+    }
+
+    #[test]
+    fn zoom_in_clamps_at_the_maximum_and_cannot_overflow() {
+        let mut s = State::default();
+        // A "zoom in storm" of far more steps than u16 could ever hold: the
+        // saturating step plus the clamp must pin it exactly at MAX.
+        for _ in 0..100_000 {
+            update(&mut s, Message::ZoomIn);
+        }
+        assert_eq!(s.font_size(), State::MAX_FONT_SIZE);
+    }
+
     // ---- Property-based invariants (epic #25 Definition of Done) ----
 
     fn arb_message() -> impl Strategy<Value = Message> {
@@ -1451,6 +1591,11 @@ mod tests {
             ]
             .prop_map(Message::FindOptionToggled),
             (0usize..500).prop_map(Message::GoToLine),
+            // Editor zoom (#35): drive in/out/reset so the font-size invariant is
+            // checked under long random streams, including zoom storms.
+            Just(Message::ZoomIn),
+            Just(Message::ZoomOut),
+            Just(Message::ZoomReset),
         ]
     }
 
@@ -1465,6 +1610,10 @@ mod tests {
                 let _ = update(&mut s, m);
                 prop_assert!(!s.docs.is_empty());
                 prop_assert!(s.active < s.docs.len());
+                // Zoom (#35) can never drive the font size out of range, whatever
+                // the interleaving of ZoomIn / ZoomOut / ZoomReset.
+                prop_assert!(s.font_size() >= State::MIN_FONT_SIZE);
+                prop_assert!(s.font_size() <= State::MAX_FONT_SIZE);
             }
         }
 
@@ -1533,6 +1682,28 @@ mod tests {
             for _ in 0..60 { update(&mut s, Message::Undo); }
             for _ in 0..60 { update(&mut s, Message::Redo); }
             prop_assert_eq!(s.active_doc().content.clone(), top);
+        }
+
+        /// Any interleaving of zoom in/out/reset keeps the font size within the
+        /// allowed range, and a reset anywhere in the stream lands exactly on the
+        /// default — the guarantees the persistence issue (#38) will rely on.
+        #[test]
+        fn zoom_stays_in_range_and_reset_is_exact(ops in prop::collection::vec(0u8..3, 0..300)) {
+            let mut s = State::default();
+            for op in ops {
+                let msg = match op {
+                    0 => Message::ZoomIn,
+                    1 => Message::ZoomOut,
+                    _ => Message::ZoomReset,
+                };
+                let is_reset = matches!(msg, Message::ZoomReset);
+                update(&mut s, msg);
+                prop_assert!(s.font_size() >= State::MIN_FONT_SIZE);
+                prop_assert!(s.font_size() <= State::MAX_FONT_SIZE);
+                if is_reset {
+                    prop_assert_eq!(s.font_size(), State::DEFAULT_FONT_SIZE);
+                }
+            }
         }
 
         /// After any stream of find/replace/edit messages, the find state stays

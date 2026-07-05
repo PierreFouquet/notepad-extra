@@ -140,6 +140,93 @@ fn rapid_tab_churn_never_underflows() {
     assert_eq!(s.docs.len(), 1);
 }
 
+#[test]
+fn rapid_tab_switch_storm_stays_consistent() {
+    // Open a pile of distinct tabs, then jump the selection all over the strip
+    // tens of thousands of times. `active` must stay in range and each tab must
+    // keep exactly the content it was loaded with (#31).
+    let mut s = State::default();
+    for i in 0..200 {
+        update(
+            &mut s,
+            Message::FileLoaded {
+                path: PathBuf::from(format!("/tmp/tab{i}.txt")),
+                content: format!("content {i}\n"),
+            },
+        );
+    }
+    assert_eq!(s.docs.len(), 200);
+    let mut idx = 0usize;
+    for step in 0..50_000 {
+        idx = (idx * 7 + step) % s.docs.len();
+        update(&mut s, Message::TabSelected(idx));
+        assert_eq!(s.active, idx);
+        assert!(s.active < s.docs.len());
+    }
+    for (i, doc) in s.docs.iter().enumerate() {
+        assert_eq!(doc.content, format!("content {i}\n"));
+    }
+}
+
+#[test]
+fn closing_thousands_of_dirty_tabs_via_discard_is_bounded() {
+    // Every tab is dirty, so every close routes through the confirm → discard
+    // path. Closing far past the tab count must never underflow, and each dirty
+    // tab must ask before it goes (#31).
+    let mut s = State::default();
+    for _ in 0..2000 {
+        update(&mut s, Message::NewTab);
+        update(&mut s, Message::Edited("dirty".into())); // dirties the new active tab
+    }
+    assert_eq!(s.docs.len(), 2001); // 2000 new + the original blank
+    for _ in 0..5000 {
+        let id = s.active_doc().id;
+        let dirty = s.active_doc().dirty();
+        let active = s.active;
+        let fx = update(&mut s, Message::TabClosed(active));
+        if dirty {
+            assert!(
+                matches!(fx.first(), Some(Effect::ConfirmClose { .. })),
+                "a dirty tab must ask before closing"
+            );
+            update(&mut s, Message::TabCloseDiscard(id));
+        }
+        assert!(!s.docs.is_empty());
+        assert!(s.active < s.docs.len());
+    }
+    assert_eq!(s.docs.len(), 1);
+}
+
+#[test]
+fn many_large_tabs_are_retained_then_freed() {
+    // A proxy for the "memory footprint with many large tabs" concern: open a few
+    // hundred tabs each holding a sizeable buffer, prove every buffer survives
+    // intact, then close them all and prove the document list shrinks back to a
+    // single tab (no lingering entries) (#31).
+    let mut s = State::default();
+    let big = "lorem ipsum dolor sit amet\n".repeat(2000); // ~54 KB per tab
+    for i in 0..250 {
+        update(
+            &mut s,
+            Message::FileLoaded {
+                path: PathBuf::from(format!("/tmp/big{i}.txt")),
+                content: big.clone(),
+            },
+        );
+    }
+    assert_eq!(s.docs.len(), 250);
+    for doc in &s.docs {
+        assert_eq!(doc.content.len(), big.len());
+    }
+    // Freshly loaded tabs are clean, so each closes without a confirmation.
+    for _ in 0..250 {
+        update(&mut s, Message::TabClosed(0));
+        assert!(!s.docs.is_empty());
+    }
+    assert_eq!(s.docs.len(), 1);
+    assert!(s.active_doc().content.is_empty(), "ends on a fresh blank");
+}
+
 // ---- Find / Replace / Go-to-line adversarial cases (#33) ----
 
 #[test]

@@ -20,9 +20,11 @@ pub mod find;
 pub mod history;
 pub mod io;
 pub mod lang;
+pub mod status;
 pub mod text;
 
 pub use app::{Document, Effect, FindOption, FindState, Message, State, TabId, update};
 pub use find::{Match, Matcher, Replacement, SearchError, SearchOptions};
 pub use history::{Edit, History, diff};
+pub use status::{StatusBar, status};
 pub use text::EndOfLine;

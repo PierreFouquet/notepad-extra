@@ -302,6 +302,21 @@ pub fn line_col_of(text: &str, offset: usize) -> (usize, usize) {
     (line, offset - line_start)
 }
 
+/// The byte offset of the 0-based `line` and byte-`column` iced's cursor
+/// reports — the inverse of [`line_col_of`]. The column is clamped to the
+/// line's own length (so it can't spill into the next line) and floored onto a
+/// char boundary; `line` / `column` may be anything (they saturate), so any
+/// cursor the widget hands us maps to a safe, in-bounds offset. Pure, so the
+/// shell's cursor→offset conversion is proven here, not in the window-bound
+/// shell.
+pub fn offset_at(text: &str, line: usize, column: usize) -> usize {
+    let line_start = goto_line_offset(text, line.saturating_add(1));
+    let line_end = text[line_start..]
+        .find('\n')
+        .map_or(text.len(), |i| line_start + i);
+    floor_boundary(text, line_start.saturating_add(column).min(line_end))
+}
+
 fn to_match(m: regex::Match) -> Match {
     Match {
         start: m.start(),
@@ -311,7 +326,8 @@ fn to_match(m: regex::Match) -> Match {
 
 /// Round `i` down to the nearest char boundary (clamped to `text.len()`), so an
 /// arbitrary offset is always safe to hand to the regex engine or to slice.
-fn floor_boundary(text: &str, i: usize) -> usize {
+/// Shared with [`crate::status`], which floors widget-supplied offsets too.
+pub(crate) fn floor_boundary(text: &str, i: usize) -> usize {
     if i >= text.len() {
         return text.len();
     }
@@ -583,6 +599,26 @@ mod tests {
     }
 
     #[test]
+    fn offset_at_inverts_line_col_of() {
+        let text = "ab\ncdé\nx"; // 'é' is two bytes on line 1
+        // Every boundary offset round-trips: offset -> (line, byte-col) -> offset.
+        for off in [0usize, 1, 2, 3, 4, 5, 7, 8] {
+            let (l, c) = line_col_of(text, off);
+            assert_eq!(
+                offset_at(text, l, c),
+                off,
+                "offset {off} did not round-trip"
+            );
+        }
+        // A column past the line's end clamps to the newline, never into the next line.
+        assert_eq!(offset_at(text, 0, 99), 2); // end of "ab"
+        // A line past the end clamps to the last line's start.
+        assert_eq!(offset_at(text, 999, 0), 8);
+        // Saturating arithmetic: extreme inputs clamp to end-of-text, never overflow.
+        assert_eq!(offset_at(text, usize::MAX, usize::MAX), text.len());
+    }
+
+    #[test]
     fn match_helpers_report_shape() {
         let m = Match { start: 3, end: 3 };
         assert!(m.is_empty());
@@ -668,6 +704,19 @@ mod tests {
         #[test]
         fn goto_line_is_always_in_bounds(text in ".{0,200}", line in 0usize..500) {
             let off = goto_line_offset(&text, line);
+            prop_assert!(off <= text.len());
+            prop_assert!(text.is_char_boundary(off));
+        }
+
+        /// `offset_at` maps any (line, column) — however far out of range — to an
+        /// in-bounds char boundary, and never panics.
+        #[test]
+        fn offset_at_is_always_a_valid_boundary(
+            text in ".{0,200}",
+            line in 0usize..300,
+            column in 0usize..300,
+        ) {
+            let off = offset_at(&text, line, column);
             prop_assert!(off <= text.len());
             prop_assert!(text.is_char_boundary(off));
         }

@@ -5,7 +5,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use notepad_core::EndOfLine;
-use notepad_core::{lang, text};
+use notepad_core::{find, lang, text};
 
 fuzz_target!(|s: String| {
     let _ = EndOfLine::detect(&s);
@@ -15,4 +15,16 @@ fuzz_target!(|s: String| {
     let _ = text::basename(&s);
     let _ = text::extension_of(&s);
     let _ = lang::language_for_path(&s);
+
+    // Position helpers behind the status bar (#37) and go-to-line: arbitrary
+    // byte offsets and (line, column) pairs — including out-of-range and
+    // mid-glyph — must clamp to a valid boundary, never panic.
+    let _ = find::line_count(&s);
+    for off in [0, s.len() / 2, s.len(), s.len().saturating_add(7), usize::MAX] {
+        let (line, col) = find::line_col_of(&s, off);
+        let _ = find::goto_line_offset(&s, off);
+        let _ = find::offset_at(&s, off, off);
+        // Round-trip the reported cursor position back to an offset.
+        let _ = find::offset_at(&s, line, col);
+    }
 });

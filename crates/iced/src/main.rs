@@ -297,6 +297,22 @@ impl Shell {
         }
     }
 
+    /// The status-bar readout for the active document, derived from the pure
+    /// core plus the editor widget's live caret/selection. Headless-testable:
+    /// `text_editor::Content::cursor()` needs no renderer. The widget speaks in
+    /// `(line, byte-column)`, which `offset_at` turns into the byte offsets the
+    /// core's [`core::status`] expects.
+    fn status(&self) -> core::StatusBar {
+        let doc = self.core.active_doc();
+        let cursor = self.editor.cursor();
+        let caret =
+            core::find::offset_at(&doc.content, cursor.position.line, cursor.position.column);
+        let anchor = cursor
+            .selection
+            .map(|a| core::find::offset_at(&doc.content, a.line, a.column));
+        core::status(doc, caret, anchor)
+    }
+
     fn view(&self) -> Element<'_, Message> {
         let find_style = if self.core.find.open {
             button::primary
@@ -340,16 +356,24 @@ impl Shell {
             .on_action(Message::Edit)
             .height(Fill);
 
-        let doc = self.core.active_doc();
         let status: Element<'_, Message> = match &self.error {
             Some(e) => text(format!("Error: {e}")).into(),
-            None => row![
-                text(doc.language),
-                text(doc.eol.label()),
-                text(format!("{} lines", self.editor.line_count())),
-            ]
-            .spacing(16)
-            .into(),
+            None => {
+                let s = self.status();
+                // Caret position first, then a selection count only when there
+                // is one, then document size, language, EOL and encoding.
+                let mut cells = row![text(format!("Ln {}, Col {}", s.line, s.column))].spacing(16);
+                if s.selection > 0 {
+                    cells = cells.push(text(format!("Sel {}", s.selection)));
+                }
+                cells
+                    .push(text(format!("{} chars", s.chars)))
+                    .push(text(format!("{} lines", s.lines)))
+                    .push(text(s.language))
+                    .push(text(s.eol))
+                    .push(text(s.encoding))
+                    .into()
+            }
         };
 
         let mut layout = column![toolbar, tabs].spacing(8).padding(10);
@@ -660,5 +684,59 @@ mod tests {
         assert_eq!(shell.core.find.count, 2); // case-insensitive
         let _ = shell.update(Message::ToggleOption(FindOption::CaseSensitive));
         assert_eq!(shell.core.find.count, 1);
+    }
+
+    // ---- Status bar wiring (#37) ----
+
+    #[test]
+    fn status_reports_the_caret_line_and_column() {
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::Edit(paste("one\ntwo\nthree")));
+        // Paste leaves the caret at the end of "three" on line 3.
+        let s = shell.status();
+        assert_eq!(s.line, 3);
+        assert_eq!(s.column, 6); // after the 5 chars of "three"
+        assert_eq!(s.selection, 0);
+    }
+
+    #[test]
+    fn status_follows_go_to_line() {
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::Edit(paste("one\ntwo\nthree")));
+        let _ = shell.update(Message::GoToInputChanged("2".into()));
+        let _ = shell.update(Message::GoToSubmit);
+        let s = shell.status();
+        assert_eq!((s.line, s.column), (2, 1));
+    }
+
+    #[test]
+    fn status_reports_the_selection_length() {
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::Edit(paste("hello")));
+        let _ = shell.update(Message::Edit(text_editor::Action::SelectAll));
+        let s = shell.status();
+        assert_eq!(s.selection, 5);
+        // Cross-check against the widget's own selected text.
+        assert_eq!(
+            shell
+                .editor
+                .selection()
+                .as_deref()
+                .map(|t| t.chars().count()),
+            Some(5)
+        );
+    }
+
+    #[test]
+    fn status_reflects_language_eol_and_encoding_after_load() {
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::FileRead {
+            path: PathBuf::from("/tmp/x.rs"),
+            result: Ok("fn main() {}\r\nok\r\n".to_string()),
+        });
+        let s = shell.status();
+        assert_eq!(s.language, "Rust");
+        assert_eq!(s.eol, "CRLF");
+        assert_eq!(s.encoding, "UTF-8");
     }
 }

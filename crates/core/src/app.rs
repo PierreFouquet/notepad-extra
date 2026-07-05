@@ -116,6 +116,12 @@ pub struct State {
     pub active: usize,
     /// Find / Replace / Go-to bar state (#33).
     pub find: FindState,
+    /// A document (by stable id) that must be closed once its in-flight
+    /// "save before closing" write lands (#31). Set by [`Message::TabCloseSave`],
+    /// consumed by [`Message::FileSaved`], and cleared by [`Message::SaveAbandoned`]
+    /// if that save is cancelled or fails — so an abandoned save never leaves a
+    /// tab primed to vanish on the next unrelated save.
+    pending_close: Option<TabId>,
     next_id: TabId,
 }
 
@@ -125,6 +131,7 @@ impl Default for State {
             docs: Vec::new(),
             active: 0,
             find: FindState::default(),
+            pending_close: None,
             next_id: 1,
         };
         let id = state.alloc_id();
@@ -174,10 +181,22 @@ pub enum Message {
     SavePathChosen { id: TabId, path: PathBuf },
     /// The shell finished writing document `id` to `path`.
     FileSaved { id: TabId, path: PathBuf },
+    /// A save for document `id` did not complete — the user cancelled the save
+    /// picker, or the write errored. Drops any pending "save before closing" so
+    /// the tab is not left primed to close on a later, unrelated save (#31).
+    SaveAbandoned { id: TabId },
     /// Focus the tab at `index` (ignored if out of range).
     TabSelected(usize),
-    /// Close the tab at `index`; a new blank tab appears if it was the last.
+    /// Close the tab at `index`. A clean tab closes at once; a tab with unsaved
+    /// changes instead yields [`Effect::ConfirmClose`] so the shell can prompt
+    /// (discard / cancel / save) — the close then arrives as one of the two
+    /// messages below. A new blank tab appears if the last tab is closed.
     TabClosed(usize),
+    /// The user chose to discard a dirty tab (by stable id): close it now (#31).
+    TabCloseDiscard(TabId),
+    /// The user chose to save a dirty tab before closing it (#31): save it, then
+    /// close it once the write lands (see `pending_close`).
+    TabCloseSave(TabId),
 
     // ---- Find / Replace / Go-to-line (#33) ----
     /// Open the find / replace bar and refresh its readout.
@@ -224,6 +243,11 @@ pub enum Effect {
     /// into view. `start == end` is a bare caret (go-to-line); otherwise it
     /// highlights a find match or a freshly inserted replacement.
     RevealRange { start: usize, end: usize },
+    /// The user tried to close document `id`, which has unsaved changes. The
+    /// shell must ask whether to save, discard, or keep it, replying with
+    /// [`Message::TabCloseSave`], [`Message::TabCloseDiscard`], or nothing
+    /// (cancel). `title` names the document for the prompt (#31).
+    ConfirmClose { id: TabId, title: String },
 }
 
 /// Apply `message` to `state`, returning the effects the shell must run.
@@ -332,7 +356,23 @@ pub fn update(state: &mut State, message: Message) -> Vec<Effect> {
                 doc.path = Some(path);
                 doc.history.mark_saved();
             }
+            // A "save before closing" was waiting on this write (#31): now that it
+            // landed, close the tab and repoint find at the new active document.
+            if state.pending_close == Some(id) {
+                state.pending_close = None;
+                if let Some(index) = state.docs.iter().position(|d| d.id == id) {
+                    close_doc_at(state, index);
+                }
+                resync_find_after_doc_change(state);
+            }
             title_effect(state)
+        }
+
+        Message::SaveAbandoned { id } => {
+            if state.pending_close == Some(id) {
+                state.pending_close = None;
+            }
+            vec![]
         }
 
         Message::TabSelected(index) => {
@@ -344,20 +384,53 @@ pub fn update(state: &mut State, message: Message) -> Vec<Effect> {
         }
 
         Message::TabClosed(index) => {
-            if index < state.docs.len() {
-                state.docs.remove(index);
-                if state.docs.is_empty() {
-                    let id = state.alloc_id();
-                    state.docs.push(Document::blank(id));
-                }
-                if state.active >= state.docs.len() {
-                    state.active = state.docs.len() - 1;
-                } else if index < state.active {
-                    state.active -= 1;
-                }
+            let Some(doc) = state.docs.get(index) else {
+                return vec![]; // out of range: nothing to close
+            };
+            if doc.dirty() {
+                // Unsaved changes: don't discard silently — ask the shell to
+                // confirm (discard / cancel / save). Nothing changes yet (#31).
+                return vec![Effect::ConfirmClose {
+                    id: doc.id,
+                    title: doc.title().to_string(),
+                }];
+            }
+            close_doc_at(state, index);
+            resync_find_after_doc_change(state);
+            title_effect(state)
+        }
+
+        Message::TabCloseDiscard(id) => {
+            if let Some(index) = state.docs.iter().position(|d| d.id == id) {
+                close_doc_at(state, index);
             }
             resync_find_after_doc_change(state);
             title_effect(state)
+        }
+
+        Message::TabCloseSave(id) => {
+            // Kick off the save for this doc (by id, not necessarily the active
+            // one) and arm the pending close so [`Message::FileSaved`] finishes
+            // the job. An untitled doc needs a destination first.
+            let effect = state
+                .docs
+                .iter()
+                .find(|d| d.id == id)
+                .map(|doc| match &doc.path {
+                    Some(path) => Effect::WriteFile {
+                        id,
+                        path: path.clone(),
+                        content: doc.eol.join(&doc.content),
+                    },
+                    None => Effect::PickSavePath { id },
+                });
+            match effect {
+                Some(fx) => {
+                    state.pending_close = Some(id);
+                    vec![fx]
+                }
+                None => vec![], // unknown id: nothing to save or close
+            }
         }
 
         // ---- Find / Replace / Go-to-line (#33) ----
@@ -409,6 +482,23 @@ pub fn update(state: &mut State, message: Message) -> Vec<Effect> {
 
 fn title_effect(state: &State) -> Vec<Effect> {
     vec![Effect::SetTitle(state.active_doc().title().to_string())]
+}
+
+/// Remove the document at `index`, preserving the two core invariants: the list
+/// never empties (a fresh blank refills it) and `active < docs.len()` still holds,
+/// with `active` following the same document when an earlier tab is removed.
+/// Callers resync find and emit the title afterward.
+fn close_doc_at(state: &mut State, index: usize) {
+    state.docs.remove(index);
+    if state.docs.is_empty() {
+        let id = state.alloc_id();
+        state.docs.push(Document::blank(id));
+    }
+    if state.active >= state.docs.len() {
+        state.active = state.docs.len() - 1;
+    } else if index < state.active {
+        state.active -= 1;
+    }
 }
 
 /// Apply `new_content` to the active document as one undo-able edit, returning
@@ -762,6 +852,200 @@ mod tests {
         assert_eq!(s.active, 0);
         update(&mut s, Message::TabClosed(42));
         assert_eq!(s.docs.len(), 1);
+    }
+
+    // ---- Close-with-unsaved guard (#31) ----
+
+    /// The `(id, title)` of a `ConfirmClose` effect in a set, if present.
+    fn confirm_close(fx: &[Effect]) -> Option<(TabId, &str)> {
+        fx.iter().find_map(|e| match e {
+            Effect::ConfirmClose { id, title } => Some((*id, title.as_str())),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn closing_a_clean_tab_needs_no_confirmation() {
+        let mut s = State::default();
+        load(&mut s, "/t/a.txt", "hello"); // reuses the blank → one clean doc
+        update(&mut s, Message::NewTab); // a second, pristine blank tab
+        let fx = update(&mut s, Message::TabClosed(0)); // close the clean loaded tab
+        assert!(confirm_close(&fx).is_none(), "a clean tab closes at once");
+        assert_eq!(s.docs.len(), 1);
+    }
+
+    #[test]
+    fn closing_a_dirty_tab_asks_before_discarding() {
+        let mut s = State::default();
+        update(&mut s, Message::Edited("unsaved".into()));
+        let id = s.active_doc().id;
+        let fx = update(&mut s, Message::TabClosed(0));
+        // Nothing is removed; the shell is asked to confirm, naming the doc.
+        assert_eq!(s.docs.len(), 1);
+        assert!(s.active_doc().dirty());
+        assert_eq!(confirm_close(&fx), Some((id, "Untitled")));
+    }
+
+    #[test]
+    fn cancelling_the_close_prompt_leaves_everything_untouched() {
+        // "Cancel" is simply the shell sending no follow-up: the core already did
+        // nothing, so the dirty tab is still open and still dirty.
+        let mut s = State::default();
+        update(&mut s, Message::Edited("keep me".into()));
+        let fx = update(&mut s, Message::TabClosed(0));
+        assert!(confirm_close(&fx).is_some());
+        assert_eq!(s.docs.len(), 1);
+        assert!(s.active_doc().dirty());
+        assert_eq!(s.active_doc().content, "keep me");
+    }
+
+    #[test]
+    fn discarding_a_dirty_tab_closes_it() {
+        let mut s = State::default();
+        load(&mut s, "/t/a.txt", "a"); // clean doc 0
+        update(&mut s, Message::NewTab); // doc 1
+        update(&mut s, Message::Edited("dirty".into())); // doc 1 dirty
+        let id = s.active_doc().id;
+        update(&mut s, Message::TabClosed(1)); // asks (dirty)
+        update(&mut s, Message::TabCloseDiscard(id)); // user chose "Don't Save"
+        assert_eq!(s.docs.len(), 1);
+        assert_eq!(s.active_doc().content, "a"); // focus fell back to doc 0
+    }
+
+    #[test]
+    fn discard_targets_the_document_by_id_not_index() {
+        // Close a dirty tab that is *not* the active one; focus must stay on the
+        // document it was on, regardless of the index shuffle.
+        let mut s = State::default();
+        load(&mut s, "/t/a.txt", "aaa"); // doc 0
+        update(&mut s, Message::NewTab); // doc 1
+        update(&mut s, Message::Edited("bbb".into())); // doc 1 dirty
+        let dirty_id = s.active_doc().id;
+        update(&mut s, Message::NewTab); // doc 2, now active
+        update(&mut s, Message::Edited("ccc".into()));
+        let active_id = s.active_doc().id;
+        assert_eq!(s.docs.len(), 3);
+        update(&mut s, Message::TabClosed(1)); // ask about doc 1
+        update(&mut s, Message::TabCloseDiscard(dirty_id));
+        assert_eq!(s.docs.len(), 2);
+        assert_eq!(s.active_doc().id, active_id, "focus stays on the same doc");
+        assert_eq!(s.active_doc().content, "ccc");
+    }
+
+    #[test]
+    fn saving_a_titled_dirty_tab_before_close_writes_then_closes() {
+        let mut s = State::default();
+        load(&mut s, "/t/close.txt", "orig"); // doc 0: titled, clean (reused blank)
+        update(&mut s, Message::NewTab); // doc 1: blank, active
+        update(&mut s, Message::TabSelected(0)); // focus doc 0
+        update(&mut s, Message::Edited("edited".into())); // doc 0 dirty, has a path
+        let id = s.active_doc().id;
+        update(&mut s, Message::TabClosed(0)); // asks
+        let fx = update(&mut s, Message::TabCloseSave(id));
+        // Titled doc → writes straight to its path; still open until it lands.
+        assert_eq!(
+            fx,
+            vec![Effect::WriteFile {
+                id,
+                path: PathBuf::from("/t/close.txt"),
+                content: "edited".into(),
+            }]
+        );
+        assert_eq!(s.docs.len(), 2);
+        assert_eq!(s.pending_close, Some(id));
+        update(
+            &mut s,
+            Message::FileSaved {
+                id,
+                path: PathBuf::from("/t/close.txt"),
+            },
+        );
+        assert_eq!(s.docs.len(), 1, "the write landed → the tab closed");
+        assert_eq!(s.pending_close, None);
+        assert_eq!(s.active_doc().content, ""); // the blank doc 1 remains
+    }
+
+    #[test]
+    fn saving_an_untitled_dirty_tab_before_close_picks_a_path_then_closes() {
+        let mut s = State::default();
+        update(&mut s, Message::Edited("scratch".into())); // doc 0: untitled, dirty
+        let id = s.active_doc().id;
+        update(&mut s, Message::TabClosed(0)); // asks
+        let fx = update(&mut s, Message::TabCloseSave(id));
+        assert_eq!(fx, vec![Effect::PickSavePath { id }]); // needs a destination
+        assert_eq!(s.docs.len(), 1);
+        // The picker resolves → write; the write lands → the last tab closes,
+        // leaving a fresh blank.
+        let wfx = update(
+            &mut s,
+            Message::SavePathChosen {
+                id,
+                path: PathBuf::from("/t/s.txt"),
+            },
+        );
+        assert_eq!(
+            wfx,
+            vec![Effect::WriteFile {
+                id,
+                path: PathBuf::from("/t/s.txt"),
+                content: "scratch".into(),
+            }]
+        );
+        update(
+            &mut s,
+            Message::FileSaved {
+                id,
+                path: PathBuf::from("/t/s.txt"),
+            },
+        );
+        assert_eq!(s.docs.len(), 1);
+        assert!(
+            s.active_doc().is_pristine_blank(),
+            "closing the last tab leaves a blank"
+        );
+    }
+
+    #[test]
+    fn abandoning_the_save_during_close_keeps_the_tab() {
+        // A cancelled or failed save must not leave the tab primed to vanish on
+        // the next, unrelated save.
+        let mut s = State::default();
+        update(&mut s, Message::Edited("scratch".into()));
+        let id = s.active_doc().id;
+        update(&mut s, Message::TabClosed(0));
+        update(&mut s, Message::TabCloseSave(id)); // arms pending_close
+        assert_eq!(s.pending_close, Some(id));
+        update(&mut s, Message::SaveAbandoned { id }); // picker cancelled / write failed
+        assert_eq!(s.pending_close, None);
+        assert_eq!(s.docs.len(), 1, "the tab stays open");
+        // A later, ordinary save must NOT surprise-close it.
+        update(
+            &mut s,
+            Message::FileSaved {
+                id,
+                path: PathBuf::from("/t/later.txt"),
+            },
+        );
+        assert_eq!(s.docs.len(), 1);
+        assert!(!s.active_doc().dirty());
+    }
+
+    #[test]
+    fn discard_for_unknown_id_is_a_harmless_noop() {
+        let mut s = State::default();
+        update(&mut s, Message::Edited("x".into()));
+        let fx = update(&mut s, Message::TabCloseDiscard(9999));
+        assert_eq!(s.docs.len(), 1); // nothing closed
+        assert!(s.active_doc().dirty());
+        assert_eq!(fx, vec![Effect::SetTitle("Untitled".into())]);
+    }
+
+    #[test]
+    fn save_before_close_for_unknown_id_does_nothing() {
+        let mut s = State::default();
+        let fx = update(&mut s, Message::TabCloseSave(9999));
+        assert!(fx.is_empty());
+        assert_eq!(s.pending_close, None);
     }
 
     // ---- Find / Replace / Go-to-line (#33) ----
@@ -1137,6 +1421,15 @@ mod tests {
             Just(Message::Redo),
             (0usize..6).prop_map(Message::TabSelected),
             (0usize..6).prop_map(Message::TabClosed),
+            // Close-with-unsaved guard (#31): small ids so they land on real
+            // documents often enough to drive the discard / save-then-close paths.
+            (0u64..8).prop_map(Message::TabCloseDiscard),
+            (0u64..8).prop_map(Message::TabCloseSave),
+            (0u64..8).prop_map(|id| Message::SaveAbandoned { id }),
+            ("[a-z]{1,6}", 0u64..8).prop_map(|(n, id)| Message::FileSaved {
+                id,
+                path: PathBuf::from(format!("/t/{n}.txt")),
+            }),
             ("[a-z]{1,6}", any::<String>()).prop_map(|(n, c)| Message::FileLoaded {
                 path: PathBuf::from(format!("/t/{n}.txt")),
                 content: c

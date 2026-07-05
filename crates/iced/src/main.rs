@@ -76,6 +76,11 @@ enum Message {
     Redo,
     TabSelected(usize),
     TabClosed(usize),
+    /// The user answered the close-with-unsaved prompt for document `id` (#31).
+    CloseChoiceMade {
+        id: TabId,
+        choice: CloseChoice,
+    },
     /// The `text_editor` widget produced an action (typing, cursor move, …).
     Edit(text_editor::Action),
     /// The open dialog resolved (`None` = cancelled).
@@ -120,6 +125,27 @@ enum Message {
     GoToSubmit,
 }
 
+/// The user's answer to the close-with-unsaved prompt (#31).
+#[derive(Debug, Clone, Copy)]
+enum CloseChoice {
+    /// Save the document, then close it.
+    Save,
+    /// Discard the unsaved changes and close.
+    Discard,
+    /// Keep the document open.
+    Cancel,
+}
+
+/// A document awaiting the user's answer to "close with unsaved changes?" (#31).
+/// Rendered as an in-app bar rather than a native dialog: the `xdg-portal`
+/// backend exposes no message dialog, and an in-app modal keeps the app fully
+/// offline and headlessly testable.
+#[derive(Debug, Clone)]
+struct PendingClose {
+    id: TabId,
+    title: String,
+}
+
 /// The whole shell: the pure core plus the live editor buffer, window title, the
 /// last error surfaced in the status bar, and the go-to-line input's text.
 struct Shell {
@@ -130,6 +156,9 @@ struct Shell {
     /// Go-to-line field text; parsed to a line number only on submit. The rest
     /// of the find state lives in the pure core.
     goto_input: String,
+    /// The tab whose close is awaiting confirmation, if any (#31); drives the
+    /// in-app confirm bar in [`Shell::view`].
+    confirm_close: Option<PendingClose>,
 }
 
 impl Shell {
@@ -144,6 +173,7 @@ impl Shell {
                 title,
                 error: None,
                 goto_input: String::new(),
+                confirm_close: None,
             },
             Task::none(),
         )
@@ -164,7 +194,21 @@ impl Shell {
             Message::Undo => self.apply_core(core::Message::Undo, true),
             Message::Redo => self.apply_core(core::Message::Redo, true),
             Message::TabSelected(i) => self.apply_core(core::Message::TabSelected(i), true),
-            Message::TabClosed(i) => self.apply_core(core::Message::TabClosed(i), true),
+            // resync=false: closing a clean tab (or a save-then-close) changes the
+            // active document, which `apply_core` detects and resyncs on its own;
+            // a *dirty* tab only yields a `ConfirmClose`, so the editor must be
+            // left untouched (no caret jump) until the user answers.
+            Message::TabClosed(i) => self.apply_core(core::Message::TabClosed(i), false),
+            Message::CloseChoiceMade { id, choice } => {
+                self.confirm_close = None;
+                match choice {
+                    CloseChoice::Save => self.apply_core(core::Message::TabCloseSave(id), false),
+                    CloseChoice::Discard => {
+                        self.apply_core(core::Message::TabCloseDiscard(id), false)
+                    }
+                    CloseChoice::Cancel => Task::none(),
+                }
+            }
 
             Message::Edit(action) => {
                 // Cursor moves / selection must not touch the core; only real
@@ -206,7 +250,11 @@ impl Shell {
                 id,
                 path: Some(path),
             } => self.apply_core(core::Message::SavePathChosen { id, path }, false),
-            Message::SavePicked { path: None, .. } => Task::none(),
+            // A cancelled save picker: tell the core so any "save before closing"
+            // is dropped rather than left to fire on a later, unrelated save (#31).
+            Message::SavePicked { id, path: None } => {
+                self.apply_core(core::Message::SaveAbandoned { id }, false)
+            }
 
             Message::Saved { id, path, result } => match result {
                 Ok(()) => {
@@ -215,7 +263,8 @@ impl Shell {
                 }
                 Err(e) => {
                     self.error = Some(e);
-                    Task::none()
+                    // The write failed: likewise drop any pending close (#31).
+                    self.apply_core(core::Message::SaveAbandoned { id }, false)
                 }
             },
 
@@ -256,12 +305,16 @@ impl Shell {
     }
 
     /// Feed one message through the pure core, run every [`Effect`] it returns,
-    /// and (when the active document may have changed underneath us) rebuild the
-    /// editor buffer from the core. `resync` is `false` for `Edited`, whose text
-    /// *came from* the editor and must not be overwritten.
+    /// and rebuild the editor buffer from the core when the active document may
+    /// have changed underneath us. `resync` is `false` for `Edited` (whose text
+    /// *came from* the editor and must not be overwritten); regardless of it, a
+    /// change of *which* document is active also forces a resync — that is how a
+    /// save-before-close that lands asynchronously (#31) moves the editor onto
+    /// the surviving tab.
     fn apply_core(&mut self, msg: core::Message, resync: bool) -> Task<Message> {
+        let active_before = self.core.active_doc().id;
         let effects = core::update(&mut self.core, msg);
-        if resync {
+        if resync || self.core.active_doc().id != active_before {
             self.editor = text_editor::Content::with_text(&self.core.active_doc().content);
         }
         let tasks: Vec<Task<Message>> = effects.into_iter().map(|e| self.run_effect(e)).collect();
@@ -328,6 +381,12 @@ impl Shell {
                     }
                 };
                 self.editor.move_to(cursor);
+                Task::none()
+            }
+            // Surface the close-with-unsaved prompt as an in-app bar (see
+            // [`PendingClose`]); the buttons feed back a [`Message::CloseChoiceMade`].
+            Effect::ConfirmClose { id, title } => {
+                self.confirm_close = Some(PendingClose { id, title });
                 Task::none()
             }
         }
@@ -413,10 +472,51 @@ impl Shell {
         };
 
         let mut layout = column![toolbar, tabs].spacing(8).padding(10);
+        if self.confirm_close.is_some() {
+            layout = layout.push(self.confirm_bar());
+        }
         if self.core.find.open {
             layout = layout.push(self.find_bar());
         }
         layout.push(editor).push(container(status)).into()
+    }
+
+    /// The in-app "close with unsaved changes?" bar, shown while a close awaits
+    /// the user's answer (#31). Save / Don't Save / Cancel map to [`CloseChoice`]s
+    /// carrying the document's stable id, so the right tab closes even if the tab
+    /// order shifted while the bar was up.
+    fn confirm_bar(&self) -> Element<'_, Message> {
+        let Some(pending) = &self.confirm_close else {
+            return row![].into(); // never rendered unless set; empty as a guard
+        };
+        let id = pending.id;
+        let prompt = format!("\u{201c}{}\u{201d} has unsaved changes.", pending.title);
+        container(
+            row![
+                text(prompt),
+                button("Save")
+                    .style(button::primary)
+                    .on_press(Message::CloseChoiceMade {
+                        id,
+                        choice: CloseChoice::Save,
+                    }),
+                button("Don\u{2019}t Save").style(button::danger).on_press(
+                    Message::CloseChoiceMade {
+                        id,
+                        choice: CloseChoice::Discard,
+                    }
+                ),
+                button("Cancel")
+                    .style(button::secondary)
+                    .on_press(Message::CloseChoiceMade {
+                        id,
+                        choice: CloseChoice::Cancel,
+                    }),
+            ]
+            .spacing(8),
+        )
+        .padding(6)
+        .into()
     }
 
     /// The find / replace / go-to bar, shown only while `find.open`. All state
@@ -643,6 +743,121 @@ mod tests {
         let _ = shell.update(Message::Redo);
         assert_eq!(shell.editor.text().trim_end(), "");
         assert!(!shell.core.active_doc().dirty());
+        assert_eq!(shell.core.docs.len(), 1);
+    }
+
+    // ---- Close-with-unsaved guard wiring (#31) ----
+
+    #[test]
+    fn closing_a_dirty_tab_asks_before_removing_it() {
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::Edit(paste("unsaved")));
+        assert!(shell.core.active_doc().dirty());
+        let _ = shell.update(Message::TabClosed(0));
+        // Nothing removed; the in-app confirm bar is armed instead.
+        assert_eq!(shell.core.docs.len(), 1);
+        assert!(shell.confirm_close.is_some());
+    }
+
+    #[test]
+    fn closing_a_clean_tab_removes_it_without_asking() {
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::FileRead {
+            path: PathBuf::from("/tmp/a.txt"),
+            result: Ok("aaa".to_string()),
+        }); // doc 0, clean
+        let _ = shell.update(Message::NewTab); // doc 1, pristine blank, active
+        let _ = shell.update(Message::TabClosed(0)); // close the clean loaded tab
+        assert_eq!(shell.core.docs.len(), 1);
+        assert!(shell.confirm_close.is_none());
+    }
+
+    #[test]
+    fn cancelling_the_close_keeps_the_tab_and_clears_the_prompt() {
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::Edit(paste("stay")));
+        let id = shell.core.active_doc().id;
+        let _ = shell.update(Message::TabClosed(0));
+        assert!(shell.confirm_close.is_some());
+        let _ = shell.update(Message::CloseChoiceMade {
+            id,
+            choice: CloseChoice::Cancel,
+        });
+        assert!(shell.confirm_close.is_none());
+        assert_eq!(shell.core.docs.len(), 1);
+        assert!(shell.core.active_doc().dirty());
+        assert_eq!(shell.editor.text().trim_end(), "stay");
+    }
+
+    #[test]
+    fn discarding_via_the_shell_removes_the_tab_and_resyncs_the_editor() {
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::FileRead {
+            path: PathBuf::from("/tmp/keep.txt"),
+            result: Ok("keep".to_string()),
+        }); // doc 0, clean
+        let _ = shell.update(Message::NewTab); // doc 1, active
+        let _ = shell.update(Message::Edit(paste("throwaway"))); // doc 1 dirty
+        let id = shell.core.active_doc().id;
+        let _ = shell.update(Message::TabClosed(1)); // asks
+        assert!(shell.confirm_close.is_some());
+        let _ = shell.update(Message::CloseChoiceMade {
+            id,
+            choice: CloseChoice::Discard,
+        });
+        assert_eq!(shell.core.docs.len(), 1);
+        assert!(shell.confirm_close.is_none());
+        // The editor resynced onto the surviving document.
+        assert_eq!(shell.editor.text().trim_end(), "keep");
+    }
+
+    #[test]
+    fn saving_via_the_shell_closes_the_tab_after_the_write_lands() {
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::FileRead {
+            path: PathBuf::from("/tmp/doc.txt"),
+            result: Ok("orig".to_string()),
+        }); // doc 0, clean, titled
+        let _ = shell.update(Message::NewTab); // doc 1 (blank), active
+        let _ = shell.update(Message::Edit(paste("second"))); // doc 1 content
+        let _ = shell.update(Message::TabSelected(0)); // focus doc 0
+        let _ = shell.update(Message::Edit(paste("edited"))); // doc 0 dirty
+        let id = shell.core.active_doc().id;
+        let _ = shell.update(Message::TabClosed(0)); // asks
+        let _ = shell.update(Message::CloseChoiceMade {
+            id,
+            choice: CloseChoice::Save,
+        });
+        // Still open until the async write reports back.
+        assert_eq!(shell.core.docs.len(), 2);
+        let _ = shell.update(Message::Saved {
+            id,
+            path: PathBuf::from("/tmp/doc.txt"),
+            result: Ok(()),
+        });
+        assert_eq!(shell.core.docs.len(), 1);
+        // The editor resynced onto the surviving second tab.
+        assert_eq!(shell.editor.text().trim_end(), "second");
+    }
+
+    #[test]
+    fn cancelling_the_save_picker_during_close_does_not_close_later() {
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::Edit(paste("scratch"))); // untitled, dirty
+        let id = shell.core.active_doc().id;
+        let _ = shell.update(Message::TabClosed(0)); // asks
+        let _ = shell.update(Message::CloseChoiceMade {
+            id,
+            choice: CloseChoice::Save,
+        }); // → save picker
+        let _ = shell.update(Message::SavePicked { id, path: None }); // user cancels
+        assert_eq!(shell.core.docs.len(), 1); // still open
+        // A later successful save of the same tab must NOT surprise-close it.
+        let _ = shell.update(Message::Saved {
+            id,
+            path: PathBuf::from("/tmp/x.txt"),
+            result: Ok(()),
+        });
         assert_eq!(shell.core.docs.len(), 1);
     }
 

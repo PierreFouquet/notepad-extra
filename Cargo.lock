@@ -2737,6 +2737,8 @@ version = "0.1.0"
 dependencies = [
  "proptest",
  "regex",
+ "serde",
+ "serde_json",
  "tempfile",
 ]
 
@@ -2760,6 +2762,7 @@ dependencies = [
  "notepad-core",
  "png 0.18.1",
  "rfd 0.15.4",
+ "tempfile",
 ]
 
 [[package]]

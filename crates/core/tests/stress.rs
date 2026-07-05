@@ -360,3 +360,46 @@ fn status_on_a_million_line_document_stays_correct() {
     assert_eq!(st.column, 1);
     assert_eq!(st.chars, 2_000_000);
 }
+
+#[test]
+fn rapid_zoom_storm_stays_within_bounds_and_leaves_editing_intact() {
+    // Editor zoom (#35): tens of thousands of interleaved zoom ops must always
+    // keep the font size in range, and must never disturb the buffer or its
+    // undo history — zoom is an app-wide view setting, not a document edit.
+    let mut s = State::default();
+    update(&mut s, Message::Edited("hello".into()));
+    let before = s.active_doc().content.clone();
+
+    for i in 0..50_000 {
+        let msg = match i % 3 {
+            0 => Message::ZoomIn,
+            1 => Message::ZoomOut,
+            _ => Message::ZoomReset,
+        };
+        // Zoom emits no effect and touches no document.
+        assert!(update(&mut s, msg).is_empty());
+        assert!(s.font_size() >= State::MIN_FONT_SIZE);
+        assert!(s.font_size() <= State::MAX_FONT_SIZE);
+    }
+
+    // The buffer, dirty flag and undo are untouched by all that zooming.
+    assert_eq!(s.active_doc().content, before);
+    assert!(s.active_doc().dirty());
+    update(&mut s, Message::Undo);
+    assert_eq!(s.active_doc().content, "");
+}
+
+#[test]
+fn monotonic_zoom_to_each_extreme_settles_exactly_on_the_bound() {
+    // Push far past either end: the value must pin exactly at the bound, never
+    // oscillate, underflow, or overflow.
+    let mut s = State::default();
+    for _ in 0..10_000 {
+        update(&mut s, Message::ZoomIn);
+    }
+    assert_eq!(s.font_size(), State::MAX_FONT_SIZE);
+    for _ in 0..10_000 {
+        update(&mut s, Message::ZoomOut);
+    }
+    assert_eq!(s.font_size(), State::MIN_FONT_SIZE);
+}

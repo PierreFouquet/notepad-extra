@@ -46,5 +46,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "prefs_parse"
+path = "fuzz_targets/prefs_parse.rs"
+test = false
+doc = false
+bench = false
+
 [profile.release]
 debug = 1

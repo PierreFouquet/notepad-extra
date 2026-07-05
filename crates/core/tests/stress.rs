@@ -376,8 +376,10 @@ fn rapid_zoom_storm_stays_within_bounds_and_leaves_editing_intact() {
             1 => Message::ZoomOut,
             _ => Message::ZoomReset,
         };
-        // Zoom emits no effect and touches no document.
-        assert!(update(&mut s, msg).is_empty());
+        // Zoom's only effect is to persist the new size (#38): it never emits a
+        // document-mutating effect and never touches the buffer.
+        let fx = update(&mut s, msg);
+        assert!(fx.iter().all(|e| matches!(e, Effect::SavePreferences(_))));
         assert!(s.font_size() >= State::MIN_FONT_SIZE);
         assert!(s.font_size() <= State::MAX_FONT_SIZE);
     }

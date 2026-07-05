@@ -21,14 +21,14 @@ use iced::widget::{button, column, container, row, text, text_editor, text_input
 use iced::{Element, Fill, Length, Task};
 use notepad_core as core;
 use notepad_core::{Effect, FindOption, TabId};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub fn main() -> iced::Result {
     let window = iced::window::Settings {
         icon: window_icon(),
         ..iced::window::Settings::default()
     };
-    iced::application(Shell::new, Shell::update, Shell::view)
+    iced::application(Shell::boot, Shell::update, Shell::view)
         .title(Shell::title)
         .window(window)
         .run()
@@ -137,6 +137,12 @@ enum Message {
     /// Toggle soft word-wrap. Driven by the toolbar button; a key accelerator
     /// arrives with the rest in #39.
     ToggleWordWrap,
+
+    // ---- Preferences persistence (#38) ----
+    /// A preferences write finished. The result is intentionally ignored: a
+    /// failure to persist a setting must never interrupt editing (see the core's
+    /// `Effect::SavePreferences`).
+    PreferencesSaved,
 }
 
 /// The user's answer to the close-with-unsaved prompt (#31).
@@ -176,6 +182,18 @@ struct Shell {
 }
 
 impl Shell {
+    /// The real startup path used by `main`: build the default shell, then apply
+    /// the preferences saved on disk (#38). Kept separate from [`Shell::new`] so
+    /// the headless tests get a deterministic default shell that never reads the
+    /// user's real config.
+    fn boot() -> (Self, Task<Message>) {
+        let (mut shell, task) = Self::new();
+        // Font size / word-wrap are read live from the core by `view`, so simply
+        // applying the loaded prefs is enough — no editor rebuild needed.
+        shell.core.apply_preferences(&load_preferences());
+        (shell, task)
+    }
+
     fn new() -> (Self, Task<Message>) {
         let core = core::State::default();
         let editor = text_editor::Content::with_text(&core.active_doc().content);
@@ -322,6 +340,10 @@ impl Shell {
             Message::ZoomOut => self.apply_core(core::Message::ZoomOut, false),
             Message::ZoomReset => self.apply_core(core::Message::ZoomReset, false),
             Message::ToggleWordWrap => self.apply_core(core::Message::ToggleWordWrap, false),
+
+            // The preferences write landed (#38). Nothing to do: its result is
+            // deliberately swallowed so a failed save never disrupts editing.
+            Message::PreferencesSaved => Task::none(),
         }
     }
 
@@ -410,6 +432,19 @@ impl Shell {
                 self.confirm_close = Some(PendingClose { id, title });
                 Task::none()
             }
+            // Persist preferences to the config file off the UI thread (#38).
+            // `write_file` creates the parent config dir as needed. With no
+            // config dir resolvable we simply don't persist — never an error the
+            // user sees. The write result is dropped (see [`Message::PreferencesSaved`]).
+            Effect::SavePreferences(prefs) => match config_path() {
+                Some(path) => {
+                    let json = prefs.to_json();
+                    Task::perform(async move { core::io::write_file(&path, &json) }, |_| {
+                        Message::PreferencesSaved
+                    })
+                }
+                None => Task::none(),
+            },
         }
     }
 
@@ -653,6 +688,78 @@ async fn pick_save() -> Option<PathBuf> {
         .save_file()
         .await
         .map(|h| h.path().to_path_buf())
+}
+
+/// Load the persisted preferences (#38), recovering to defaults on *any* failure
+/// — no config dir, a missing / unreadable file, or corrupt JSON. Never errors,
+/// so a bad config can never stop the app from starting.
+fn load_preferences() -> core::Preferences {
+    match config_path() {
+        Some(path) => load_preferences_from(&path),
+        None => core::Preferences::default(),
+    }
+}
+
+/// Load preferences from a specific file, recovering to defaults if it can't be
+/// read (missing / unreadable) — corrupt *contents* are handled inside
+/// [`core::Preferences::from_json`]. Split out from [`load_preferences`] so the
+/// save→reload round-trip is testable against a temp file, never the real config.
+fn load_preferences_from(path: &Path) -> core::Preferences {
+    match core::io::read_file(path) {
+        Ok(text) => core::Preferences::from_json(&text),
+        Err(_) => core::Preferences::default(),
+    }
+}
+
+/// The preferences file path: `<per-user config dir>/notepad-extra/preferences.json`,
+/// or `None` when no config dir can be found (preferences then don't persist,
+/// rather than the app failing). Fully offline — a local path from the OS's
+/// standard per-user config location, resolved from the environment with no
+/// extra crate and no network. `write_file` creates the intermediate dirs.
+fn config_path() -> Option<PathBuf> {
+    let mut dir = config_dir()?;
+    dir.push("notepad-extra");
+    dir.push("preferences.json");
+    Some(dir)
+}
+
+/// The OS per-user configuration directory.
+///
+/// * **Windows:** `%APPDATA%`.
+/// * **macOS:** `$HOME/Library/Application Support`.
+/// * **Linux/other:** `$XDG_CONFIG_HOME` (only if absolute, per the XDG spec),
+///   else `$HOME/.config`.
+#[cfg(target_os = "windows")]
+fn config_dir() -> Option<PathBuf> {
+    std::env::var_os("APPDATA")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+#[cfg(target_os = "macos")]
+fn config_dir() -> Option<PathBuf> {
+    home_dir().map(|h| h.join("Library").join("Application Support"))
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn config_dir() -> Option<PathBuf> {
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+        let path = PathBuf::from(xdg);
+        // The XDG spec says a relative $XDG_CONFIG_HOME must be ignored.
+        if path.is_absolute() {
+            return Some(path);
+        }
+    }
+    home_dir().map(|h| h.join(".config"))
+}
+
+/// The user's home directory from `$HOME`, or `None` if unset/empty. (Used only
+/// off Windows, where `%APPDATA%` is the config root instead.)
+#[cfg(not(target_os = "windows"))]
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
 }
 
 #[cfg(test)]
@@ -1079,5 +1186,80 @@ mod tests {
         let _ = shell.view();
         let _ = shell.update(Message::ToggleWordWrap);
         let _ = shell.view();
+    }
+
+    // ---- Preferences persistence (#38) ----
+
+    #[test]
+    fn preferences_persist_across_a_simulated_restart() {
+        // The heart of #38: settings changed in one session must come back in the
+        // next. This drives the *real* save + load path through an actual file —
+        // only the config *location* is swapped for a temp dir so the test never
+        // touches the user's real config.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("notepad-extra").join("preferences.json");
+
+        // --- Session 1: the user changes zoom and word-wrap. Persist them exactly
+        // as the `Effect::SavePreferences` handler does (same JSON, same writer).
+        let (mut session1, _) = Shell::new();
+        let _ = session1.update(Message::ToggleWordWrap);
+        let _ = session1.update(Message::ZoomIn);
+        let _ = session1.update(Message::ZoomIn);
+        let saved_size = session1.core.font_size();
+        assert_ne!(
+            saved_size,
+            core::State::DEFAULT_FONT_SIZE,
+            "zoom actually moved"
+        );
+        core::io::write_file(&path, &session1.core.preferences().to_json())
+            .expect("persist preferences");
+
+        // --- Session 2 ("restart"): a brand-new shell loads that file, exactly as
+        // `boot` does, and must come up with the persisted settings — not defaults.
+        let (mut session2, _) = Shell::new();
+        session2
+            .core
+            .apply_preferences(&load_preferences_from(&path));
+        assert_eq!(session2.core.font_size(), saved_size, "zoom restored");
+        assert!(session2.core.word_wrap(), "word-wrap restored");
+    }
+
+    #[test]
+    fn a_missing_config_loads_defaults_like_first_run() {
+        // "Restarting" with no config file yet (or after it was deleted) must
+        // recover to the out-of-the-box defaults, never fail.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("does-not-exist.json");
+
+        let (mut shell, _) = Shell::new();
+        shell
+            .core
+            .apply_preferences(&load_preferences_from(&missing));
+        assert_eq!(shell.core.font_size(), core::State::DEFAULT_FONT_SIZE);
+        assert!(!shell.core.word_wrap());
+    }
+
+    #[test]
+    fn a_corrupt_config_loads_defaults_without_panicking() {
+        // A truncated / garbage file on disk must not crash startup: load
+        // recovers to defaults (the corrupt-recovery guarantee, end to end).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("preferences.json");
+        core::io::write_file(&path, "{ this is not valid json").expect("write junk");
+
+        let (mut shell, _) = Shell::new();
+        shell.core.apply_preferences(&load_preferences_from(&path));
+        assert_eq!(shell.core.font_size(), core::State::DEFAULT_FONT_SIZE);
+        assert!(!shell.core.word_wrap());
+    }
+
+    #[test]
+    fn config_path_lands_in_a_per_user_notepad_extra_dir() {
+        // Whatever the platform, the file resolves (in CI there is always a HOME /
+        // APPDATA) to `.../notepad-extra/preferences.json` — a stable, local,
+        // per-user location. Fully offline: no network, just a filesystem path.
+        let path = config_path().expect("a config path in the test environment");
+        assert_eq!(path.file_name().unwrap(), "preferences.json");
+        assert_eq!(path.parent().unwrap().file_name().unwrap(), "notepad-extra");
     }
 }

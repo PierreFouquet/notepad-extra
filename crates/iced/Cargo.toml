@@ -40,3 +40,8 @@ rfd = { version = "0.15", default-features = false, features = [
 # feature (off under our `default-features = false` build), so we decode here and
 # hand raw RGBA to `window::icon::from_rgba`.
 png = { version = "0.18", default-features = false }
+
+[dev-dependencies]
+# Real temp files for the preferences save→reload round-trip test (#38). Already
+# in `Cargo.lock` via the workspace, so it adds nothing to vendor for #17.
+tempfile = "3.6"

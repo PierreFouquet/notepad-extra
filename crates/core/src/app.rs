@@ -8,6 +8,7 @@
 use crate::find::{self, Match, Matcher, SearchError, SearchOptions};
 use crate::history::History;
 use crate::lang;
+use crate::prefs::Preferences;
 use crate::text::{self, EndOfLine};
 use std::path::PathBuf;
 
@@ -182,6 +183,25 @@ impl State {
         self.word_wrap
     }
 
+    /// Snapshot the persistable preferences (#38) for the shell to write to disk.
+    /// Emitted as [`Effect::SavePreferences`] whenever one of them changes.
+    pub fn preferences(&self) -> Preferences {
+        Preferences {
+            version: crate::prefs::CURRENT_VERSION,
+            font_size: self.font_size,
+            word_wrap: self.word_wrap,
+        }
+    }
+
+    /// Apply preferences loaded from disk at startup (#38). Font size goes
+    /// through [`State::set_font_size`], which clamps it into the valid zoom
+    /// range, so a hand-edited or out-of-range config can never break an
+    /// invariant. Does not itself persist — loading is not a change to save.
+    pub fn apply_preferences(&mut self, prefs: &Preferences) {
+        self.set_font_size(prefs.font_size);
+        self.word_wrap = prefs.word_wrap;
+    }
+
     /// Enlarge the editor font by one step, clamped to `MAX_FONT_SIZE` (Ctrl+ +).
     /// `saturating_add` means the arithmetic itself can never overflow before the
     /// clamp, so no input sequence can produce a bad size.
@@ -328,6 +348,10 @@ pub enum Effect {
     /// [`Message::TabCloseSave`], [`Message::TabCloseDiscard`], or nothing
     /// (cancel). `title` names the document for the prompt (#31).
     ConfirmClose { id: TabId, title: String },
+    /// Persist the app-wide preferences to the config file (#38). Emitted when a
+    /// persistable setting (zoom #35, word-wrap #34) changes; the shell writes
+    /// the JSON and swallows any write error rather than interrupting editing.
+    SavePreferences(Preferences),
 }
 
 /// Apply `message` to `state`, returning the effects the shell must run.
@@ -560,26 +584,29 @@ pub fn update(state: &mut State, message: Message) -> Vec<Effect> {
 
         // ---- Editor zoom / font size (#35) ----
         // Zoom only changes the app-wide font size, which the shell reads from
-        // `font_size()` when it renders — no effect, no buffer or title change.
+        // `font_size()` when it renders — no buffer or title change. It is a
+        // persisted preference, though, so each change asks the shell to save it
+        // (#38).
         Message::ZoomIn => {
             state.zoom_in();
-            vec![]
+            vec![Effect::SavePreferences(state.preferences())]
         }
         Message::ZoomOut => {
             state.zoom_out();
-            vec![]
+            vec![Effect::SavePreferences(state.preferences())]
         }
         Message::ZoomReset => {
             state.zoom_reset();
-            vec![]
+            vec![Effect::SavePreferences(state.preferences())]
         }
 
         // ---- Word wrap (#34) ----
         // Like zoom, this only changes an app-wide render preference the shell
-        // reads from `word_wrap()` — no effect, no buffer or title change.
+        // reads from `word_wrap()` — no buffer or title change — and is persisted
+        // on each toggle (#38).
         Message::ToggleWordWrap => {
             state.word_wrap = !state.word_wrap;
-            vec![]
+            vec![Effect::SavePreferences(state.preferences())]
         }
     }
 }
@@ -1521,12 +1548,14 @@ mod tests {
     }
 
     #[test]
-    fn zoom_in_and_out_step_by_a_point_and_emit_no_effect() {
+    fn zoom_in_and_out_step_by_a_point_and_persist() {
         let mut s = State::default();
         let base = s.font_size();
         let fx = update(&mut s, Message::ZoomIn);
         assert_eq!(s.font_size(), base + 1);
-        assert!(fx.is_empty(), "zoom is pure state, no effect to run");
+        // Zoom is a persisted preference (#38): each change asks the shell to
+        // save the new value, which mirrors the state's fresh snapshot.
+        assert_eq!(fx, vec![Effect::SavePreferences(s.preferences())]);
         update(&mut s, Message::ZoomOut);
         update(&mut s, Message::ZoomOut);
         assert_eq!(s.font_size(), base - 1);
@@ -1584,11 +1613,13 @@ mod tests {
     }
 
     #[test]
-    fn toggle_word_wrap_flips_and_emits_no_effect() {
+    fn toggle_word_wrap_flips_and_persists() {
         let mut s = State::default();
         let fx = update(&mut s, Message::ToggleWordWrap);
         assert!(s.word_wrap());
-        assert!(fx.is_empty(), "word wrap is pure state, no effect to run");
+        // Word wrap is a persisted preference (#38): the toggle asks the shell to
+        // save the new value.
+        assert_eq!(fx, vec![Effect::SavePreferences(s.preferences())]);
         update(&mut s, Message::ToggleWordWrap);
         assert!(!s.word_wrap(), "a second toggle returns to off");
     }
@@ -1616,6 +1647,71 @@ mod tests {
             update(&mut s, Message::ToggleWordWrap);
         }
         assert!(s.word_wrap(), "an odd toggle count ends on");
+    }
+
+    // ---- Preferences persistence (#38) ----
+
+    #[test]
+    fn preferences_snapshot_reflects_the_live_prefs() {
+        let mut s = State::default();
+        update(&mut s, Message::ToggleWordWrap);
+        update(&mut s, Message::ZoomIn);
+        let prefs = s.preferences();
+        assert_eq!(prefs.font_size, s.font_size());
+        assert!(prefs.word_wrap);
+        assert_eq!(prefs.version, crate::prefs::CURRENT_VERSION);
+    }
+
+    #[test]
+    fn apply_preferences_restores_zoom_and_wrap() {
+        // Simulate a fresh launch loading a saved config: the state must come up
+        // with the persisted zoom and wrap, matching the snapshot exactly.
+        let prefs = Preferences {
+            version: crate::prefs::CURRENT_VERSION,
+            font_size: 25,
+            word_wrap: true,
+        };
+        let mut s = State::default();
+        s.apply_preferences(&prefs);
+        assert_eq!(s.font_size(), 25);
+        assert!(s.word_wrap());
+        assert_eq!(s.preferences(), prefs);
+    }
+
+    #[test]
+    fn apply_preferences_clamps_out_of_range_font_size() {
+        // A hand-edited config with an absurd size must never escape the zoom
+        // bounds — apply routes through the same clamp the zoom controls use.
+        let mut s = State::default();
+        s.apply_preferences(&Preferences {
+            version: 1,
+            font_size: u16::MAX,
+            word_wrap: false,
+        });
+        assert_eq!(s.font_size(), State::MAX_FONT_SIZE);
+
+        s.apply_preferences(&Preferences {
+            version: 1,
+            font_size: 0,
+            word_wrap: false,
+        });
+        assert_eq!(s.font_size(), State::MIN_FONT_SIZE);
+    }
+
+    #[test]
+    fn apply_preferences_does_not_itself_request_a_save() {
+        // Loading is not a change to persist: applying prefs mutates state but
+        // (unlike a zoom/wrap message) returns no SavePreferences effect, so a
+        // launch never rewrites the file it just read.
+        let mut s = State::default();
+        s.apply_preferences(&Preferences::default());
+        // `apply_preferences` is not a `Message`, so it produces no effects at
+        // all; the only prefs-saving effects come from Zoom*/ToggleWordWrap.
+        let fx = update(&mut s, Message::Edited("x".into()));
+        assert!(
+            !fx.iter().any(|e| matches!(e, Effect::SavePreferences(_))),
+            "an ordinary edit never persists preferences"
+        );
     }
 
     // ---- Property-based invariants (epic #25 Definition of Done) ----

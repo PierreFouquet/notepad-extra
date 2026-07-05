@@ -15,6 +15,7 @@
 //! exercised headlessly (see the tests below), matching the epic's DoD.
 #![forbid(unsafe_code)]
 
+use iced::widget::text::Wrapping;
 use iced::widget::text_editor::{Cursor, Position};
 use iced::widget::{button, column, container, row, text, text_editor, text_input};
 use iced::{Element, Fill, Length, Task};
@@ -131,6 +132,11 @@ enum Message {
     ZoomIn,
     ZoomOut,
     ZoomReset,
+
+    // ---- Word wrap (#34) ----
+    /// Toggle soft word-wrap. Driven by the toolbar button; a key accelerator
+    /// arrives with the rest in #39.
+    ToggleWordWrap,
 }
 
 /// The user's answer to the close-with-unsaved prompt (#31).
@@ -315,6 +321,7 @@ impl Shell {
             Message::ZoomIn => self.apply_core(core::Message::ZoomIn, false),
             Message::ZoomOut => self.apply_core(core::Message::ZoomOut, false),
             Message::ZoomReset => self.apply_core(core::Message::ZoomReset, false),
+            Message::ToggleWordWrap => self.apply_core(core::Message::ToggleWordWrap, false),
         }
     }
 
@@ -428,6 +435,12 @@ impl Shell {
         } else {
             button::secondary
         };
+        // The Wrap button reads as "pressed" (primary) while wrapping is on (#34).
+        let wrap_style = if self.core.word_wrap() {
+            button::primary
+        } else {
+            button::secondary
+        };
         let toolbar = row![
             button("New").on_press(Message::NewTab),
             button("Open").on_press(Message::Open),
@@ -443,6 +456,10 @@ impl Shell {
             button("A\u{2212}").on_press(Message::ZoomOut),
             button(text(format!("{} pt", self.core.font_size()))).on_press(Message::ZoomReset),
             button("A+").on_press(Message::ZoomIn),
+            // Word wrap toggle (#34): lit while wrapping is on.
+            button("Wrap")
+                .style(wrap_style)
+                .on_press(Message::ToggleWordWrap),
         ]
         .spacing(6);
 
@@ -469,6 +486,11 @@ impl Shell {
         let editor = text_editor(&self.editor)
             .on_action(Message::Edit)
             .size(f32::from(self.core.font_size()))
+            .wrapping(if self.core.word_wrap() {
+                Wrapping::Word
+            } else {
+                Wrapping::None
+            })
             .height(Fill);
 
         let status: Element<'_, Message> = match &self.error {
@@ -1035,5 +1057,27 @@ mod tests {
         // Zooming left the live buffer and its dirty flag alone.
         assert_eq!(shell.editor.text().trim_end(), "keep me");
         assert!(shell.core.active_doc().dirty());
+    }
+
+    #[test]
+    fn wrap_toggle_flips_core_state_without_touching_the_buffer() {
+        // The Wrap button routes straight through to the core (#34) and, like
+        // zoom, must not resync/clear the editor: typed text survives a toggle.
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::Edit(paste("keep me")));
+        assert!(!shell.core.word_wrap(), "starts off");
+
+        let _ = shell.update(Message::ToggleWordWrap);
+        assert!(shell.core.word_wrap());
+        let _ = shell.update(Message::ToggleWordWrap);
+        assert!(!shell.core.word_wrap());
+
+        // Toggling left the live buffer and its dirty flag alone, and the view
+        // still renders in either wrap state.
+        assert_eq!(shell.editor.text().trim_end(), "keep me");
+        assert!(shell.core.active_doc().dirty());
+        let _ = shell.view();
+        let _ = shell.update(Message::ToggleWordWrap);
+        let _ = shell.view();
     }
 }

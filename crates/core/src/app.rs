@@ -121,6 +121,11 @@ pub struct State {
     /// through [`State::zoom_in`] / [`State::zoom_out`] / [`State::zoom_reset`],
     /// which enforce that. Read via [`State::font_size`]. Persisted by #38.
     font_size: u16,
+    /// Whether soft word-wrap is on, a single app-wide toggle shared by every
+    /// tab (#34). Read via [`State::word_wrap`], flipped by
+    /// [`Message::ToggleWordWrap`]. Off by default, matching the WebView build.
+    /// Persisted by #38.
+    word_wrap: bool,
     /// A document (by stable id) that must be closed once its in-flight
     /// "save before closing" write lands (#31). Set by [`Message::TabCloseSave`],
     /// consumed by [`Message::FileSaved`], and cleared by [`Message::SaveAbandoned`]
@@ -137,6 +142,7 @@ impl Default for State {
             active: 0,
             find: FindState::default(),
             font_size: State::DEFAULT_FONT_SIZE,
+            word_wrap: false,
             pending_close: None,
             next_id: 1,
         };
@@ -168,6 +174,12 @@ impl State {
     /// `[MIN_FONT_SIZE, MAX_FONT_SIZE]`.
     pub fn font_size(&self) -> u16 {
         self.font_size
+    }
+
+    /// Whether soft word-wrap is currently on (#34). The shell reads this when it
+    /// renders to pick the editor's wrapping strategy.
+    pub fn word_wrap(&self) -> bool {
+        self.word_wrap
     }
 
     /// Enlarge the editor font by one step, clamped to `MAX_FONT_SIZE` (Ctrl+ +).
@@ -283,6 +295,10 @@ pub enum Message {
     ZoomOut,
     /// Reset the editor font to the default size (Ctrl+0).
     ZoomReset,
+
+    // ---- Word wrap (#34) ----
+    /// Flip soft word-wrap on or off, app-wide.
+    ToggleWordWrap,
 }
 
 /// A side effect for the render shell to perform. `update` returns these instead
@@ -555,6 +571,14 @@ pub fn update(state: &mut State, message: Message) -> Vec<Effect> {
         }
         Message::ZoomReset => {
             state.zoom_reset();
+            vec![]
+        }
+
+        // ---- Word wrap (#34) ----
+        // Like zoom, this only changes an app-wide render preference the shell
+        // reads from `word_wrap()` — no effect, no buffer or title change.
+        Message::ToggleWordWrap => {
+            state.word_wrap = !state.word_wrap;
             vec![]
         }
     }
@@ -1548,6 +1572,52 @@ mod tests {
         assert_eq!(s.font_size(), State::MAX_FONT_SIZE);
     }
 
+    // ---- Word wrap (#34) ----
+
+    #[test]
+    fn word_wrap_is_off_by_default() {
+        let s = State::default();
+        assert!(
+            !s.word_wrap(),
+            "parity with the WebView build: wrap starts off"
+        );
+    }
+
+    #[test]
+    fn toggle_word_wrap_flips_and_emits_no_effect() {
+        let mut s = State::default();
+        let fx = update(&mut s, Message::ToggleWordWrap);
+        assert!(s.word_wrap());
+        assert!(fx.is_empty(), "word wrap is pure state, no effect to run");
+        update(&mut s, Message::ToggleWordWrap);
+        assert!(!s.word_wrap(), "a second toggle returns to off");
+    }
+
+    #[test]
+    fn word_wrap_survives_edits_and_tab_changes() {
+        // The toggle is app-wide and independent of buffer/tab churn: nothing but
+        // another toggle changes it.
+        let mut s = State::default();
+        update(&mut s, Message::ToggleWordWrap);
+        assert!(s.word_wrap());
+        update(&mut s, Message::Edited("hello\nworld".into()));
+        update(&mut s, Message::NewTab);
+        update(&mut s, Message::TabSelected(0));
+        assert!(
+            s.word_wrap(),
+            "editing and switching tabs leave wrap untouched"
+        );
+    }
+
+    #[test]
+    fn odd_number_of_toggles_lands_on() {
+        let mut s = State::default();
+        for _ in 0..1001 {
+            update(&mut s, Message::ToggleWordWrap);
+        }
+        assert!(s.word_wrap(), "an odd toggle count ends on");
+    }
+
     // ---- Property-based invariants (epic #25 Definition of Done) ----
 
     fn arb_message() -> impl Strategy<Value = Message> {
@@ -1596,6 +1666,9 @@ mod tests {
             Just(Message::ZoomIn),
             Just(Message::ZoomOut),
             Just(Message::ZoomReset),
+            // Word wrap (#34): flip it inside long random streams so nothing else
+            // in the core depends on its value.
+            Just(Message::ToggleWordWrap),
         ]
     }
 
@@ -1703,6 +1776,22 @@ mod tests {
                 if is_reset {
                     prop_assert_eq!(s.font_size(), State::DEFAULT_FONT_SIZE);
                 }
+            }
+        }
+
+        /// Word wrap (#34) depends on nothing but its own toggle: after any
+        /// message stream, it is on exactly when an odd number of
+        /// `ToggleWordWrap`s went by — no edit, tab, find or zoom can disturb it.
+        #[test]
+        fn word_wrap_tracks_toggle_parity(seq in prop::collection::vec(arb_message(), 0..80)) {
+            let mut s = State::default();
+            let mut toggles = 0usize;
+            for m in seq {
+                if m == Message::ToggleWordWrap {
+                    toggles += 1;
+                }
+                update(&mut s, m);
+                prop_assert_eq!(s.word_wrap(), toggles % 2 == 1);
             }
         }
 

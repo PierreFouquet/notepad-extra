@@ -5,7 +5,7 @@
 //! catastrophic regexes, huge-document replace-all, and thousands of Find Next.
 
 use notepad_core::find::{self, goto_line_offset};
-use notepad_core::{Effect, Matcher, Message, SearchOptions, State, update};
+use notepad_core::{Effect, Matcher, Message, SearchOptions, State, status, update};
 use std::path::PathBuf;
 
 /// A regex-mode [`SearchOptions`].
@@ -225,4 +225,51 @@ fn go_to_line_never_leaves_the_buffer_on_a_huge_document() {
     assert_eq!(goto_line_offset(&content, 3), 10);
     // `line_col_of` round-trips that offset back to (line 2, column 0).
     assert_eq!(find::line_col_of(&content, 10), (2, 0));
+}
+
+#[test]
+fn status_on_a_huge_single_line_stays_correct() {
+    // A single one-megabyte line: the caret at the end reports a character
+    // column of len+1, and selecting the whole line counts every character —
+    // computed without materialising anything pathological.
+    let mut s = State::default();
+    let huge = "x".repeat(1_000_000);
+    update(
+        &mut s,
+        Message::FileLoaded {
+            path: PathBuf::from("/tmp/big.txt"),
+            content: huge.clone(),
+        },
+    );
+    let doc = s.active_doc();
+    let end = doc.content.len();
+    let st = status(doc, end, None);
+    assert_eq!(st.line, 1);
+    assert_eq!(st.column, 1_000_001);
+    assert_eq!(st.chars, 1_000_000);
+    assert_eq!(st.lines, 1);
+    assert_eq!(st.selection, 0);
+    // Selecting the whole line counts all million characters.
+    assert_eq!(status(doc, end, Some(0)).selection, 1_000_000);
+}
+
+#[test]
+fn status_on_a_million_line_document_stays_correct() {
+    // A million "a\n" lines: the trailing newline yields a final empty line, so
+    // the caret at end-of-text sits on line 1,000,001, column 1.
+    let mut s = State::default();
+    let content = "a\n".repeat(1_000_000);
+    update(
+        &mut s,
+        Message::FileLoaded {
+            path: PathBuf::from("/tmp/lines.txt"),
+            content,
+        },
+    );
+    let doc = s.active_doc();
+    let st = status(doc, doc.content.len(), None);
+    assert_eq!(st.lines, 1_000_001);
+    assert_eq!(st.line, 1_000_001);
+    assert_eq!(st.column, 1);
+    assert_eq!(st.chars, 2_000_000);
 }

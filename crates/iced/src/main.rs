@@ -15,10 +15,11 @@
 //! exercised headlessly (see the tests below), matching the epic's DoD.
 #![forbid(unsafe_code)]
 
-use iced::widget::{button, column, container, row, text, text_editor};
-use iced::{Element, Fill, Task};
+use iced::widget::text_editor::{Cursor, Position};
+use iced::widget::{button, column, container, row, text, text_editor, text_input};
+use iced::{Element, Fill, Length, Task};
 use notepad_core as core;
-use notepad_core::{Effect, TabId};
+use notepad_core::{Effect, FindOption, TabId};
 use std::path::PathBuf;
 
 pub fn main() -> iced::Result {
@@ -59,15 +60,40 @@ enum Message {
         path: PathBuf,
         result: Result<(), String>,
     },
+
+    // ---- Find / Replace / Go-to-line (#33) ----
+    /// Show or hide the find / replace bar.
+    ToggleFind,
+    /// Close the find / replace bar.
+    CloseFind,
+    /// The search pattern input changed.
+    FindQueryChanged(String),
+    /// The replacement input changed.
+    ReplaceQueryChanged(String),
+    /// Select the next / previous match.
+    FindNext,
+    FindPrev,
+    /// Replace the current match / all matches.
+    ReplaceOne,
+    ReplaceAll,
+    /// Flip a search option (case / whole-word / regex).
+    ToggleOption(FindOption),
+    /// The go-to-line input changed (shell-local until submitted).
+    GoToInputChanged(String),
+    /// Jump to the line typed in the go-to input.
+    GoToSubmit,
 }
 
-/// The whole shell: the pure core plus the live editor buffer, window title, and
-/// the last error surfaced in the status bar.
+/// The whole shell: the pure core plus the live editor buffer, window title, the
+/// last error surfaced in the status bar, and the go-to-line input's text.
 struct Shell {
     core: core::State,
     editor: text_editor::Content,
     title: String,
     error: Option<String>,
+    /// Go-to-line field text; parsed to a line number only on submit. The rest
+    /// of the find state lives in the pure core.
+    goto_input: String,
 }
 
 impl Shell {
@@ -81,6 +107,7 @@ impl Shell {
                 editor,
                 title,
                 error: None,
+                goto_input: String::new(),
             },
             Task::none(),
         )
@@ -155,6 +182,40 @@ impl Shell {
                     Task::none()
                 }
             },
+
+            // ---- Find / Replace / Go-to-line (#33) ----
+            Message::ToggleFind => {
+                let msg = if self.core.find.open {
+                    core::Message::FindClosed
+                } else {
+                    core::Message::FindOpened
+                };
+                self.apply_core(msg, false)
+            }
+            Message::CloseFind => self.apply_core(core::Message::FindClosed, false),
+            Message::FindQueryChanged(q) => {
+                self.apply_core(core::Message::FindQueryChanged(q), false)
+            }
+            Message::ReplaceQueryChanged(r) => {
+                self.apply_core(core::Message::ReplaceTextChanged(r), false)
+            }
+            Message::FindNext => self.apply_core(core::Message::FindNext, false),
+            Message::FindPrev => self.apply_core(core::Message::FindPrev, false),
+            // Replaces rewrite the buffer, so resync the editor before the core's
+            // RevealRange selects the result.
+            Message::ReplaceOne => self.apply_core(core::Message::ReplaceNext, true),
+            Message::ReplaceAll => self.apply_core(core::Message::ReplaceAll, true),
+            Message::ToggleOption(option) => {
+                self.apply_core(core::Message::FindOptionToggled(option), false)
+            }
+            Message::GoToInputChanged(s) => {
+                self.goto_input = s;
+                Task::none()
+            }
+            Message::GoToSubmit => match self.goto_input.trim().parse::<usize>() {
+                Ok(line) => self.apply_core(core::Message::GoToLine(line), false),
+                Err(_) => Task::none(), // ignore non-numeric input, never panic
+            },
         }
     }
 
@@ -202,10 +263,46 @@ impl Shell {
                     },
                 )
             }
+            // Turn a byte range into an editor selection (or a bare caret when
+            // empty, e.g. go-to-line). The core hands us offsets on the same
+            // canonical text the editor holds; `line_col_of` converts them to the
+            // (line, byte-column) the widget's cursor speaks.
+            Effect::RevealRange { start, end } => {
+                let content = &self.core.active_doc().content;
+                let (sl, sc) = core::find::line_col_of(content, start);
+                let cursor = if start == end {
+                    Cursor {
+                        position: Position {
+                            line: sl,
+                            column: sc,
+                        },
+                        selection: None,
+                    }
+                } else {
+                    let (el, ec) = core::find::line_col_of(content, end);
+                    Cursor {
+                        position: Position {
+                            line: el,
+                            column: ec,
+                        },
+                        selection: Some(Position {
+                            line: sl,
+                            column: sc,
+                        }),
+                    }
+                };
+                self.editor.move_to(cursor);
+                Task::none()
+            }
         }
     }
 
     fn view(&self) -> Element<'_, Message> {
+        let find_style = if self.core.find.open {
+            button::primary
+        } else {
+            button::secondary
+        };
         let toolbar = row![
             button("New").on_press(Message::NewTab),
             button("Open").on_press(Message::Open),
@@ -213,6 +310,9 @@ impl Shell {
             button("Save As").on_press(Message::SaveAs),
             button("Undo").on_press(Message::Undo),
             button("Redo").on_press(Message::Redo),
+            button("Find")
+                .style(find_style)
+                .on_press(Message::ToggleFind),
         ]
         .spacing(6);
 
@@ -252,11 +352,82 @@ impl Shell {
             .into(),
         };
 
-        column![toolbar, tabs, editor, container(status)]
-            .spacing(8)
-            .padding(10)
+        let mut layout = column![toolbar, tabs].spacing(8).padding(10);
+        if self.core.find.open {
+            layout = layout.push(self.find_bar());
+        }
+        layout.push(editor).push(container(status)).into()
+    }
+
+    /// The find / replace / go-to bar, shown only while `find.open`. All state
+    /// (query, replacement, options, match readout) lives in the pure core; this
+    /// only renders it and maps widget events back to shell messages.
+    fn find_bar(&self) -> Element<'_, Message> {
+        let find = &self.core.find;
+
+        let readout = if let Some(err) = &find.error {
+            format!("\u{26a0} {err}")
+        } else if find.query.is_empty() {
+            String::new()
+        } else if find.count == 0 {
+            "No matches".to_string()
+        } else if find.ordinal > 0 {
+            format!("{} / {}", find.ordinal, find.count)
+        } else {
+            format!("{} matches", find.count)
+        };
+
+        let find_row = row![
+            text_input("Find", &find.query)
+                .on_input(Message::FindQueryChanged)
+                .on_submit(Message::FindNext)
+                .width(Length::Fixed(220.0)),
+            button("Prev").on_press(Message::FindPrev),
+            button("Next").on_press(Message::FindNext),
+            option_button("Aa", find.options.case_sensitive, FindOption::CaseSensitive),
+            option_button("W", find.options.whole_word, FindOption::WholeWord),
+            option_button(".*", find.options.regex, FindOption::Regex),
+            text(readout),
+            button("\u{00d7}").on_press(Message::CloseFind),
+        ]
+        .spacing(6);
+
+        let replace_row = row![
+            text_input("Replace with", &find.replacement)
+                .on_input(Message::ReplaceQueryChanged)
+                .on_submit(Message::ReplaceOne)
+                .width(Length::Fixed(220.0)),
+            button("Replace").on_press(Message::ReplaceOne),
+            button("All").on_press(Message::ReplaceAll),
+            text("Go to line:"),
+            text_input("n", &self.goto_input)
+                .on_input(Message::GoToInputChanged)
+                .on_submit(Message::GoToSubmit)
+                .width(Length::Fixed(70.0)),
+            button("Go").on_press(Message::GoToSubmit),
+        ]
+        .spacing(6);
+
+        container(column![find_row, replace_row].spacing(6))
+            .padding(6)
             .into()
     }
+}
+
+/// A search-option toggle button, highlighted (primary) while the option is on.
+fn option_button<'a>(
+    label: &'a str,
+    active: bool,
+    option: FindOption,
+) -> iced::widget::Button<'a, Message> {
+    let style = if active {
+        button::primary
+    } else {
+        button::secondary
+    };
+    button(text(label))
+        .style(style)
+        .on_press(Message::ToggleOption(option))
 }
 
 /// The window title: the active document's, with a leading "• " when dirty and
@@ -405,5 +576,89 @@ mod tests {
         assert_eq!(shell.editor.text().trim_end(), "");
         assert!(!shell.core.active_doc().dirty());
         assert_eq!(shell.core.docs.len(), 1);
+    }
+
+    // ---- Find / Replace / Go-to-line wiring (#33) ----
+
+    #[test]
+    fn toggling_find_opens_and_closes_the_bar() {
+        let (mut shell, _) = Shell::new();
+        assert!(!shell.core.find.open);
+        let _ = shell.update(Message::ToggleFind);
+        assert!(shell.core.find.open);
+        let _ = shell.update(Message::ToggleFind);
+        assert!(!shell.core.find.open);
+    }
+
+    #[test]
+    fn find_query_selects_the_match_in_the_editor() {
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::Edit(paste("foo bar foo")));
+        let _ = shell.update(Message::ToggleFind);
+        let _ = shell.update(Message::FindQueryChanged("foo".into()));
+        assert_eq!(shell.core.find.count, 2);
+        // The RevealRange effect actually selected the first match in the widget.
+        assert_eq!(shell.editor.selection().as_deref(), Some("foo"));
+        // Find Next moves the selection to the second occurrence.
+        let _ = shell.update(Message::FindNext);
+        assert_eq!(shell.editor.selection().as_deref(), Some("foo"));
+        assert_eq!(shell.core.find.current.map(|m| m.start), Some(8));
+    }
+
+    #[test]
+    fn go_to_line_moves_the_editor_cursor() {
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::Edit(paste("one\ntwo\nthree")));
+        let _ = shell.update(Message::GoToInputChanged("2".into()));
+        let _ = shell.update(Message::GoToSubmit);
+        let cursor = shell.editor.cursor();
+        assert_eq!(cursor.position.line, 1); // 0-based → line 2
+        assert_eq!(cursor.position.column, 0);
+    }
+
+    #[test]
+    fn non_numeric_go_to_input_is_ignored() {
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::Edit(paste("a\nb")));
+        let _ = shell.update(Message::GoToInputChanged("not-a-number".into()));
+        let _ = shell.update(Message::GoToSubmit); // must not panic
+        assert_eq!(shell.core.active_doc().content, "a\nb");
+    }
+
+    #[test]
+    fn replace_one_rewrites_the_buffer_and_reselects() {
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::Edit(paste("ab ab ab")));
+        let _ = shell.update(Message::ToggleFind);
+        let _ = shell.update(Message::FindQueryChanged("ab".into()));
+        let _ = shell.update(Message::ReplaceQueryChanged("X".into()));
+        let _ = shell.update(Message::ReplaceOne);
+        assert_eq!(shell.core.active_doc().content, "X ab ab");
+        assert_eq!(shell.editor.text().trim_end(), "X ab ab");
+        // The editor resynced and the selection landed on the next match.
+        assert_eq!(shell.editor.selection().as_deref(), Some("ab"));
+    }
+
+    #[test]
+    fn replace_all_rewrites_every_match() {
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::Edit(paste("ab ab ab")));
+        let _ = shell.update(Message::ToggleFind);
+        let _ = shell.update(Message::FindQueryChanged("ab".into()));
+        let _ = shell.update(Message::ReplaceQueryChanged("X".into()));
+        let _ = shell.update(Message::ReplaceAll);
+        assert_eq!(shell.editor.text().trim_end(), "X X X");
+        assert_eq!(shell.core.find.count, 0);
+    }
+
+    #[test]
+    fn toggling_a_search_option_reaches_the_core() {
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::Edit(paste("Foo foo")));
+        let _ = shell.update(Message::ToggleFind);
+        let _ = shell.update(Message::FindQueryChanged("foo".into()));
+        assert_eq!(shell.core.find.count, 2); // case-insensitive
+        let _ = shell.update(Message::ToggleOption(FindOption::CaseSensitive));
+        assert_eq!(shell.core.find.count, 1);
     }
 }

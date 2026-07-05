@@ -5,13 +5,13 @@
 
 use arbitrary::{Arbitrary, Unstructured};
 use libfuzzer_sys::fuzz_target;
-use notepad_core::{Message, State, TabId, update};
+use notepad_core::{FindOption, Message, State, TabId, update};
 use std::path::PathBuf;
 
 // Built here rather than deriving `Arbitrary` on the core types, so the core
-// stays dependency-free.
+// stays free of the `arbitrary` dependency.
 fn arb_message(u: &mut Unstructured) -> arbitrary::Result<Message> {
-    Ok(match u.int_in_range(0u8..=11)? {
+    Ok(match u.int_in_range(0u8..=21)? {
         0 => Message::NewTab,
         1 => Message::OpenRequested,
         2 => Message::SaveRequested,
@@ -29,10 +29,26 @@ fn arb_message(u: &mut Unstructured) -> arbitrary::Result<Message> {
             id: TabId::arbitrary(u)?,
             path: PathBuf::from(String::arbitrary(u)?),
         },
-        _ => Message::FileSaved {
+        11 => Message::FileSaved {
             id: TabId::arbitrary(u)?,
             path: PathBuf::from(String::arbitrary(u)?),
         },
+        // Find / Replace / Go-to (#33): exercise the whole bar under fuzzing, so
+        // stale-offset regressions (e.g. undo/redo shrinking the buffer) surface.
+        12 => Message::FindOpened,
+        13 => Message::FindClosed,
+        14 => Message::FindQueryChanged(String::arbitrary(u)?),
+        15 => Message::ReplaceTextChanged(String::arbitrary(u)?),
+        16 => Message::FindOptionToggled(match u.int_in_range(0u8..=2)? {
+            0 => FindOption::CaseSensitive,
+            1 => FindOption::WholeWord,
+            _ => FindOption::Regex,
+        }),
+        17 => Message::FindNext,
+        18 => Message::FindPrev,
+        19 => Message::ReplaceNext,
+        20 => Message::ReplaceAll,
+        _ => Message::GoToLine(usize::arbitrary(u)?),
     })
 }
 
@@ -50,5 +66,11 @@ fuzz_target!(|data: &[u8]| {
             state.active < state.docs.len(),
             "active index must stay in bounds"
         );
+        // A highlighted find match must never dangle past the active buffer.
+        if let Some(hit) = state.find.current {
+            let content = &state.active_doc().content;
+            assert!(hit.end <= content.len(), "match end past buffer");
+            assert!(content.is_char_boundary(hit.start) && content.is_char_boundary(hit.end));
+        }
     }
 });

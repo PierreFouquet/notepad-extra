@@ -117,3 +117,4 @@ jobs:
         run: |
           cargo fuzz run --fuzz-dir crates/core/fuzz --target x86_64-unknown-linux-gnu update_sequence -- -max_total_time=15
           cargo fuzz run --fuzz-dir crates/core/fuzz --target x86_64-unknown-linux-gnu text_helpers   -- -max_total_time=15
+          cargo fuzz run --fuzz-dir crates/core/fuzz --target x86_64-unknown-linux-gnu find_search     -- -max_total_time=15

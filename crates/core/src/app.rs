@@ -117,6 +117,10 @@ pub struct State {
     pub active: usize,
     /// Find / Replace / Go-to bar state (#33).
     pub find: FindState,
+    /// Whether the About panel is showing (#40). A plain UI flag with no buffer
+    /// bearing; read via [`State::about_open`], toggled by [`Message::AboutOpened`]
+    /// / [`Message::AboutClosed`]. Not persisted.
+    about_open: bool,
     /// Editor font size in points, a single app-wide zoom level shared by every
     /// tab (#35). Always within `[MIN_FONT_SIZE, MAX_FONT_SIZE]`; mutate only
     /// through [`State::zoom_in`] / [`State::zoom_out`] / [`State::zoom_reset`],
@@ -142,6 +146,7 @@ impl Default for State {
             docs: Vec::new(),
             active: 0,
             find: FindState::default(),
+            about_open: false,
             font_size: State::DEFAULT_FONT_SIZE,
             word_wrap: false,
             pending_close: None,
@@ -181,6 +186,12 @@ impl State {
     /// renders to pick the editor's wrapping strategy.
     pub fn word_wrap(&self) -> bool {
         self.word_wrap
+    }
+
+    /// Whether the About panel is currently showing (#40). The shell reads this
+    /// when it renders to decide whether to draw the About panel.
+    pub fn about_open(&self) -> bool {
+        self.about_open
     }
 
     /// Snapshot the persistable preferences (#38) for the shell to write to disk.
@@ -319,6 +330,16 @@ pub enum Message {
     // ---- Word wrap (#34) ----
     /// Flip soft word-wrap on or off, app-wide.
     ToggleWordWrap,
+
+    // ---- About dialog + external links (#40) ----
+    /// Show the About panel.
+    AboutOpened,
+    /// Hide the About panel.
+    AboutClosed,
+    /// Open a URL in the user's browser (an About-panel link). The core emits an
+    /// [`Effect::OpenUrl`] only for a safe `https` URL; anything else is dropped
+    /// here, so an unsafe link can never reach the OS handler.
+    OpenUrl(String),
 }
 
 /// A side effect for the render shell to perform. `update` returns these instead
@@ -352,6 +373,11 @@ pub enum Effect {
     /// persistable setting (zoom #35, word-wrap #34) changes; the shell writes
     /// the JSON and swallows any write error rather than interrupting editing.
     SavePreferences(Preferences),
+    /// Open `url` in the user's default browser via the OS handler (an About
+    /// link, #40). Only ever emitted for a URL the core already vetted with
+    /// [`crate::io::is_safe_external_url`]; the shell runs it via
+    /// [`crate::io::open_external`]. The app makes no network request itself.
+    OpenUrl(String),
 }
 
 /// Apply `message` to `state`, returning the effects the shell must run.
@@ -607,6 +633,27 @@ pub fn update(state: &mut State, message: Message) -> Vec<Effect> {
         Message::ToggleWordWrap => {
             state.word_wrap = !state.word_wrap;
             vec![Effect::SavePreferences(state.preferences())]
+        }
+
+        // ---- About dialog + external links (#40) ----
+        // Opening/closing the panel is a pure UI flag with no side effect. A link
+        // click becomes an `OpenUrl` effect only when the URL is a safe `https`
+        // one — the vetting lives here, in the pure core, so the rejection is
+        // tested headlessly and an unsafe link never reaches the OS handler.
+        Message::AboutOpened => {
+            state.about_open = true;
+            vec![]
+        }
+        Message::AboutClosed => {
+            state.about_open = false;
+            vec![]
+        }
+        Message::OpenUrl(url) => {
+            if crate::io::is_safe_external_url(&url) {
+                vec![Effect::OpenUrl(url)]
+            } else {
+                vec![]
+            }
         }
     }
 }
@@ -1712,6 +1759,60 @@ mod tests {
             !fx.iter().any(|e| matches!(e, Effect::SavePreferences(_))),
             "an ordinary edit never persists preferences"
         );
+    }
+
+    // ---- About dialog + external links (#40) ----
+
+    #[test]
+    fn about_panel_opens_and_closes_without_side_effects() {
+        let mut s = State::default();
+        assert!(!s.about_open(), "starts hidden");
+        assert!(update(&mut s, Message::AboutOpened).is_empty());
+        assert!(s.about_open());
+        assert!(update(&mut s, Message::AboutClosed).is_empty());
+        assert!(!s.about_open());
+    }
+
+    #[test]
+    fn about_panel_does_not_disturb_the_buffer() {
+        // Opening/closing About is a pure overlay: it must not touch the document,
+        // its dirty flag, or the active tab.
+        let mut s = State::default();
+        update(&mut s, Message::Edited("keep me".into()));
+        update(&mut s, Message::AboutOpened);
+        update(&mut s, Message::AboutClosed);
+        assert_eq!(s.active_doc().content, "keep me");
+        assert!(s.active_doc().dirty());
+        assert_eq!(s.docs.len(), 1);
+    }
+
+    #[test]
+    fn open_url_emits_an_effect_only_for_a_safe_https_link() {
+        let mut s = State::default();
+        let safe = "https://github.com/PierreFouquet/notepad-extra".to_string();
+        assert_eq!(
+            update(&mut s, Message::OpenUrl(safe.clone())),
+            vec![Effect::OpenUrl(safe)]
+        );
+    }
+
+    #[test]
+    fn open_url_drops_unsafe_links_in_the_core() {
+        // The vetting lives in the pure core, so an unsafe scheme never becomes an
+        // effect and can never reach the OS handler — asserted headlessly.
+        let mut s = State::default();
+        for bad in [
+            "http://example.com",
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "https://exa mple.com",
+            "",
+        ] {
+            assert!(
+                update(&mut s, Message::OpenUrl(bad.to_string())).is_empty(),
+                "unsafe URL {bad:?} must not produce an effect"
+            );
+        }
     }
 
     // ---- Property-based invariants (epic #25 Definition of Done) ----

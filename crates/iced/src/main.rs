@@ -16,8 +16,8 @@
 #![forbid(unsafe_code)]
 
 use iced::widget::text::Wrapping;
-use iced::widget::{button, column, container, row, text, text_input};
-use iced::{Element, Fill, Length, Task};
+use iced::widget::{button, column, container, row, stack, text, text_input};
+use iced::{Element, Fill, Length, Subscription, Task};
 use notepad_core as core;
 use notepad_core::{Effect, FindOption, TabId};
 use std::path::{Path, PathBuf};
@@ -36,8 +36,35 @@ pub fn main() -> iced::Result {
     };
     iced::application(Shell::boot, Shell::update, Shell::view)
         .title(Shell::title)
+        .subscription(Shell::subscription)
         .window(window)
         .run()
+}
+
+/// Map raw window events to shell messages for the drag-and-drop subscription
+/// (#42). We track the three drag phases the toolkit reports: a file *hovering*
+/// over the window (raise the drop overlay), the cursor *leaving* with the files
+/// (drop it), and a file *dropped* (open it). Files are delivered **one path per
+/// event** — so hovering or dropping several fires these once each. `status` and
+/// `window::Id` are irrelevant (a drag is never captured by a widget, and there
+/// is a single window), so they are ignored. Kept a free `fn` (not a closure)
+/// because `iced::event::listen_with` takes a plain function pointer, and pure so
+/// the mapping is unit-testable without a runtime.
+fn on_window_event(
+    event: iced::Event,
+    _status: iced::event::Status,
+    _id: iced::window::Id,
+) -> Option<Message> {
+    match event {
+        iced::Event::Window(iced::window::Event::FileHovered(_)) => Some(Message::FilesHovered),
+        iced::Event::Window(iced::window::Event::FilesHoveredLeft) => {
+            Some(Message::FilesHoveredLeft)
+        }
+        iced::Event::Window(iced::window::Event::FileDropped(path)) => {
+            Some(Message::FileDropped(path))
+        }
+        _ => None,
+    }
 }
 
 /// The window / taskbar icon, decoded from the embedded `icons/icon.png` (#66).
@@ -92,6 +119,15 @@ enum Message {
     Edit(text_editor::Action),
     /// The open dialog resolved (`None` = cancelled).
     OpenPicked(Option<PathBuf>),
+    /// A file was dragged and dropped onto the window (#42). Read it and open it
+    /// in a tab, exactly as the open picker does — the toolkit fires this once
+    /// per dropped path, so many files simply produce many of these.
+    FileDropped(PathBuf),
+    /// A dragged file is hovering over the window (#42): raise the "drop to open"
+    /// overlay so the user knows a drop will land.
+    FilesHovered,
+    /// The drag left the window without dropping (#42): lower the overlay.
+    FilesHoveredLeft,
     /// A chosen file finished loading from disk.
     FileRead {
         path: PathBuf,
@@ -198,6 +234,9 @@ struct Shell {
     /// The tab whose close is awaiting confirmation, if any (#31); drives the
     /// in-app confirm bar in [`Shell::view`].
     confirm_close: Option<PendingClose>,
+    /// Whether a file drag is currently hovering over the window (#42); drives the
+    /// "drop to open" overlay in [`Shell::view`].
+    drag_hover: bool,
 }
 
 impl Shell {
@@ -225,6 +264,7 @@ impl Shell {
                 error: None,
                 goto_input: String::new(),
                 confirm_close: None,
+                drag_hover: false,
             },
             Task::none(),
         )
@@ -275,16 +315,31 @@ impl Shell {
                 }
             }
 
-            Message::OpenPicked(Some(path)) => {
-                let for_msg = path.clone();
-                Task::perform(async move { core::io::read_file(&path) }, move |result| {
-                    Message::FileRead {
-                        path: for_msg.clone(),
-                        result,
-                    }
-                })
-            }
+            // A picked or dropped file takes the same path: read it off-thread,
+            // then land the bytes as `FileRead`. `FileRead`'s error arm already
+            // skips a failed read (missing / directory / non-UTF-8) without
+            // opening a tab, which is exactly the drag-and-drop skip behaviour
+            // the #42 test focus asks for — so a dropped directory or binary is
+            // handled for free.
+            Message::OpenPicked(Some(path)) => Self::read_into_tab(path),
             Message::OpenPicked(None) => Task::none(),
+            Message::FileDropped(path) => {
+                // The drop lands the files, so the hover is over — lower the
+                // overlay. (A multi-file drop fires one `FileDropped` each; each
+                // simply re-clears the already-cleared flag.)
+                self.drag_hover = false;
+                Self::read_into_tab(path)
+            }
+            // Drag hover phases (#42): raise the overlay while a file is over the
+            // window, lower it if the drag leaves without dropping.
+            Message::FilesHovered => {
+                self.drag_hover = true;
+                Task::none()
+            }
+            Message::FilesHoveredLeft => {
+                self.drag_hover = false;
+                Task::none()
+            }
 
             Message::FileRead { path, result } => match result {
                 Ok(content) => {
@@ -383,6 +438,28 @@ impl Shell {
         }
     }
 
+    /// Read `path` off-thread and land the bytes as [`Message::FileRead`]. The
+    /// single reader shared by the open picker (`Effect::ReadFile`) and drag-and-
+    /// drop (`Message::FileDropped`, #42): both a chosen and a dropped file open
+    /// the very same way, and `FileRead`'s error arm skips a failed read (missing
+    /// / directory / non-UTF-8) without opening a tab.
+    fn read_into_tab(path: PathBuf) -> Task<Message> {
+        let for_msg = path.clone();
+        Task::perform(async move { core::io::read_file(&path) }, move |result| {
+            Message::FileRead {
+                path: for_msg.clone(),
+                result,
+            }
+        })
+    }
+
+    /// Passive subscriptions: currently just drag-and-drop file opening (#42),
+    /// which surfaces as raw window `FileDropped` events mapped by
+    /// [`on_window_event`].
+    fn subscription(&self) -> Subscription<Message> {
+        iced::event::listen_with(on_window_event)
+    }
+
     /// Feed one message through the pure core, run every [`Effect`] it returns,
     /// and rebuild the editor buffer from the core when the active document may
     /// have changed underneath us. `resync` is `false` for `Edited` (whose text
@@ -408,15 +485,7 @@ impl Shell {
                 Task::none()
             }
             Effect::PickOpenPath => Task::perform(pick_open(), Message::OpenPicked),
-            Effect::ReadFile(path) => {
-                let for_msg = path.clone();
-                Task::perform(async move { core::io::read_file(&path) }, move |result| {
-                    Message::FileRead {
-                        path: for_msg.clone(),
-                        result,
-                    }
-                })
-            }
+            Effect::ReadFile(path) => Self::read_into_tab(path),
             Effect::PickSavePath { id } => {
                 Task::perform(pick_save(), move |path| Message::SavePicked { id, path })
             }
@@ -622,7 +691,14 @@ impl Shell {
         if self.core.find.open {
             layout = layout.push(self.find_bar());
         }
-        layout.push(editor).push(container(status)).into()
+        let content = layout.push(editor).push(container(status));
+        // While a file drags over the window, float the "drop to open" overlay on
+        // top of everything (#42); otherwise the plain layout.
+        if self.drag_hover {
+            stack![content, Self::drop_overlay()].into()
+        } else {
+            content.into()
+        }
     }
 
     /// The in-app "close with unsaved changes?" bar, shown while a close awaits
@@ -661,6 +737,34 @@ impl Shell {
         )
         .padding(6)
         .into()
+    }
+
+    /// The drag-and-drop hint overlay (#42), shown while a file is hovering over
+    /// the window. A translucent full-window backdrop dims the editor and centres
+    /// a "Drop files to open" card, mirroring the WebView build's drop overlay so
+    /// the user sees a drop will land. Purely visual — it captures no input and
+    /// disappears the instant the drag drops or leaves.
+    fn drop_overlay<'a>() -> Element<'a, Message> {
+        let card = container(text("Drop files to open").size(22))
+            .padding([16, 28])
+            .style(|theme: &iced::Theme| {
+                let palette = theme.extended_palette();
+                container::Style {
+                    text_color: Some(palette.primary.strong.text),
+                    background: Some(palette.primary.strong.color.into()),
+                    border: iced::border::rounded(8),
+                    ..container::Style::default()
+                }
+            });
+        container(card)
+            .center(Fill)
+            .width(Fill)
+            .height(Fill)
+            .style(|_theme| container::Style {
+                background: Some(iced::Color::from_rgba(0.0, 0.0, 0.0, 0.45).into()),
+                ..container::Style::default()
+            })
+            .into()
     }
 
     /// The About panel (#40), shown while `core.about_open()`. Renders the app
@@ -1387,6 +1491,142 @@ mod tests {
         assert!(shell.error.is_none());
         assert_eq!(shell.editor.text().trim_end(), "in progress");
         assert!(shell.core.active_doc().dirty());
+    }
+
+    // ---- Drag-and-drop file open wiring (#42) ----
+
+    /// Land a dropped `path` exactly as the runtime does: `Message::FileDropped`
+    /// calls `read_into_tab`, which reads off-thread and re-enters as `FileRead`.
+    /// The async read can't run under the headless test, so we perform the same
+    /// real `read_file` here and feed its result straight into the shell — the
+    /// faithful, synchronous equivalent of a completed drop.
+    fn drop_file(shell: &mut Shell, path: &Path) {
+        // Prove the drop message itself is accepted and routed without panicking
+        // (it returns the read task we can't drive here), then land the bytes.
+        let _ = shell.update(Message::FileDropped(path.to_path_buf()));
+        let result = core::io::read_file(path);
+        let _ = shell.update(Message::FileRead {
+            path: path.to_path_buf(),
+            result,
+        });
+    }
+
+    #[test]
+    fn on_window_event_maps_each_drag_phase() {
+        // The subscription mapper turns each drag phase into its message — hover
+        // raises the overlay, leave lowers it, drop opens the file — and ignores
+        // unrelated window events.
+        let id = iced::window::Id::unique();
+        let status = iced::event::Status::Ignored;
+
+        let hovered = iced::Event::Window(iced::window::Event::FileHovered("/tmp/x.txt".into()));
+        assert!(matches!(
+            on_window_event(hovered, status, id),
+            Some(Message::FilesHovered)
+        ));
+        let left = iced::Event::Window(iced::window::Event::FilesHoveredLeft);
+        assert!(matches!(
+            on_window_event(left, status, id),
+            Some(Message::FilesHoveredLeft)
+        ));
+        let dropped = iced::Event::Window(iced::window::Event::FileDropped("/tmp/x.txt".into()));
+        assert!(matches!(
+            on_window_event(dropped, status, id),
+            Some(Message::FileDropped(p)) if p == Path::new("/tmp/x.txt")
+        ));
+        // An unrelated window event maps to nothing.
+        let other = iced::Event::Window(iced::window::Event::Unfocused);
+        assert!(on_window_event(other, status, id).is_none());
+    }
+
+    #[test]
+    fn the_drop_overlay_tracks_the_drag_phases() {
+        // The overlay (#42) is up only while a file hovers: a hover raises it, a
+        // leave lowers it, and an actual drop lowers it too (the drop consumes the
+        // hover). The view renders in both states without panicking.
+        let (mut shell, _) = Shell::new();
+        assert!(!shell.drag_hover, "no overlay at rest");
+
+        let _ = shell.update(Message::FilesHovered);
+        assert!(shell.drag_hover, "hover raises the overlay");
+        let _ = shell.view();
+
+        let _ = shell.update(Message::FilesHoveredLeft);
+        assert!(!shell.drag_hover, "leaving lowers it");
+
+        // A drag that ends in a drop also lowers the overlay.
+        let _ = shell.update(Message::FilesHovered);
+        assert!(shell.drag_hover);
+        let _ = shell.update(Message::FileDropped(PathBuf::from("/tmp/nope.txt")));
+        assert!(!shell.drag_hover, "a drop lowers the overlay");
+    }
+
+    #[test]
+    fn dropping_files_opens_a_tab_each() {
+        // The core of #42: several files dropped onto a fresh window open in
+        // their own tabs (the first reusing the pristine blank), each carrying
+        // its own content, with the last one focused.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let files = [
+            ("a.rs", "fn a() {}\n"),
+            ("b.txt", "bee\n"),
+            ("c.md", "# cee"),
+        ];
+        let (mut shell, _) = Shell::new();
+        for (name, body) in files {
+            let path = dir.path().join(name);
+            core::io::write_file(&path, body).expect("seed file");
+            drop_file(&mut shell, &path);
+        }
+        assert_eq!(shell.core.docs.len(), files.len());
+        assert!(shell.error.is_none());
+        assert_eq!(shell.core.active_doc().title(), "c.md");
+        assert_eq!(shell.editor.text().trim_end_matches('\n'), "# cee");
+    }
+
+    #[test]
+    fn dropping_a_directory_is_skipped_not_opened() {
+        // Dropping a folder must be quietly skipped (surfaced as a status error),
+        // never opened as a document and never a panic — the read fails and the
+        // `FileRead` error arm opens nothing.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut shell, _) = Shell::new();
+        drop_file(&mut shell, dir.path());
+        assert_eq!(shell.core.docs.len(), 1, "still just the blank tab");
+        assert_eq!(shell.core.active_doc().title(), "Untitled");
+        assert!(shell.error.is_some(), "the skip is surfaced");
+    }
+
+    #[test]
+    fn dropping_missing_or_binary_files_is_skipped() {
+        // A path that no longer exists and a non-UTF-8 (binary) file are both
+        // bad-read cases: skipped without opening a tab, never a panic (#42).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut shell, _) = Shell::new();
+
+        drop_file(&mut shell, &dir.path().join("gone.txt")); // never existed
+        assert_eq!(shell.core.docs.len(), 1);
+        assert!(shell.error.is_some());
+
+        let binary = dir.path().join("blob.bin");
+        std::fs::write(&binary, [0xFF, 0xFE, 0x00, 0x01]).expect("write bytes");
+        drop_file(&mut shell, &binary);
+        assert_eq!(shell.core.docs.len(), 1, "binary never becomes a tab");
+    }
+
+    #[test]
+    fn rapid_repeated_drops_stay_well_behaved() {
+        // Many files dropped back to back (the #42 stress case) must all open
+        // without a panic or a lost tab.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut shell, _) = Shell::new();
+        for i in 0..40 {
+            let path = dir.path().join(format!("f{i}.txt"));
+            core::io::write_file(&path, &format!("line {i}\n")).expect("seed");
+            drop_file(&mut shell, &path);
+        }
+        assert_eq!(shell.core.docs.len(), 40);
+        assert!(shell.error.is_none());
     }
 
     // ---- About dialog + external links wiring (#40) ----

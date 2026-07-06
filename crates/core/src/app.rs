@@ -897,6 +897,42 @@ mod tests {
     }
 
     #[test]
+    fn dropping_many_files_reuses_the_blank_once_then_appends() {
+        // Drag-and-drop (#42) lands one `FileLoaded` per dropped file. From a
+        // fresh blank tab, the first drop reuses it and each later drop adds its
+        // own tab — so N files dropped onto an empty editor give exactly N tabs,
+        // the last one focused, with every file's content preserved.
+        let mut s = State::default();
+        let files = [
+            ("/tmp/a.rs", "fn a() {}\n"),
+            ("/tmp/b.txt", "bee\n"),
+            ("/tmp/c.md", "# cee\n"),
+        ];
+        for (path, content) in files {
+            load(&mut s, path, content);
+        }
+        assert_eq!(s.docs.len(), files.len(), "one tab per dropped file");
+        assert_eq!(s.active, files.len() - 1, "focus follows the last drop");
+        for (i, (_, content)) in files.iter().enumerate() {
+            assert_eq!(s.docs[i].content, EndOfLine::to_lf(content));
+        }
+        assert_eq!(s.active_doc().title(), "c.md");
+    }
+
+    #[test]
+    fn rapid_repeated_loads_never_panic_and_keep_appending() {
+        // The "rapid repeated drops" stress case (#42): hundreds of files landing
+        // back to back must stay well-behaved — no panic, no lost tabs — beyond
+        // the first reused blank.
+        let mut s = State::default();
+        for i in 0..500 {
+            load(&mut s, &format!("/tmp/f{i}.txt"), &format!("line {i}\n"));
+        }
+        assert_eq!(s.docs.len(), 500);
+        assert_eq!(s.active, 499);
+    }
+
+    #[test]
     fn opening_after_edit_adds_a_tab() {
         let mut s = State::default();
         update(&mut s, Message::Edited("dirty".into()));

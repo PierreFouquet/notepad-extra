@@ -24,7 +24,17 @@ iced = { version = "0.14", default-features = false, features = [
     "x11",
     "wayland",
     "thread-pool",
+    "advanced",
 ] }
+
+# Word-wrap (#34) exposed that iced 0.14's `text_editor` renders no scrollbar and
+# offers no horizontal scroll. To add a visible scrollbar we vendor the widget
+# (`src/text_editor.rs`) and reach its concrete editor's scroll offset, which
+# lives on `iced_graphics::text::Editor::buffer().scroll()`. Both crates are
+# pinned to the exact versions iced 0.14 already resolves, so cargo unifies the
+# types and this adds nothing to vendor for the source-built story (#17).
+iced_core = "=0.14.0"
+iced_graphics = "=0.14.0"
 
 # Native file dialogs. `xdg-portal` keeps us off GTK/webkit build deps (the whole
 # point of the migration); `async-std` gives rfd its own executor so it works
@@ -40,6 +50,16 @@ rfd = { version = "0.15", default-features = false, features = [
 # feature (off under our `default-features = false` build), so we decode here and
 # hand raw RGBA to `window::icon::from_rgba`.
 png = { version = "0.18", default-features = false }
+
+# The vendored `text_editor` (src/text_editor.rs) keeps upstream iced's
+# `#[cfg(feature = ...)]` gates on capabilities we don't build: `highlighter`
+# (syntax highlighting via `iced_highlighter`, tracked in #32) and `advanced`
+# (the `class` style setter — we use the `style` closure instead). Declaring the
+# features here — off, enabling nothing — leaves that code compiled out while
+# making the cfg names known, so the `-D warnings` clippy job stays clean (#34).
+[features]
+highlighter = []
+advanced = []
 
 [dev-dependencies]
 # Real temp files for the preferences save→reload round-trip test (#38). Already

@@ -16,12 +16,18 @@
 #![forbid(unsafe_code)]
 
 use iced::widget::text::Wrapping;
-use iced::widget::text_editor::{Cursor, Position};
-use iced::widget::{button, column, container, row, text, text_editor, text_input};
+use iced::widget::{button, column, container, row, text, text_input};
 use iced::{Element, Fill, Length, Task};
 use notepad_core as core;
 use notepad_core::{Effect, FindOption, TabId};
 use std::path::{Path, PathBuf};
+
+// Vendored copy of iced 0.14's `text_editor`, extended with a visible vertical
+// scrollbar (#34) — the stock widget renders none and exposes no scroll offset.
+// The free `text_editor` fn and `Cursor`/`Position` mirror iced's own so the
+// rest of the shell is unchanged.
+mod text_editor;
+use text_editor::{Cursor, Position, text_editor};
 
 pub fn main() -> iced::Result {
     let window = iced::window::Settings {
@@ -597,7 +603,16 @@ impl Shell {
             }
         };
 
-        let mut layout = column![toolbar, tabs].spacing(8).padding(10);
+        // The root column must fill the window on both axes. Left at its default
+        // `Shrink`, iced's flex layout hands the editor a wrap width equal to the
+        // widest non-fill sibling (the toolbar) instead of the window width, so
+        // `Wrapping::Word` never has a real boundary to wrap against and long
+        // lines overflow with no way to scroll (#34).
+        let mut layout = column![toolbar, tabs]
+            .spacing(8)
+            .padding(10)
+            .width(Fill)
+            .height(Fill);
         if self.core.about_open() {
             layout = layout.push(self.about_panel());
         }

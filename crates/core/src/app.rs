@@ -9,6 +9,7 @@ use crate::find::{self, Match, Matcher, SearchError, SearchOptions};
 use crate::history::History;
 use crate::prefs::Preferences;
 use crate::text::{self, EndOfLine};
+use notepad_syntax::ThemeMode;
 use std::path::PathBuf;
 
 /// Stable identifier for an open document, so effects that complete
@@ -159,6 +160,12 @@ pub struct State {
     /// `editor_font` (two separate pickers); never empty. Read via
     /// [`State::ui_font`], changed by [`Message::SetUiFont`]. Persisted by #38.
     ui_font: String,
+    /// The UI light/dark theme, app-wide (#36). Read via [`State::theme`],
+    /// flipped by [`Message::ToggleTheme`]. Light by default, matching the
+    /// WebView build. The shell maps it to both the `iced::Theme` chrome and the
+    /// paired syntect highlight theme ([`notepad_syntax::highlight_theme`]).
+    /// Persisted by #38.
+    theme: ThemeMode,
     /// A document (by stable id) that must be closed once its in-flight
     /// "save before closing" write lands (#31). Set by [`Message::TabCloseSave`],
     /// consumed by [`Message::FileSaved`], and cleared by [`Message::SaveAbandoned`]
@@ -180,6 +187,7 @@ impl Default for State {
             show_line_numbers: true,
             editor_font: State::DEFAULT_EDITOR_FONT.to_string(),
             ui_font: State::DEFAULT_UI_FONT.to_string(),
+            theme: ThemeMode::default(),
             pending_close: None,
             next_id: 1,
         };
@@ -249,6 +257,13 @@ impl State {
         &self.ui_font
     }
 
+    /// The current UI light/dark theme (#36). The shell reads this when it
+    /// renders to pick both the `iced::Theme` chrome and the paired syntect
+    /// highlight theme.
+    pub fn theme(&self) -> ThemeMode {
+        self.theme
+    }
+
     /// Whether the About panel is currently showing (#40). The shell reads this
     /// when it renders to decide whether to draw the About panel.
     pub fn about_open(&self) -> bool {
@@ -265,6 +280,7 @@ impl State {
             show_line_numbers: self.show_line_numbers,
             editor_font: self.editor_font.clone(),
             ui_font: self.ui_font.clone(),
+            theme: self.theme,
         }
     }
 
@@ -278,6 +294,7 @@ impl State {
         self.show_line_numbers = prefs.show_line_numbers;
         self.set_editor_font(&prefs.editor_font);
         self.set_ui_font(&prefs.ui_font);
+        self.theme = prefs.theme;
     }
 
     /// Enlarge the editor font by one step, clamped to `MAX_FONT_SIZE` (Ctrl+ +).
@@ -425,6 +442,11 @@ pub enum Message {
     // ---- Line numbers (#41) ----
     /// Show or hide the line-number gutter, app-wide.
     ToggleLineNumbers,
+
+    // ---- Light / Dark theme (#36) ----
+    /// Flip the UI theme between light and dark, app-wide. The shell repaints in
+    /// the new `iced::Theme` and re-highlights with the paired syntect theme.
+    ToggleTheme,
 
     // ---- Font family selection (#61) ----
     /// Set the editor buffer's font family (from the editor-font picker). An
@@ -757,6 +779,19 @@ pub fn update(state: &mut State, message: Message) -> Vec<Effect> {
         // persisted on each toggle (#38).
         Message::ToggleLineNumbers => {
             state.show_line_numbers = !state.show_line_numbers;
+            vec![Effect::SavePreferences(state.preferences())]
+        }
+
+        // ---- Light / Dark theme (#36) ----
+        // Like the toggles above, this flips an app-wide render preference the
+        // shell reads (from `theme()`) — no buffer or title change — and is
+        // persisted on each toggle (#38). The shell maps the new mode to both the
+        // `iced::Theme` chrome and the paired syntect highlight theme.
+        Message::ToggleTheme => {
+            state.theme = match state.theme {
+                ThemeMode::Light => ThemeMode::Dark,
+                ThemeMode::Dark => ThemeMode::Light,
+            };
             vec![Effect::SavePreferences(state.preferences())]
         }
 
@@ -1318,6 +1353,56 @@ mod tests {
             "Python",
             "saving must not clobber it"
         );
+    }
+
+    // ---- Light / Dark theme (#36) -----------------------------------------
+
+    #[test]
+    fn theme_defaults_to_light() {
+        assert_eq!(State::default().theme(), ThemeMode::Light);
+    }
+
+    #[test]
+    fn toggle_theme_flips_and_persists() {
+        let mut s = State::default();
+        // Each toggle flips the mode and asks the shell to persist the new prefs.
+        let fx = update(&mut s, Message::ToggleTheme);
+        assert_eq!(s.theme(), ThemeMode::Dark);
+        assert_eq!(fx, vec![Effect::SavePreferences(s.preferences())]);
+        assert_eq!(s.preferences().theme, ThemeMode::Dark);
+
+        let fx = update(&mut s, Message::ToggleTheme);
+        assert_eq!(
+            s.theme(),
+            ThemeMode::Light,
+            "a second toggle returns to light"
+        );
+        assert_eq!(fx, vec![Effect::SavePreferences(s.preferences())]);
+    }
+
+    #[test]
+    fn apply_preferences_restores_theme() {
+        let mut s = State::default();
+        let prefs = Preferences {
+            theme: ThemeMode::Dark,
+            ..Preferences::default()
+        };
+        s.apply_preferences(&prefs);
+        assert_eq!(s.theme(), ThemeMode::Dark);
+    }
+
+    #[test]
+    fn toggling_theme_leaves_documents_untouched() {
+        // Theme is app-wide chrome only: it must not create/close tabs, change
+        // the active buffer, or dirty anything.
+        let mut s = State::default();
+        update(&mut s, Message::Edited("keep".into()));
+        let content = s.active_doc().content.clone();
+        let dirty = s.active_doc().dirty();
+        update(&mut s, Message::ToggleTheme);
+        assert_eq!(s.docs.len(), 1);
+        assert_eq!(s.active_doc().content, content);
+        assert_eq!(s.active_doc().dirty(), dirty);
     }
 
     #[test]
@@ -2087,7 +2172,7 @@ mod tests {
     #[test]
     fn apply_preferences_restores_zoom_and_wrap() {
         // Simulate a fresh launch loading a saved config: the state must come up
-        // with the persisted zoom, wrap and gutter, matching the snapshot exactly.
+        // with the persisted zoom, wrap, gutter and theme, matching the snapshot.
         let prefs = Preferences {
             version: crate::prefs::CURRENT_VERSION,
             font_size: 25,
@@ -2095,6 +2180,7 @@ mod tests {
             show_line_numbers: false,
             editor_font: "Fira Code".to_string(),
             ui_font: "Noto Sans".to_string(),
+            theme: ThemeMode::Dark,
         };
         let mut s = State::default();
         s.apply_preferences(&prefs);
@@ -2106,6 +2192,7 @@ mod tests {
         );
         assert_eq!(s.editor_font(), "Fira Code", "editor font restored");
         assert_eq!(s.ui_font(), "Noto Sans", "UI font restored");
+        assert_eq!(s.theme(), ThemeMode::Dark, "theme restored");
         assert_eq!(s.preferences(), prefs);
     }
 

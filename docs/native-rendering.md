@@ -164,6 +164,30 @@ widget's own `Style` (background, text `value`, `selection`). `faint(color, a)`
 derives translucent tints from the theme's text colour so they read in both light
 and dark.
 
+## Light / dark theme + syntect pairing (#36)
+
+The UI theme is one app-wide `ThemeMode { Light, Dark }` in the pure core
+(persisted via #38, default light). The shell maps it two ways each frame: to the
+`iced::Theme` chrome (`Shell::theme` → `Theme::Light`/`Dark`, wired with `.theme()`
+on the application builder) and to the editor's syntect highlight theme, which
+`notepad_syntax::highlight_theme(mode)` pairs — **InspiredGitHub** for light,
+**Monokai Extended** for dark, matching the retired WebView build (light by
+default, Monokai for dark). Monokai isn't in syntect's *own* default theme set, so
+the themes come from `two-face` (already vendored for the syntaxes), keeping the
+app offline and oniguruma-free.
+
+Switching re-highlights for free: the vendored `text_editor` compares the
+highlighter's `Settings` (which carry the `ThemeMode`) and calls `update()` when
+they differ, rebuilding our `SyntectHighlighter` from line 0. The whole-window
+repaint is free too — the new `iced::Theme` changes the clear colour, so the
+software compositor redraws the surface (no repaint-nudge needed here, unlike the
+`pick_list` trap above).
+
+The toolbar button matches the WebView build: its label names the theme you'll
+switch *to* (☾ Dark / ☀ Light), not the current state — a plain action button, not
+a lit on/off toggle (which read as if the word labelled the current mode). The
+WebView's 🌙 emoji isn't in the bundled DejaVu Sans Mono, so ☾ stands in for it.
+
 ## Dialogs are in-app panels, not native windows
 
 The `rfd` `xdg-portal` backend (chosen to stay off GTK/webkit build deps) exposes

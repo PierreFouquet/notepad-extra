@@ -8,8 +8,10 @@
 //!  * [`detect`] — extension → syntax **name** (for auto-detection and the
 //!    status bar), owned by the pure core.
 //!  * [`catalog`] — the grouped picker list the render shell draws.
-//!  * [`syntax_set`] / [`theme_set`] — the shared sets the shell's highlighter
-//!    parses and colours with (so detection and rendering never disagree).
+//!  * [`syntax_set`] — the shared set the shell's highlighter parses with (so
+//!    detection and rendering never disagree).
+//!  * [`ThemeMode`] / [`highlight_theme`] — the light/dark highlight-theme
+//!    pairing the shell colours with (#36).
 //!
 //! **Offline & no C dependency.** The default syntaxes/themes are embedded
 //! binary dumps (no runtime fetch), and syntect is built with its **fancy-regex**
@@ -17,8 +19,10 @@
 
 use std::sync::OnceLock;
 
-use syntect::highlighting::ThemeSet;
+use serde::{Deserialize, Serialize};
+use syntect::highlighting::Theme;
 use syntect::parsing::SyntaxSet;
+use two_face::theme::{EmbeddedLazyThemeSet, EmbeddedThemeName};
 
 /// The syntax name that means "no highlighting". This is syntect's own built-in
 /// plain-text syntax, so [`detect`] returning it and the picker's "Plain Text"
@@ -39,11 +43,48 @@ pub fn syntax_set() -> &'static SyntaxSet {
     SET.get_or_init(two_face::syntax::extra_no_newlines)
 }
 
-/// The shared theme set: syntect's embedded defaults, loaded once. The render
-/// shell picks a concrete theme by name; the light/dark pairing is #36's job.
-pub fn theme_set() -> &'static ThemeSet {
-    static SET: OnceLock<ThemeSet> = OnceLock::new();
-    SET.get_or_init(ThemeSet::load_defaults)
+/// Which of the two paired highlight themes the editor renders with (#36),
+/// mirroring the app's UI light/dark toggle. The shell maps its UI theme to one
+/// of these and [`highlight_theme`] resolves it to a concrete syntect [`Theme`].
+/// Persisted as part of the preferences (#38), hence the serde derives; the wire
+/// form is the lowercase variant name (`"light"` / `"dark"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemeMode {
+    /// Light UI chrome + a GitHub-light highlight theme. The default, matching
+    /// the previous WebView build's light look.
+    #[default]
+    Light,
+    /// Dark UI chrome + the Monokai highlight theme, matching the previous
+    /// WebView build's Monokai editor theme.
+    Dark,
+}
+
+/// The embedded theme set (two-face's, ~30 themes), loaded once. We use
+/// **two-face**'s set rather than syntect's own defaults because it carries
+/// **Monokai** — the dark theme the previous WebView build shipped — which
+/// syntect's defaults lack. The dumps are embedded (no runtime fetch) and built
+/// with the fancy-regex backend, so this stays fully offline and oniguruma-free.
+fn embedded_themes() -> &'static EmbeddedLazyThemeSet {
+    static SET: OnceLock<EmbeddedLazyThemeSet> = OnceLock::new();
+    SET.get_or_init(two_face::theme::extra)
+}
+
+/// The concrete syntect highlight [`Theme`] paired with a UI [`ThemeMode`] (#36):
+///
+///  * [`ThemeMode::Light`] → **InspiredGitHub** (GitHub-light), matching the
+///    previous WebView build's light editor.
+///  * [`ThemeMode::Dark`] → **Monokai Extended**, matching that build's Monokai.
+///
+/// The theme is borrowed from the process-wide [`embedded_themes`] set, so the
+/// returned reference is `'static` — which is exactly what the shell's
+/// highlighter wants (no `Box::leak`, no self-borrow).
+pub fn highlight_theme(mode: ThemeMode) -> &'static Theme {
+    let name = match mode {
+        ThemeMode::Light => EmbeddedThemeName::InspiredGithub,
+        ThemeMode::Dark => EmbeddedThemeName::MonokaiExtended,
+    };
+    embedded_themes().get(name)
 }
 
 /// Extension → syntax-**name** aliases for extensions the bundled set doesn't
@@ -337,12 +378,55 @@ mod tests {
         assert!(n >= 150, "expected 150+ bundled syntaxes, got {n}");
     }
 
+    /// Rec. 601 relative luminance of a syntect colour in `[0, 1]`, for the
+    /// per-theme palette / contrast assertions below (#36).
+    fn luma(c: syntect::highlighting::Color) -> f32 {
+        (0.299 * f32::from(c.r) + 0.587 * f32::from(c.g) + 0.114 * f32::from(c.b)) / 255.0
+    }
+
     #[test]
-    fn default_theme_set_loads() {
-        assert!(
-            !theme_set().themes.is_empty(),
-            "the embedded theme set must not be empty"
+    fn theme_mode_defaults_to_light() {
+        // A fresh install (and any config predating the theme key) opens light,
+        // matching the previous WebView build.
+        assert_eq!(ThemeMode::default(), ThemeMode::Light);
+    }
+
+    #[test]
+    fn paired_highlight_themes_load_and_differ() {
+        // Per-theme palette correctness (#36): light resolves to a light-backed
+        // theme, dark to a dark-backed one, and the two are distinct palettes.
+        let light = highlight_theme(ThemeMode::Light);
+        let dark = highlight_theme(ThemeMode::Dark);
+        let lbg = light
+            .settings
+            .background
+            .expect("light theme has a background");
+        let dbg = dark
+            .settings
+            .background
+            .expect("dark theme has a background");
+        assert!(luma(lbg) > 0.6, "light theme background should be light");
+        assert!(luma(dbg) < 0.4, "dark theme background should be dark");
+        assert_ne!(
+            (lbg.r, lbg.g, lbg.b),
+            (dbg.r, dbg.g, dbg.b),
+            "the two themes must not share a background"
         );
+    }
+
+    #[test]
+    fn paired_themes_have_readable_contrast() {
+        // Contrast sanity (#36): in each theme the default foreground and the
+        // background must be far enough apart in luminance to stay readable.
+        for mode in [ThemeMode::Light, ThemeMode::Dark] {
+            let theme = highlight_theme(mode);
+            let bg = theme.settings.background.expect("theme has a background");
+            let fg = theme.settings.foreground.expect("theme has a foreground");
+            assert!(
+                (luma(fg) - luma(bg)).abs() > 0.3,
+                "{mode:?} theme foreground/background contrast is too low to read"
+            );
+        }
     }
 
     #[test]

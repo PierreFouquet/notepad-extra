@@ -12,30 +12,29 @@
 //! an edit then only re-parses from the changed line downward — the incremental
 //! model iced's editor expects (see the trait's `change_line` / `current_line`).
 //!
-//! Only colour is applied for #32 (bold/italic token styling is a later nicety);
-//! the theme is a fixed light one, with the light/dark pairing left to #36.
+//! Only colour is applied for #32 (bold/italic token styling is a later nicety).
+//! The theme follows the app's light/dark toggle (#36): the syntect theme is
+//! chosen by [`notepad_syntax::highlight_theme`] from the active [`ThemeMode`].
 
 use std::ops::Range;
 
 use iced::{Color, Font};
 use iced_core::text::highlighter::{self, Format};
+use notepad_syntax::ThemeMode;
 
 use syntect::highlighting::{
-    HighlightState, Highlighter as SyntectInner, RangedHighlightIterator, Style, Theme,
+    HighlightState, Highlighter as SyntectInner, RangedHighlightIterator, Style,
 };
 use syntect::parsing::{ParseState, ScopeStack, SyntaxSet};
 
-/// The syntect theme #32 renders with — a light theme to match the current UI.
-/// #36 will swap this for a light/dark pairing. Ships in syntect's default set.
-pub const DEFAULT_THEME: &str = "InspiredGitHub";
-
 /// Identifies *what* to highlight: the effective syntax name (from the core's
-/// [`notepad_core::app::Document::language`]) and the theme key. `PartialEq` lets
-/// the widget rebuild the highlighter only when one of these actually changes.
+/// [`notepad_core::app::Document::language`]) and the light/dark [`ThemeMode`]
+/// (#36). `PartialEq` lets the widget rebuild the highlighter only when one of
+/// these actually changes — so toggling the theme re-highlights the buffer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
     pub syntax: String,
-    pub theme: &'static str,
+    pub theme: ThemeMode,
 }
 
 /// One highlighted span's style, produced by [`SyntectHighlighter`] and turned
@@ -90,14 +89,10 @@ impl SyntectHighlighter {
             .find_syntax_by_name(&settings.syntax)
             .unwrap_or_else(|| syntaxes.find_syntax_plain_text());
 
-        // The set is a process-wide `&'static`, so the theme reference is `'static`
-        // too — no `Box::leak` (which iced_highlighter needs) and no self-borrow.
-        let themes = notepad_syntax::theme_set();
-        let theme: &'static Theme = themes
-            .themes
-            .get(settings.theme)
-            .or_else(|| themes.themes.values().next())
-            .expect("syntect's default theme set is never empty");
+        // The paired theme is borrowed from the process-wide embedded set, so the
+        // reference is `'static` too — no `Box::leak` (which iced_highlighter
+        // needs) and no self-borrow (#36).
+        let theme = notepad_syntax::highlight_theme(settings.theme);
 
         let inner = SyntectInner::new(theme);
         let initial = LineState {
@@ -184,8 +179,47 @@ mod tests {
     fn settings(syntax: &str) -> Settings {
         Settings {
             syntax: syntax.to_string(),
-            theme: DEFAULT_THEME,
+            theme: ThemeMode::Light,
         }
+    }
+
+    /// The set of foreground colours a syntax produces for one line, under a given
+    /// theme — used to prove the theme actually drives the palette (#36).
+    fn line_colors(
+        syntax: &str,
+        theme: ThemeMode,
+        line: &str,
+    ) -> std::collections::BTreeSet<[u8; 4]> {
+        let mut hl = SyntectHighlighter::new(&Settings {
+            syntax: syntax.to_string(),
+            theme,
+        });
+        hl.highlight_line(line)
+            .map(|(_, h)| {
+                let c = h.0.foreground;
+                [c.r, c.g, c.b, c.a]
+            })
+            .collect()
+    }
+
+    /// Toggling the theme (#36) changes the palette: the same Rust line comes out
+    /// with a different set of colours under the light vs the dark theme, and the
+    /// two [`Settings`] compare unequal (which is what makes the widget rebuild
+    /// the highlighter on a theme switch).
+    #[test]
+    fn theme_mode_changes_the_palette() {
+        let light = line_colors("Rust", ThemeMode::Light, "fn main() {}");
+        let dark = line_colors("Rust", ThemeMode::Dark, "fn main() {}");
+        assert!(!light.is_empty() && !dark.is_empty());
+        assert_ne!(light, dark, "light and dark themes must colour differently");
+        assert_ne!(
+            settings("Rust"),
+            Settings {
+                syntax: "Rust".to_string(),
+                theme: ThemeMode::Dark,
+            },
+            "a theme change must make Settings compare unequal so the widget rebuilds"
+        );
     }
 
     /// Every span a Rust line produces must carry a colour, and a keyword must

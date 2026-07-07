@@ -54,6 +54,7 @@ pub fn main() -> iced::Result {
         .title(Shell::title)
         .subscription(Shell::subscription)
         .style(Shell::app_style)
+        .theme(Shell::theme)
         .default_font(ui_default)
         .window(window);
     for face in fonts::BUNDLED_FONT_FACES {
@@ -206,6 +207,11 @@ enum Message {
     /// accelerator arrives with the rest in #39.
     ToggleLineNumbers,
 
+    // ---- Light / Dark theme (#36) ----
+    /// Toggle the UI theme between light and dark. Driven by the toolbar button;
+    /// a key accelerator arrives with the rest in #39.
+    ToggleTheme,
+
     // ---- Font family selection (#61) ----
     /// The editor-font picker chose a family (bundled or OS-installed).
     SetEditorFont(String),
@@ -352,6 +358,17 @@ impl Shell {
         style
     }
 
+    /// The active `iced::Theme` for the whole app (#36), mapped from the core's
+    /// light/dark [`core::ThemeMode`]. iced reads this every frame, so a toggle
+    /// repaints the chrome in the new palette; the editor's syntect highlight
+    /// theme is paired separately in [`Shell::view`] via the same `ThemeMode`.
+    fn theme(&self) -> iced::Theme {
+        match self.core.theme() {
+            core::ThemeMode::Light => iced::Theme::Light,
+            core::ThemeMode::Dark => iced::Theme::Dark,
+        }
+    }
+
     fn dispatch(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::NewTab => self.apply_core(core::Message::NewTab, true),
@@ -495,6 +512,10 @@ impl Shell {
             // The gutter is a view-only preference the editor reads from
             // `show_line_numbers()`; it never rewrites the buffer, so resync=false.
             Message::ToggleLineNumbers => self.apply_core(core::Message::ToggleLineNumbers, false),
+            // Theme is a view-only preference read from `theme()`; it never
+            // rewrites the buffer, so resync=false. The editor re-highlights
+            // because its highlighter `Settings.theme` changes (#36).
+            Message::ToggleTheme => self.apply_core(core::Message::ToggleTheme, false),
             Message::SetEditorFont(family) => {
                 self.apply_core(core::Message::SetEditorFont(family), false)
             }
@@ -736,6 +757,16 @@ impl Shell {
         } else {
             button::secondary
         };
+        // Theme toggle (#36): the label names the theme you'll switch *to*, like
+        // the WebView build's button — clearer than a lit on/off state (which
+        // read as if "Dark" labelled the current mode). The moon/sun glyphs are
+        // both in the bundled DejaVu Sans Mono; the WebView's 🌙 emoji is not, so
+        // ☾ stands in for it.
+        let theme_label = if self.core.theme() == core::ThemeMode::Dark {
+            "\u{2600} Light" // ☀ — click to switch to light
+        } else {
+            "\u{263E} Dark" // ☾ — click to switch to dark
+        };
         // The UI-chrome font (#61), resolved from the persisted preference and
         // applied to every chrome widget below so the UI-font picker takes effect
         // *live* (iced has no app-wide runtime default font — each widget must
@@ -769,6 +800,12 @@ impl Shell {
             tbtn("About")
                 .style(about_style)
                 .on_press(Message::ToggleAbout),
+            // Theme toggle (#36): a plain action button whose label names the
+            // theme you'll switch *to* (☾ Dark / ☀ Light), matching the WebView
+            // build. Secondary style so it sits as a utility next to the toggles.
+            button(text(theme_label).font(ui))
+                .style(button::secondary)
+                .on_press(Message::ToggleTheme),
         ]
         .spacing(6);
 
@@ -813,7 +850,9 @@ impl Shell {
             .highlight_with::<SyntectHighlighter>(
                 highlight::Settings {
                     syntax: self.core.active_doc().language().to_string(),
-                    theme: highlight::DEFAULT_THEME,
+                    // Pair the editor's syntect theme with the UI theme (#36):
+                    // light UI → GitHub-light, dark UI → Monokai.
+                    theme: self.core.theme(),
                 },
                 highlight::to_format,
             )
@@ -1827,6 +1866,33 @@ mod tests {
         assert!(shell.core.show_line_numbers());
         let _ = shell.view(); // the gutter-on view builds
 
+        assert_eq!(shell.editor.text().trim_end(), "keep me");
+        assert!(shell.core.active_doc().dirty());
+    }
+
+    // ---- Light / Dark theme (#36) ----
+
+    #[test]
+    fn theme_toggle_flips_core_and_maps_to_iced_theme() {
+        // The Dark button routes straight through to the core, like Wrap, and must
+        // not resync/clear the editor. Light by default; each toggle flips it and
+        // the shell's `iced::Theme` follows. The view builds in either theme.
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::Edit(paste("keep me")));
+        assert_eq!(shell.core.theme(), core::ThemeMode::Light, "starts light");
+        assert_eq!(shell.theme(), iced::Theme::Light);
+        let _ = shell.view(); // the light view builds
+
+        let _ = shell.update(Message::ToggleTheme);
+        assert_eq!(shell.core.theme(), core::ThemeMode::Dark);
+        assert_eq!(shell.theme(), iced::Theme::Dark);
+        let _ = shell.view(); // the dark view builds
+
+        let _ = shell.update(Message::ToggleTheme);
+        assert_eq!(shell.core.theme(), core::ThemeMode::Light);
+        assert_eq!(shell.theme(), iced::Theme::Light);
+
+        // The toggle left the live buffer and its dirty flag untouched.
         assert_eq!(shell.editor.text().trim_end(), "keep me");
         assert!(shell.core.active_doc().dirty());
     }

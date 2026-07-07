@@ -26,9 +26,13 @@ pub mod status;
 pub mod text;
 
 pub use app::{Document, Effect, FindOption, FindState, Message, State, TabId, update};
+// Re-exported so the shell can name the theme type through `notepad_core` (#36);
+// it originates in `notepad-syntax`, which also owns the light/dark → syntect
+// highlight-theme pairing.
 pub use brackets::BracketMatch;
 pub use find::{Match, Matcher, Replacement, SearchError, SearchOptions};
 pub use history::{Edit, History, diff};
+pub use notepad_syntax::ThemeMode;
 pub use prefs::Preferences;
 pub use status::{StatusBar, status};
 pub use text::EndOfLine;

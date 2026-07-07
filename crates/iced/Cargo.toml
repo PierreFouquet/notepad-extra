@@ -1,6 +1,6 @@
 [package]
 name = "notepad-iced"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 description = "Thin iced render shell for notepad-extra's native rewrite: executes the pure core's Effects (#28)."
 authors = ["Pierre Fouquet"]
@@ -15,6 +15,14 @@ repository = "https://github.com/PierreFouquet/notepad-extra"
 # concern tracked in #32; the software-renderer / no-GPU choice is #26.
 [dependencies]
 notepad-core = { path = "../core" }
+
+# Syntax highlighting (#32). The shared syntect-backed catalogue: the shell's
+# `SyntectHighlighter` (src/highlight.rs) parses with these same `SyntaxSet` /
+# `ThemeSet`, so what it colours can never disagree with what the core detects.
+# `syntect` reaches the shell transitively through this crate (fancy-regex, no
+# oniguruma C dep) — we never enable iced's own `iced_highlighter` path.
+notepad-syntax = { path = "../syntax" }
+syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 
 # Software renderer only (`tiny-skia`) — no wgpu, no GPU requirement (#26). The
 # `x11`/`wayland` features wire the software surface (softbuffer) to the Linux

@@ -5,7 +5,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use notepad_core::EndOfLine;
-use notepad_core::{find, lang, text};
+use notepad_core::{find, text};
 
 fuzz_target!(|s: String| {
     let _ = EndOfLine::detect(&s);
@@ -14,7 +14,8 @@ fuzz_target!(|s: String| {
     let _ = EndOfLine::Crlf.join(&canonical);
     let _ = text::basename(&s);
     let _ = text::extension_of(&s);
-    let _ = lang::language_for_path(&s);
+    // Language detection (#32): any path string must resolve without panicking.
+    let _ = notepad_syntax::detect(&s);
 
     // Position helpers behind the status bar (#37) and go-to-line: arbitrary
     // byte offsets and (line, column) pairs — including out-of-range and

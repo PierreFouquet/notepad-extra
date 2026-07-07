@@ -1,6 +1,6 @@
 [package]
 name = "notepad-extra"
-version = "0.4.0"
+version.workspace = true
 edition = "2024"
 description = "Small, fast, fully offline text and code editor. Inspired by Notepad++."
 authors = ["Pierre Fouquet"]
@@ -27,5 +27,24 @@ tempfile = "3.6"
 #   * notepad-core — pure, UI-free `update(State, Message) -> Effect` core (#28)
 #   * notepad-iced — thin iced render shell that executes the core's Effects (#28)
 [workspace]
-members = ["crates/core", "crates/iced"]
+members = ["crates/syntax", "crates/core", "crates/iced"]
 resolver = "2"
+
+# One product version for the whole workspace: the app and every native crate
+# share it, inherited via `version.workspace = true`. Bumping the release bumps
+# everything from a single source of truth (no per-crate drift).
+[workspace.package]
+version = "0.4.0"
+
+# Syntax highlighting (#32) runs on syntect + fancy-regex, whose regex engine is
+# an order of magnitude slower when built without optimisation — enough to make
+# opening a large file feel sluggish in a plain `dev` build. Optimise just those
+# dependencies (and their regex backend); our own crates stay at the default dev
+# opt-level so incremental rebuilds and debugging are unaffected. Release builds
+# already optimise everything, so this only lifts the debug experience.
+[profile.dev.package.syntect]
+opt-level = 3
+[profile.dev.package.fancy-regex]
+opt-level = 3
+[profile.dev.package.regex-automata]
+opt-level = 3

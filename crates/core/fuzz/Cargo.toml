@@ -14,6 +14,10 @@ arbitrary = "1"
 [dependencies.notepad-core]
 path = ".."
 
+# Language detection (#32) is fuzzed alongside the other path helpers.
+[dependencies.notepad-syntax]
+path = "../../syntax"
+
 # Detach from the parent workspace on purpose: fuzz builds need nightly and a
 # sanitizer runtime, so they must never be pulled into the normal `cargo test`.
 [workspace]

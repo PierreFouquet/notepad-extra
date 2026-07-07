@@ -61,7 +61,7 @@ pub fn status(doc: &Document, caret: usize, anchor: Option<usize>) -> StatusBar 
         lines: find::line_count(text),
         eol: doc.eol.label(),
         encoding: ENCODING,
-        language: doc.language,
+        language: doc.language(),
     }
 }
 
@@ -105,7 +105,8 @@ mod tests {
             path: None,
             content: content.to_string(),
             eol,
-            language,
+            detected_lang: language,
+            manual_lang: None,
             history: History::new(),
         }
     }

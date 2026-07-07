@@ -33,6 +33,12 @@ use text_editor::{BracketHighlight, Cursor, Position, text_editor};
 // resolves picker/pref family names (bundled or OS-installed) to `iced::Font`.
 mod fonts;
 
+// Syntax highlighting (#32): a fancy-regex syntect `Highlighter` plugged into the
+// editor via the vendored widget's `highlight_with`, keyed by the active tab's
+// effective language. Deliberately not iced's onig-backed `iced_highlighter`.
+mod highlight;
+use highlight::SyntectHighlighter;
+
 pub fn main() -> iced::Result {
     let window = iced::window::Settings {
         icon: window_icon(),
@@ -47,6 +53,7 @@ pub fn main() -> iced::Result {
     let mut app = iced::application(Shell::boot, Shell::update, Shell::view)
         .title(Shell::title)
         .subscription(Shell::subscription)
+        .style(Shell::app_style)
         .default_font(ui_default)
         .window(window);
     for face in fonts::BUNDLED_FONT_FACES {
@@ -206,6 +213,12 @@ enum Message {
     /// font threaded through `view`) and persisted immediately.
     SetUiFont(String),
 
+    // ---- Language selection (#32) ----
+    /// The language picker chose an entry. The special [`AUTO_DETECT`] label maps
+    /// to the core's "clear override" (`None`); a group-header separator is inert
+    /// (mapped to no change); anything else pins that syntax on the active tab.
+    SetLanguage(String),
+
     // ---- Preferences persistence (#38) ----
     /// A preferences write finished. The result is intentionally ignored: a
     /// failure to persist a setting must never interrupt editing (see the core's
@@ -263,6 +276,18 @@ struct Shell {
     /// Whether a file drag is currently hovering over the window (#42); drives the
     /// "drop to open" overlay in [`Shell::view`].
     drag_hover: bool,
+    /// A one-bit flag flipped whenever the active tab's effective language changes
+    /// (#32), read by [`Shell::app_style`] to force a full-window repaint on that
+    /// frame. This works around an iced 0.14 software-renderer damage limitation:
+    /// the `pick_list` draws its selected label with a vertically-centred
+    /// `fill_text`, but the compositor's damage rectangle for that text is anchored
+    /// at the label's centre and only extends downward, so a programmatic label
+    /// change with no pointer event over the widget (opening a file) leaves the top
+    /// halves of the old glyphs on screen — "garbled" until a hover repaints the
+    /// button quad. Nudging the background colour by 1/255 makes iced's `present`
+    /// see a changed clear-colour and redraw the whole surface once, clearing it.
+    /// Same class of bug as the vendored `text_editor`'s repaint gotcha.
+    repaint_nudge: bool,
 }
 
 impl Shell {
@@ -291,6 +316,7 @@ impl Shell {
                 goto_input: String::new(),
                 confirm_close: None,
                 drag_hover: false,
+                repaint_nudge: false,
             },
             Task::none(),
         )
@@ -300,7 +326,33 @@ impl Shell {
         self.title.clone()
     }
 
+    /// The iced entry point. Dispatches the message, then detects whether the
+    /// active tab's effective language changed as a result (opening a file,
+    /// auto-detect, a manual pick, or switching tabs) and, if so, flips
+    /// [`Shell::repaint_nudge`] so the next frame forces a full repaint — see the
+    /// field's docs for the underlying iced damage limitation this dodges (#32).
     fn update(&mut self, message: Message) -> Task<Message> {
+        let language_before = self.core.active_doc().language();
+        let task = self.dispatch(message);
+        if self.core.active_doc().language() != language_before {
+            self.repaint_nudge = !self.repaint_nudge;
+        }
+        task
+    }
+
+    /// The application background style. Normally the theme's default; when
+    /// [`Shell::repaint_nudge`] is set it nudges the clear colour imperceptibly to
+    /// force iced's software compositor into a full redraw (see the field's docs).
+    fn app_style(&self, theme: &iced::Theme) -> iced::theme::Style {
+        use iced::theme::Base;
+        let mut style = theme.base();
+        if self.repaint_nudge {
+            style.background_color.b = (style.background_color.b - 1.0 / 255.0).max(0.0);
+        }
+        style
+    }
+
+    fn dispatch(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::NewTab => self.apply_core(core::Message::NewTab, true),
             Message::Open => self.apply_core(core::Message::OpenRequested, false),
@@ -447,6 +499,18 @@ impl Shell {
                 self.apply_core(core::Message::SetEditorFont(family), false)
             }
             Message::SetUiFont(family) => self.apply_core(core::Message::SetUiFont(family), false),
+
+            // Language selection (#32). Map the picker label to a core choice:
+            // "Auto-detect" clears the override, a group-header separator is inert,
+            // any other label pins that syntax. Per-tab, no content resync.
+            Message::SetLanguage(label) => {
+                if is_group_header(&label) {
+                    Task::none()
+                } else {
+                    let choice = (label != AUTO_DETECT_LABEL).then_some(label);
+                    self.apply_core(core::Message::SetLanguage(choice), false)
+                }
+            }
 
             // The preferences write landed (#38). Nothing to do: its result is
             // deliberately swallowed so a failed save never disrupts editing.
@@ -640,6 +704,14 @@ impl Shell {
         fonts::resolve(self.core.ui_font())
     }
 
+    /// The label the language picker shows selected (#32): the active tab's
+    /// effective language, so auto-detection is reflected (a `.toml` reads "TOML")
+    /// and a manual override reads as itself. Always an entry in
+    /// [`language_options`], so the `pick_list` renders it as the current choice.
+    fn language_picker_selection(&self) -> String {
+        self.core.active_doc().language().to_string()
+    }
+
     fn view(&self) -> Element<'_, Message> {
         let find_style = if self.core.find.open {
             button::primary
@@ -734,6 +806,17 @@ impl Shell {
             .line_numbers(self.core.show_line_numbers())
             .active_line(true)
             .bracket_match(self.active_bracket())
+            // Syntax highlighting (#32): our fancy-regex syntect highlighter, keyed
+            // by the active tab's effective language. A "Plain Text" language
+            // resolves to the plain-text syntax, so this one path also covers "no
+            // highlighting" without changing the widget's type.
+            .highlight_with::<SyntectHighlighter>(
+                highlight::Settings {
+                    syntax: self.core.active_doc().language().to_string(),
+                    theme: highlight::DEFAULT_THEME,
+                },
+                highlight::to_format,
+            )
             .height(Fill);
 
         let status: Element<'_, Message> = match &self.error {
@@ -762,6 +845,12 @@ impl Shell {
         // apply live — the editor font on the editor widget, the UI font on every
         // chrome widget (including these pickers themselves).
         let families = fonts::available_families();
+        // Language picker (#32): show the *effective* language as the selection —
+        // the auto-detected syntax when the tab is on auto, or the manual override
+        // — so opening a `.toml` makes the picker read "TOML". "Auto-detect" stays
+        // in the list to clear an override. Every value `language()` can return is
+        // present in `language_options()`, so the selection always resolves.
+        let language_selection = self.language_picker_selection();
         let font_row = row![
             text("Editor font:").font(ui),
             pick_list(
@@ -776,6 +865,14 @@ impl Shell {
                 families,
                 Some(self.core.ui_font().to_string()),
                 Message::SetUiFont,
+            )
+            .font(ui)
+            .text_size(14),
+            text("Language:").font(ui),
+            pick_list(
+                language_options(),
+                Some(language_selection),
+                Message::SetLanguage,
             )
             .font(ui)
             .text_size(14),
@@ -1002,6 +1099,42 @@ fn option_button<'a>(
         .on_press(Message::ToggleOption(option))
 }
 
+// ---- Language picker (#32) ------------------------------------------------
+
+/// The picker entry that clears a manual override and reverts to extension
+/// auto-detection. Distinct from every syntax name so it round-trips cleanly.
+const AUTO_DETECT_LABEL: &str = "Auto-detect";
+
+/// Render a catalogue group name as an inert separator row in the flat picker.
+fn group_header(name: &str) -> String {
+    format!("──  {name}  ──")
+}
+
+/// Whether a picker label is a group-header separator (selecting it does nothing).
+/// Uses the same lead-in `group_header` writes, which no syntax name starts with.
+fn is_group_header(label: &str) -> bool {
+    label.starts_with("──")
+}
+
+/// The flat language-picker entries, built once: "Auto-detect", "Plain Text", then
+/// each catalogue group as an inert header followed by its languages. iced's
+/// `pick_list` has no native option groups, so headers are rendered as (inert)
+/// entries — good-enough parity with the old grouped `<optgroup>` dropdown.
+fn language_options() -> &'static [String] {
+    static OPTS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    OPTS.get_or_init(|| {
+        let mut opts = vec![
+            AUTO_DETECT_LABEL.to_string(),
+            notepad_syntax::PLAIN_TEXT.to_string(),
+        ];
+        for group in notepad_syntax::catalog() {
+            opts.push(group_header(group.name));
+            opts.extend(group.languages.iter().map(|s| (*s).to_string()));
+        }
+        opts
+    })
+}
+
 /// The display name shown in the window title and the About panel (#40).
 const APP_NAME: &str = "Notepad Extra";
 /// The project license, shown in the About panel (matches the crate metadata and
@@ -1173,7 +1306,7 @@ mod tests {
             result: Ok("fn main() {}\n".to_string()),
         });
         assert_eq!(shell.core.active_doc().title(), "hello.rs");
-        assert_eq!(shell.core.active_doc().language, "Rust");
+        assert_eq!(shell.core.active_doc().language(), "Rust");
         assert_eq!(shell.editor.text().trim_end(), "fn main() {}");
         assert!(shell.error.is_none());
     }
@@ -1215,7 +1348,7 @@ mod tests {
             result: Ok(()),
         });
         assert!(!shell.core.active_doc().dirty());
-        assert_eq!(shell.core.active_doc().language, "Python");
+        assert_eq!(shell.core.active_doc().language(), "Python");
     }
 
     #[test]
@@ -1494,6 +1627,147 @@ mod tests {
         assert_eq!(s.language, "Rust");
         assert_eq!(s.eol, "CRLF");
         assert_eq!(s.encoding, "UTF-8");
+    }
+
+    // ---- Language selection (#32) ----
+
+    #[test]
+    fn set_language_message_pins_then_reverts_and_status_follows() {
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::FileRead {
+            path: PathBuf::from("/tmp/x.rs"),
+            result: Ok("fn main() {}\n".to_string()),
+        });
+        assert_eq!(shell.status().language, "Rust"); // auto-detected
+
+        let _ = shell.update(Message::SetLanguage("Python".to_string()));
+        assert_eq!(shell.core.active_doc().language(), "Python");
+        assert_eq!(
+            shell.status().language,
+            "Python",
+            "status follows the override"
+        );
+        let _ = shell.view(); // the highlighted view still builds
+
+        // "Auto-detect" clears the override, back to the detected language.
+        let _ = shell.update(Message::SetLanguage(AUTO_DETECT_LABEL.to_string()));
+        assert_eq!(shell.core.active_doc().language(), "Rust");
+        assert_eq!(shell.core.active_doc().manual_lang, None);
+    }
+
+    #[test]
+    fn picker_shows_the_auto_detected_language() {
+        let (mut shell, _) = Shell::new();
+        // A fresh untitled buffer is unclassified → the picker reads "Plain Text".
+        assert_eq!(shell.language_picker_selection(), "Plain Text");
+
+        // Opening a file auto-detects it: the picker follows without any manual pick.
+        let _ = shell.update(Message::FileRead {
+            path: PathBuf::from("/tmp/Cargo.toml"),
+            result: Ok("[package]\nname = \"x\"\n".to_string()),
+        });
+        assert_eq!(shell.core.active_doc().manual_lang, None, "still on auto");
+        assert_eq!(
+            shell.language_picker_selection(),
+            "TOML",
+            "the picker reflects the auto-detected language"
+        );
+        // A manual override shows itself, and the selection is always a real option.
+        let _ = shell.update(Message::SetLanguage("Python".to_string()));
+        assert_eq!(shell.language_picker_selection(), "Python");
+        assert!(
+            language_options()
+                .iter()
+                .any(|o| *o == shell.language_picker_selection()),
+            "the selection must be one of the picker's options"
+        );
+    }
+
+    #[test]
+    fn language_change_flips_the_repaint_nudge_to_force_a_full_redraw() {
+        // The pick_list's selected label is drawn with a vertically-centred
+        // `fill_text` that iced's software compositor under-damages on a
+        // programmatic change, leaving garbled pixels until a hover. Flipping the
+        // nudge on every effective-language change forces a full redraw that clears
+        // it (see `Shell::repaint_nudge` / `app_style`).
+        let (mut shell, _) = Shell::new();
+        let base = shell.repaint_nudge;
+
+        // Auto-detect on open changes the language → nudge flips.
+        let _ = shell.update(Message::FileRead {
+            path: PathBuf::from("/tmp/x.rs"),
+            result: Ok("fn main() {}\n".to_string()),
+        });
+        assert_ne!(
+            shell.repaint_nudge, base,
+            "opening a file must flip the nudge"
+        );
+        let after_open = shell.repaint_nudge;
+
+        // A message that doesn't change the language must NOT flip it.
+        let _ = shell.update(Message::ToggleWordWrap);
+        assert_eq!(
+            shell.repaint_nudge, after_open,
+            "a non-language change must not flip the nudge"
+        );
+
+        // A manual pick changes it again → flips.
+        let _ = shell.update(Message::SetLanguage("Python".to_string()));
+        assert_ne!(shell.repaint_nudge, after_open);
+
+        // The nudged background differs from the plain one, so `present` sees a
+        // changed clear-colour and repaints the whole surface.
+        let plain = Shell {
+            repaint_nudge: false,
+            ..Shell::new().0
+        }
+        .app_style(&iced::Theme::Light);
+        let nudged = Shell {
+            repaint_nudge: true,
+            ..Shell::new().0
+        }
+        .app_style(&iced::Theme::Light);
+        assert_ne!(
+            plain.background_color, nudged.background_color,
+            "the nudge must change the clear colour"
+        );
+    }
+
+    #[test]
+    fn plain_text_selection_disables_highlighting_label() {
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::FileRead {
+            path: PathBuf::from("/tmp/x.rs"),
+            result: Ok("fn main() {}\n".to_string()),
+        });
+        let _ = shell.update(Message::SetLanguage(notepad_syntax::PLAIN_TEXT.to_string()));
+        assert_eq!(shell.core.active_doc().language(), "Plain Text");
+    }
+
+    #[test]
+    fn selecting_a_group_header_is_inert() {
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::FileRead {
+            path: PathBuf::from("/tmp/x.rs"),
+            result: Ok("code".to_string()),
+        });
+        let _ = shell.update(Message::SetLanguage(group_header("Popular")));
+        assert_eq!(
+            shell.core.active_doc().language(),
+            "Rust",
+            "a separator must not change the language"
+        );
+        assert_eq!(shell.core.active_doc().manual_lang, None);
+    }
+
+    #[test]
+    fn language_options_lead_with_auto_and_plain_text_and_include_headers() {
+        let opts = language_options();
+        assert_eq!(opts[0], AUTO_DETECT_LABEL);
+        assert_eq!(opts[1], notepad_syntax::PLAIN_TEXT);
+        assert!(opts.iter().any(|o| is_group_header(o)), "has group headers");
+        assert!(opts.iter().any(|o| o == "Rust"), "lists real languages");
+        assert!(!is_group_header("Rust"), "a language is not a header");
     }
 
     #[test]

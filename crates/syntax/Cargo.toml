@@ -1,0 +1,34 @@
+[package]
+name = "notepad-syntax"
+version.workspace = true
+edition = "2024"
+description = "Shared syntect-backed language catalogue for notepad-extra: extension detection, the grouped picker list, and the SyntaxSet/ThemeSet the render shell highlights with (#32)."
+authors = ["Pierre Fouquet"]
+license = "GPL-3.0-or-later"
+homepage = "https://github.com/PierreFouquet/notepad-extra"
+repository = "https://github.com/PierreFouquet/notepad-extra"
+
+# This is the single source of truth for languages (#32): extension → syntax
+# auto-detection *and* the manual picker are both derived from syntect's own
+# `SyntaxSet`, so adding a language means adding a syntax in one place. Depended
+# on by both `notepad-core` (detection + catalogue — no syntect types leak into
+# its API) and `notepad-iced` (the highlighter reuses these same sets).
+[dependencies]
+# syntect with the **fancy-regex** backend: pure Rust, so it keeps the whole
+# tree free of the oniguruma C dependency the epic forbids (#25/#17). We disable
+# the default feature set (which pulls `regex-onig`) and opt into `default-fancy`,
+# whose only difference is `regex-fancy` instead of `regex-onig`. The `no-onig`
+# guarantee is asserted in CI via `cargo tree | grep -i onig` (see the crate's
+# README/tests). The default syntaxes and themes are embedded binary dumps, so
+# there is **no runtime fetch** — the offline guarantee holds.
+syntect = { version = "5", default-features = false, features = ["default-fancy"] }
+
+# syntect's *default* syntaxes are the dated Sublime set — missing TOML, JSONC,
+# TypeScript, Kotlin, Swift, Dockerfile and more. `two-face` bundles bat's much
+# larger set (~250 languages) as embedded dumps, so those resolve and highlight.
+# `default-features = false` drops its `syntect-onig` default; `syntect-fancy`
+# selects the pure-Rust fancy-regex dump, keeping oniguruma out of the tree.
+two-face = { version = "0.5", default-features = false, features = ["syntect-fancy"] }
+
+[dev-dependencies]
+proptest = "1"

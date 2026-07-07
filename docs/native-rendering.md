@@ -41,7 +41,16 @@ highlights (#41) — lives in that widget's `draw`. Dependencies (`iced_core`,
 unifies the types and nothing extra is vendored for the source-built story (#17).
 The vendored copy keeps upstream's `#[cfg(feature = "highlighter"/"advanced")]`
 gates; both features are declared (empty) in `Cargo.toml` so `-D warnings` stays
-clean. Syntax highlighting (#32) will turn the `highlighter` path back on.
+clean. Syntax highlighting (#32) deliberately leaves the `highlighter` feature
+**off**: enabling it pulls `iced_highlighter`, which builds syntect against
+**oniguruma** — a C dependency #25/#17 forbid. Instead the shell plugs its own
+`iced_core::text::Highlighter` into the widget's *unconditional* `highlight_with`
+(`crates/iced/src/highlight.rs`), backed by the shared **fancy-regex** syntect set
+in the `notepad-syntax` crate (pure Rust, no C dep, verified by
+`cargo tree | grep -i onig` staying empty). That crate also owns extension /
+whole-filename detection and the grouped picker catalogue, drawn from the
+**two-face** extended syntax set (~213 languages, so TOML/TypeScript/… resolve —
+syntect's own defaults do not).
 
 ## Where decorations live (MVU split)
 
@@ -91,6 +100,25 @@ window resize) — it lags edits and scrolling.
    `scroll_top` / `content_height` compute, and always current. Use
    `layout_runs()` only when you need a shaped glyph's pixel `x` (e.g.
    `glyph_bounds`), and treat "not found" as "off screen → draw nothing".
+
+4. **A stock widget's text changing with no co-located pointer event can
+   under-damage — force a full redraw.** `pick_list` draws its selected label
+   with a vertically-*centred* `fill_text`, but the damage rect (trap 1's
+   `Rectangle::new(position, size)`) is anchored at the label's centre and only
+   extends *downward*, so it covers just the bottom half of the glyphs. A hover
+   re-damages the button's quad and clears the rest — which hides the bug — but a
+   **programmatic** label change with no pointer over the widget (the language
+   picker following a file's auto-detected syntax, #32) leaves the old glyphs'
+   top halves on screen: "garbled" until you hover. You can't patch a stock
+   widget's `draw`, so the shell forces **one full redraw** on the frame the
+   language changes: `Shell::update` flips a `repaint_nudge` bit whenever the
+   active tab's `language()` changes, and `Shell::app_style` nudges the background
+   clear-colour by `1/255` when it's set — iced's `present` does a whole-surface
+   repaint when the clear-colour differs from the last frame's, clearing the
+   stale pixels. Reserve this hammer for rare, genuinely-programmatic changes;
+   normal edits already damage correctly. (The status bar's language cell dodges
+   the same bug only by luck — its neighbours repack when the shorter text
+   changes width, incidentally damaging the region.)
 
 ## Scrolling internals
 

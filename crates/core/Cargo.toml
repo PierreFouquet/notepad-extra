@@ -1,6 +1,6 @@
 [package]
 name = "notepad-core"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 description = "Pure, UI-free editor core (update / State / Message / Effect) for notepad-extra's native rewrite."
 authors = ["Pierre Fouquet"]
@@ -12,6 +12,11 @@ repository = "https://github.com/PierreFouquet/notepad-extra"
 # effects (file I/O, dialogs) are described as `Effect` values and executed by
 # the render shell, never here.
 [dependencies]
+# Language detection + the picker catalogue (#32), syntect-backed but exposing
+# only `&'static str` names — no syntect type reaches this crate's API. Pure Rust
+# (fancy-regex, no oniguruma C dep), so the core's no-C-libraries rule still holds.
+notepad-syntax = { path = "../syntax" }
+
 # Find / Replace (#33). `regex` is a finite-automaton engine: matching is
 # linear-time with no backtracking, so no pattern can hang the UI — that is the
 # epic's "catastrophic-regex guard", achieved by construction rather than with a

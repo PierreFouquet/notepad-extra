@@ -7,7 +7,6 @@
 
 use crate::find::{self, Match, Matcher, SearchError, SearchOptions};
 use crate::history::History;
-use crate::lang;
 use crate::prefs::Preferences;
 use crate::text::{self, EndOfLine};
 use std::path::PathBuf;
@@ -27,8 +26,15 @@ pub struct Document {
     pub content: String,
     /// The on-disk line ending to restore on save.
     pub eol: EndOfLine,
-    /// Status-bar language label.
-    pub language: &'static str,
+    /// The syntax auto-detected from the file's extension (#32), or
+    /// [`notepad_syntax::PLAIN_TEXT`] for an unsaved / unknown buffer. Refreshed
+    /// on every load and save; the manual override, if any, takes precedence.
+    pub detected_lang: &'static str,
+    /// A per-tab manual language override set from the picker (#32). `None` means
+    /// "auto-detect" (use [`Document::detected_lang`]). It is deliberately *not*
+    /// touched by load/save, so opening or re-saving a file never clobbers a
+    /// language the user chose by hand; it lasts the tab's lifetime.
+    pub manual_lang: Option<&'static str>,
     /// Undo/redo history; also the source of truth for the unsaved-changes
     /// ("•") marker (see [`Document::dirty`]).
     pub history: History,
@@ -41,9 +47,17 @@ impl Document {
             path: None,
             content: String::new(),
             eol: EndOfLine::default(),
-            language: lang::PLAIN_TEXT,
+            detected_lang: notepad_syntax::PLAIN_TEXT,
+            manual_lang: None,
             history: History::new(),
         }
+    }
+
+    /// The effective language: the manual override if the user set one, otherwise
+    /// the extension-detected syntax. This is what the status bar shows and what
+    /// the render shell highlights with (#32).
+    pub fn language(&self) -> &'static str {
+        self.manual_lang.unwrap_or(self.detected_lang)
     }
 
     /// Whether the buffer has unsaved changes (the tab's "•" marker), delegated
@@ -419,6 +433,13 @@ pub enum Message {
     /// Set the UI chrome's font family (from the UI-font picker).
     SetUiFont(String),
 
+    // ---- Language selection (#32) ----
+    /// Set the active tab's manual language override from the picker. `None`
+    /// clears the override ("Auto-detect"); `Some(name)` pins a syntax (including
+    /// `Some("Plain Text")` to disable highlighting). An unrecognised name is
+    /// ignored, leaving the current choice in place. Per-tab and not persisted.
+    SetLanguage(Option<String>),
+
     // ---- About dialog + external links (#40) ----
     /// Show the About panel.
     AboutOpened,
@@ -483,16 +504,20 @@ pub fn update(state: &mut State, message: Message) -> Vec<Effect> {
 
         Message::FileLoaded { path, content } => {
             let eol = EndOfLine::detect(&content);
-            let canonical = EndOfLine::to_lf(&content);
-            let language = lang::language_for_path(path.to_str().unwrap_or(""));
+            let normalized = EndOfLine::to_lf(&content);
+            let language = notepad_syntax::detect(path.to_str().unwrap_or(""));
 
             let reuse = state.docs.len() == 1 && state.docs[0].is_pristine_blank();
             if reuse {
+                // Recycling a throwaway blank tab into a freshly-opened file: the
+                // file's own detection wins, so drop any language the blank tab
+                // carried (this is a new document, not an existing manual pick).
                 let doc = &mut state.docs[0];
                 doc.path = Some(path);
-                doc.content = canonical;
+                doc.content = normalized;
                 doc.eol = eol;
-                doc.language = language;
+                doc.detected_lang = language;
+                doc.manual_lang = None;
                 doc.history = History::new(); // loaded content is the clean baseline
                 state.active = 0;
             } else {
@@ -500,9 +525,10 @@ pub fn update(state: &mut State, message: Message) -> Vec<Effect> {
                 state.docs.push(Document {
                     id,
                     path: Some(path),
-                    content: canonical,
+                    content: normalized,
                     eol,
-                    language,
+                    detected_lang: language,
+                    manual_lang: None,
                     history: History::new(),
                 });
                 state.active = state.docs.len() - 1;
@@ -570,7 +596,9 @@ pub fn update(state: &mut State, message: Message) -> Vec<Effect> {
 
         Message::FileSaved { id, path } => {
             if let Some(doc) = state.doc_mut(id) {
-                doc.language = lang::language_for_path(path.to_str().unwrap_or(""));
+                // Re-detect from the (possibly new, on Save As) path, but leave any
+                // manual language override untouched — saving must not clobber it.
+                doc.detected_lang = notepad_syntax::detect(path.to_str().unwrap_or(""));
                 doc.path = Some(path);
                 doc.history.mark_saved();
             }
@@ -744,6 +772,24 @@ pub fn update(state: &mut State, message: Message) -> Vec<Effect> {
         Message::SetUiFont(name) => {
             state.set_ui_font(&name);
             vec![Effect::SavePreferences(state.preferences())]
+        }
+
+        // ---- Language selection (#32) ----
+        // A per-tab manual override on the *active* document: `None` reverts to
+        // auto-detect, `Some(name)` pins a known syntax (interned to the same
+        // `&'static str` detection uses). It only affects the status-bar label and
+        // what the shell highlights with — no buffer, title, or preference change,
+        // so no effect is returned. Switching tabs naturally restores each tab's
+        // own choice because the state lives on the document.
+        Message::SetLanguage(choice) => {
+            let doc = &mut state.docs[state.active];
+            doc.manual_lang = match choice {
+                None => None,
+                // Ignore an unknown name (can't come from the picker) rather than
+                // silently reverting to auto-detect.
+                Some(name) => notepad_syntax::canonical(&name).or(doc.manual_lang),
+            };
+            vec![]
         }
 
         // ---- About dialog + external links (#40) ----
@@ -1003,7 +1049,7 @@ mod tests {
         load(&mut s, "/tmp/hello.rs", "fn main() {}\n");
         assert_eq!(s.docs.len(), 1, "should reuse the lone blank tab");
         assert_eq!(s.active_doc().title(), "hello.rs");
-        assert_eq!(s.active_doc().language, "Rust");
+        assert_eq!(s.active_doc().language(), "Rust");
         assert!(!s.active_doc().dirty());
     }
 
@@ -1119,7 +1165,7 @@ mod tests {
             },
         );
         assert!(!s.active_doc().dirty());
-        assert_eq!(s.active_doc().language, "Python");
+        assert_eq!(s.active_doc().language(), "Python");
         assert_eq!(s.active_doc().title(), "new.py");
     }
 
@@ -1167,7 +1213,111 @@ mod tests {
             },
         );
         assert_eq!(fx, vec![Effect::SetTitle("Untitled".into())]);
-        assert_eq!(s.active_doc().language, "Plain Text"); // untouched
+        assert_eq!(s.active_doc().language(), "Plain Text"); // untouched
+    }
+
+    // ---- Language selection (#32) -----------------------------------------
+
+    #[test]
+    fn set_language_overrides_detection_without_losing_it() {
+        let mut s = State::default();
+        load(&mut s, "/tmp/main.rs", "fn main() {}\n");
+        assert_eq!(s.active_doc().language(), "Rust"); // auto-detected
+
+        let fx = update(&mut s, Message::SetLanguage(Some("Python".into())));
+        assert!(fx.is_empty(), "language change has no side effect");
+        assert_eq!(
+            s.active_doc().language(),
+            "Python",
+            "override takes precedence"
+        );
+        assert_eq!(
+            s.active_doc().detected_lang,
+            "Rust",
+            "detection is preserved"
+        );
+    }
+
+    #[test]
+    fn set_language_none_reverts_to_auto_detect() {
+        let mut s = State::default();
+        load(&mut s, "/tmp/main.rs", "code");
+        update(&mut s, Message::SetLanguage(Some("Python".into())));
+        update(&mut s, Message::SetLanguage(None));
+        assert_eq!(s.active_doc().language(), "Rust");
+        assert_eq!(s.active_doc().manual_lang, None);
+    }
+
+    #[test]
+    fn plain_text_override_disables_highlighting() {
+        let mut s = State::default();
+        load(&mut s, "/tmp/main.rs", "code");
+        update(&mut s, Message::SetLanguage(Some("Plain Text".into())));
+        assert_eq!(s.active_doc().language(), "Plain Text");
+    }
+
+    #[test]
+    fn unknown_language_leaves_the_current_choice_untouched() {
+        let mut s = State::default();
+        load(&mut s, "/tmp/main.rs", "code");
+        update(&mut s, Message::SetLanguage(Some("Python".into())));
+        // A bogus name (can't come from the picker) must not wipe the override.
+        update(
+            &mut s,
+            Message::SetLanguage(Some("Definitely Not A Lang".into())),
+        );
+        assert_eq!(s.active_doc().language(), "Python");
+    }
+
+    #[test]
+    fn language_override_is_per_tab_and_restored_on_switch() {
+        let mut s = State::default();
+        load(&mut s, "/tmp/main.rs", "code"); // tab 0: Rust (reuses blank)
+        update(&mut s, Message::NewTab); // tab 1: blank, now active
+        update(&mut s, Message::SetLanguage(Some("Python".into())));
+        assert_eq!(s.active_doc().language(), "Python");
+
+        update(&mut s, Message::TabSelected(0));
+        assert_eq!(s.active_doc().language(), "Rust", "tab 0 is unaffected");
+        update(&mut s, Message::TabSelected(1));
+        assert_eq!(
+            s.active_doc().language(),
+            "Python",
+            "tab 1's choice is restored"
+        );
+    }
+
+    #[test]
+    fn manual_override_survives_edits_and_save_as() {
+        let mut s = State::default();
+        load(&mut s, "/tmp/main.rs", "code");
+        update(&mut s, Message::SetLanguage(Some("Python".into())));
+
+        update(&mut s, Message::Edited("edited".into()));
+        assert_eq!(
+            s.active_doc().language(),
+            "Python",
+            "editing must not clobber it"
+        );
+
+        let id = s.active_doc().id;
+        update(
+            &mut s,
+            Message::FileSaved {
+                id,
+                path: PathBuf::from("/tmp/notes.md"),
+            },
+        );
+        assert_eq!(
+            s.active_doc().detected_lang,
+            "Markdown",
+            "re-detected on save"
+        );
+        assert_eq!(
+            s.active_doc().language(),
+            "Python",
+            "saving must not clobber it"
+        );
     }
 
     #[test]
@@ -2116,6 +2266,15 @@ mod tests {
                 any::<String>(),
             ]
             .prop_map(Message::SetUiFont),
+            // Language selection (#32): mix Auto-detect (None), a known syntax,
+            // Plain Text, and arbitrary junk so override / revert / ignore-unknown
+            // are all driven under long random streams.
+            prop_oneof![
+                Just(Message::SetLanguage(None)),
+                Just(Message::SetLanguage(Some("Rust".to_string()))),
+                Just(Message::SetLanguage(Some("Plain Text".to_string()))),
+                any::<String>().prop_map(|s| Message::SetLanguage(Some(s))),
+            ],
         ]
     }
 
@@ -2134,6 +2293,9 @@ mod tests {
                 // the interleaving of ZoomIn / ZoomOut / ZoomReset.
                 prop_assert!(s.font_size() >= State::MIN_FONT_SIZE);
                 prop_assert!(s.font_size() <= State::MAX_FONT_SIZE);
+                // Language (#32) is always a syntax the shell can resolve, whatever
+                // sequence of SetLanguage / load / save ran.
+                prop_assert!(notepad_syntax::is_known(s.active_doc().language()));
             }
         }
 

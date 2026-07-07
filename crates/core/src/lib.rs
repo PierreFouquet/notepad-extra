@@ -21,7 +21,6 @@ pub mod find;
 pub mod geometry;
 pub mod history;
 pub mod io;
-pub mod lang;
 pub mod prefs;
 pub mod status;
 pub mod text;

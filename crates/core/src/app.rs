@@ -131,6 +131,11 @@ pub struct State {
     /// [`Message::ToggleWordWrap`]. Off by default, matching the WebView build.
     /// Persisted by #38.
     word_wrap: bool,
+    /// Whether the line-number gutter is shown, a single app-wide toggle shared
+    /// by every tab (#41). Read via [`State::show_line_numbers`], flipped by
+    /// [`Message::ToggleLineNumbers`]. On by default, matching the WebView build's
+    /// CodeMirror gutter. Persisted by #38.
+    show_line_numbers: bool,
     /// A document (by stable id) that must be closed once its in-flight
     /// "save before closing" write lands (#31). Set by [`Message::TabCloseSave`],
     /// consumed by [`Message::FileSaved`], and cleared by [`Message::SaveAbandoned`]
@@ -149,6 +154,7 @@ impl Default for State {
             about_open: false,
             font_size: State::DEFAULT_FONT_SIZE,
             word_wrap: false,
+            show_line_numbers: true,
             pending_close: None,
             next_id: 1,
         };
@@ -188,6 +194,12 @@ impl State {
         self.word_wrap
     }
 
+    /// Whether the line-number gutter is currently shown (#41). The shell reads
+    /// this when it renders to decide whether to draw the gutter.
+    pub fn show_line_numbers(&self) -> bool {
+        self.show_line_numbers
+    }
+
     /// Whether the About panel is currently showing (#40). The shell reads this
     /// when it renders to decide whether to draw the About panel.
     pub fn about_open(&self) -> bool {
@@ -201,6 +213,7 @@ impl State {
             version: crate::prefs::CURRENT_VERSION,
             font_size: self.font_size,
             word_wrap: self.word_wrap,
+            show_line_numbers: self.show_line_numbers,
         }
     }
 
@@ -211,6 +224,7 @@ impl State {
     pub fn apply_preferences(&mut self, prefs: &Preferences) {
         self.set_font_size(prefs.font_size);
         self.word_wrap = prefs.word_wrap;
+        self.show_line_numbers = prefs.show_line_numbers;
     }
 
     /// Enlarge the editor font by one step, clamped to `MAX_FONT_SIZE` (Ctrl+ +).
@@ -330,6 +344,10 @@ pub enum Message {
     // ---- Word wrap (#34) ----
     /// Flip soft word-wrap on or off, app-wide.
     ToggleWordWrap,
+
+    // ---- Line numbers (#41) ----
+    /// Show or hide the line-number gutter, app-wide.
+    ToggleLineNumbers,
 
     // ---- About dialog + external links (#40) ----
     /// Show the About panel.
@@ -632,6 +650,15 @@ pub fn update(state: &mut State, message: Message) -> Vec<Effect> {
         // on each toggle (#38).
         Message::ToggleWordWrap => {
             state.word_wrap = !state.word_wrap;
+            vec![Effect::SavePreferences(state.preferences())]
+        }
+
+        // ---- Line numbers (#41) ----
+        // Like word-wrap, this only flips an app-wide render preference the shell
+        // reads from `show_line_numbers()` — no buffer or title change — and is
+        // persisted on each toggle (#38).
+        Message::ToggleLineNumbers => {
+            state.show_line_numbers = !state.show_line_numbers;
             vec![Effect::SavePreferences(state.preferences())]
         }
 
@@ -1723,6 +1750,29 @@ mod tests {
         );
     }
 
+    // ---- Line numbers (#41) ----
+
+    #[test]
+    fn line_numbers_are_on_by_default() {
+        let s = State::default();
+        assert!(
+            s.show_line_numbers(),
+            "parity with the WebView CodeMirror gutter: line numbers start on"
+        );
+    }
+
+    #[test]
+    fn toggle_line_numbers_flips_and_persists() {
+        let mut s = State::default();
+        let fx = update(&mut s, Message::ToggleLineNumbers);
+        assert!(!s.show_line_numbers());
+        // Line-number visibility is a persisted preference (#38): the toggle asks
+        // the shell to save the new value.
+        assert_eq!(fx, vec![Effect::SavePreferences(s.preferences())]);
+        update(&mut s, Message::ToggleLineNumbers);
+        assert!(s.show_line_numbers(), "a second toggle returns to on");
+    }
+
     #[test]
     fn odd_number_of_toggles_lands_on() {
         let mut s = State::default();
@@ -1748,16 +1798,21 @@ mod tests {
     #[test]
     fn apply_preferences_restores_zoom_and_wrap() {
         // Simulate a fresh launch loading a saved config: the state must come up
-        // with the persisted zoom and wrap, matching the snapshot exactly.
+        // with the persisted zoom, wrap and gutter, matching the snapshot exactly.
         let prefs = Preferences {
             version: crate::prefs::CURRENT_VERSION,
             font_size: 25,
             word_wrap: true,
+            show_line_numbers: false,
         };
         let mut s = State::default();
         s.apply_preferences(&prefs);
         assert_eq!(s.font_size(), 25);
         assert!(s.word_wrap());
+        assert!(
+            !s.show_line_numbers(),
+            "the off gutter must be restored too"
+        );
         assert_eq!(s.preferences(), prefs);
     }
 
@@ -1770,6 +1825,7 @@ mod tests {
             version: 1,
             font_size: u16::MAX,
             word_wrap: false,
+            show_line_numbers: true,
         });
         assert_eq!(s.font_size(), State::MAX_FONT_SIZE);
 
@@ -1777,6 +1833,7 @@ mod tests {
             version: 1,
             font_size: 0,
             word_wrap: false,
+            show_line_numbers: true,
         });
         assert_eq!(s.font_size(), State::MIN_FONT_SIZE);
     }

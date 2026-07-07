@@ -36,6 +36,11 @@ pub struct Preferences {
     /// Whether soft word-wrap is on (#34).
     #[serde(default = "default_word_wrap")]
     pub word_wrap: bool,
+    /// Whether the line-number gutter is shown (#41). Additive, so a config
+    /// written by an older build (before this key existed) loads with the field
+    /// filled from its default — on — rather than failing the parse.
+    #[serde(default = "default_show_line_numbers")]
+    pub show_line_numbers: bool,
 }
 
 fn default_version() -> u32 {
@@ -50,6 +55,10 @@ fn default_word_wrap() -> bool {
     false
 }
 
+fn default_show_line_numbers() -> bool {
+    true
+}
+
 impl Default for Preferences {
     /// The out-of-the-box preferences: the same values a fresh [`State`] starts
     /// with, so a missing or unreadable config behaves identically to first run.
@@ -58,6 +67,7 @@ impl Default for Preferences {
             version: default_version(),
             font_size: default_font_size(),
             word_wrap: default_word_wrap(),
+            show_line_numbers: default_show_line_numbers(),
         }
     }
 }
@@ -107,6 +117,7 @@ mod tests {
             version: CURRENT_VERSION,
             font_size: 22,
             word_wrap: true,
+            show_line_numbers: false,
         };
         assert_eq!(Preferences::from_json(&prefs.to_json()), prefs);
     }
@@ -119,6 +130,7 @@ mod tests {
         let prefs = Preferences::default();
         assert_eq!(prefs.font_size, state.font_size());
         assert_eq!(prefs.word_wrap, state.word_wrap());
+        assert_eq!(prefs.show_line_numbers, state.show_line_numbers());
     }
 
     #[test]
@@ -156,6 +168,8 @@ mod tests {
         assert!(prefs.word_wrap);
         assert_eq!(prefs.font_size, default_font_size());
         assert_eq!(prefs.version, CURRENT_VERSION);
+        // An older config predating the gutter key loads with it defaulted on.
+        assert!(prefs.show_line_numbers);
     }
 
     #[test]
@@ -178,8 +192,17 @@ mod tests {
         /// unchanged (the version is stamped to current on load, which matches
         /// what we write). This is the load/save round-trip the #38 DoD requires.
         #[test]
-        fn json_round_trips_any_prefs(font_size in any::<u16>(), word_wrap in any::<bool>()) {
-            let prefs = Preferences { version: CURRENT_VERSION, font_size, word_wrap };
+        fn json_round_trips_any_prefs(
+            font_size in any::<u16>(),
+            word_wrap in any::<bool>(),
+            show_line_numbers in any::<bool>(),
+        ) {
+            let prefs = Preferences {
+                version: CURRENT_VERSION,
+                font_size,
+                word_wrap,
+                show_line_numbers,
+            };
             prop_assert_eq!(Preferences::from_json(&prefs.to_json()), prefs);
         }
 

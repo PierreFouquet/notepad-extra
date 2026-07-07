@@ -53,5 +53,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "brackets_match"
+path = "fuzz_targets/brackets_match.rs"
+test = false
+doc = false
+bench = false
+
 [profile.release]
 debug = 1

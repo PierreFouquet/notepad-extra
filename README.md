@@ -67,6 +67,8 @@ It stays **fully offline** and cross-platform (Windows/macOS/Linux remain first-
     headlessly and CI smoke-launches it under `xvfb`.
 - Test standard and how to run each layer: [docs/testing.md](docs/testing.md).
   Native CI lives in [`.github/workflows/native-ci.yml`](.github/workflows/native-ci.yml).
+- Rendering the shell (the vendored `text_editor`, damage/repaint traps, drawing
+  decorations): [docs/native-rendering.md](docs/native-rendering.md).
 
 ## Development
 
@@ -140,6 +142,7 @@ src-tauri/dist/       # Frontend (HTML/CSS/JS) + vendored CodeMirror (offline)
 crates/core/          # Native rewrite: pure update core (no window / no GPU)
 crates/iced/          # Native rewrite: thin iced render shell (executes Effects)
 docs/testing.md       # Native rewrite: test standard
+docs/native-rendering.md # Native rewrite: render-shell drawing notes & traps
 scripts/              # Helper scripts (coverage gate, index generation)
 tests/                # Rust integration tests + frontend logic tests
 ```

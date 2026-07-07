@@ -82,6 +82,19 @@ pub trait ScrollOffset {
     /// Pixels per line — translates a pixel scroll into iced's line-based
     /// `Action::Scroll` when dragging the vertical thumb (#34).
     fn line_height(&self) -> f32;
+    /// `(buffer line index, y-top)` for each buffer line visible within
+    /// `viewport_height`, in the same viewport-relative space the caret uses. A
+    /// soft-wrapped line contributes a single entry — its top row — which is what
+    /// lets the line-number gutter (#41) number wrapped lines once and stay
+    /// aligned. Derived from the live scroll and per-line row counts (not
+    /// `layout_runs`, which lags edits and scroll), so the gutter tracks the text
+    /// the same frame it changes.
+    fn visible_line_tops(&self, viewport_height: f32) -> Vec<(usize, f32)>;
+    /// Viewport-relative `(x, y-top, width)` of the glyph at buffer `line`
+    /// covering byte column `byte_col`, or `None` when that position isn't
+    /// currently laid out / on-screen. Positions the bracket-match highlight
+    /// (#41); an off-screen or end-of-line position simply draws nothing.
+    fn glyph_bounds(&self, line: usize, byte_col: usize) -> Option<(f32, f32, f32)>;
 }
 
 impl ScrollOffset for iced_graphics::text::Editor {
@@ -124,6 +137,102 @@ impl ScrollOffset for iced_graphics::text::Editor {
     fn line_height(&self) -> f32 {
         self.buffer().metrics().line_height
     }
+
+    fn visible_line_tops(&self, viewport_height: f32) -> Vec<(usize, f32)> {
+        let buffer = self.buffer();
+        let line_height = buffer.metrics().line_height;
+        let scroll = buffer.scroll();
+        // Mirror cosmic-text's own run layout: the first visible buffer line
+        // (`scroll.line`) starts at `-scroll.vertical`, and each line takes as
+        // many rows as it wraps into. Walking `buffer.lines` directly — rather
+        // than `layout_runs`, which lazily truncates at the first un-shaped line
+        // and lagged the gutter behind edits/scroll — numbers every visible line
+        // the same frame, and reading the live `scroll` keeps it in lock-step
+        // with the text as it scrolls. A not-yet-shaped line counts as one row
+        // (the same assumption `scroll_top`/`content_height` make).
+        let mut tops = Vec::new();
+        let mut y = -scroll.vertical;
+        for (i, line) in buffer.lines.iter().enumerate().skip(scroll.line) {
+            if y > viewport_height {
+                break;
+            }
+            tops.push((i, y));
+            y += line.layout_opt().map_or(1, Vec::len) as f32 * line_height;
+        }
+        tops
+    }
+
+    fn glyph_bounds(&self, line: usize, byte_col: usize) -> Option<(f32, f32, f32)> {
+        for run in self.buffer().layout_runs() {
+            if run.line_i != line {
+                continue;
+            }
+            for glyph in run.glyphs {
+                // `start..end` is the glyph's byte range within its line.
+                if byte_col >= glyph.start && byte_col < glyph.end {
+                    return Some((glyph.x, run.line_top, glyph.w));
+                }
+            }
+        }
+        None
+    }
+}
+
+/// A bracket pair to highlight (#41), in the widget's `(line, byte-column)`
+/// space — the same coordinates iced's `Cursor` uses, so the shell builds it
+/// from the core's byte offsets with `find::line_col_of`. `partner == None`
+/// marks an unbalanced bracket, which the widget draws in a distinct colour.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BracketHighlight {
+    /// The bracket adjacent to the caret.
+    pub here: Position,
+    /// Its match, or `None` when unbalanced.
+    pub partner: Option<Position>,
+}
+
+/// Padding on each side of the numbers inside the line-number gutter (#41).
+const GUTTER_PAD: f32 = 6.0;
+
+/// Width in logical pixels of the line-number gutter for a document of
+/// `line_count` lines at `text_size` px, or `0.0` when disabled (#41).
+///
+/// Sized to hold the widest line number (its digit count) plus a little padding
+/// each side; numbers are right-aligned within it. A **pure** function so
+/// `layout`, `update`, `mouse_interaction` and `draw` all reserve exactly the
+/// same strip — they must agree or clicks land on the wrong column — and so it
+/// is unit-testable with no renderer.
+fn gutter_width(enabled: bool, line_count: usize, text_size: f32) -> f32 {
+    if !enabled {
+        return 0.0;
+    }
+    // ~0.6 em per digit is a safe overestimate for the proportional default
+    // font; right-aligned numbers simply sit within the reserved column.
+    let digits = digit_count(line_count) as f32;
+    (digits * text_size * 0.6).ceil() + GUTTER_PAD * 2.0
+}
+
+/// Number of decimal digits in `n`, at least 1 (a one-line document still shows
+/// "1"). Used to size the gutter to its largest line number.
+fn digit_count(n: usize) -> u32 {
+    n.max(1).ilog10() + 1
+}
+
+/// Inset the left edge of `rect` by `gutter` pixels, clamping the width at 0 so a
+/// gutter wider than the widget can never make it negative (#41).
+fn inset_left(rect: Rectangle, gutter: f32) -> Rectangle {
+    Rectangle {
+        x: rect.x + gutter,
+        width: (rect.width - gutter).max(0.0),
+        ..rect
+    }
+}
+
+/// `color` at the given alpha — for the faint gutter numbers, active-line band
+/// and bracket boxes (#41), which sit *behind* the text and must not compete
+/// with it. Reads correctly in both light and dark themes because it derives
+/// from the theme's own text colour.
+fn faint(color: Color, alpha: f32) -> Color {
+    Color { a: alpha, ..color }
 }
 
 /// A multi-line text input.
@@ -186,6 +295,12 @@ where
     highlighter_settings: Highlighter::Settings,
     highlighter_format: fn(&Highlighter::Highlight, &Theme) -> highlighter::Format<Renderer::Font>,
     last_status: Option<Status>,
+    /// Whether to draw the line-number gutter (#41).
+    line_numbers: bool,
+    /// Whether to highlight the caret's line (#41).
+    active_line: bool,
+    /// A bracket pair to highlight, if any (#41).
+    bracket: Option<BracketHighlight>,
 }
 
 impl<'a, Message, Theme, Renderer> TextEditor<'a, highlighter::PlainText, Message, Theme, Renderer>
@@ -214,6 +329,9 @@ where
             highlighter_settings: (),
             highlighter_format: |_highlight, _theme| highlighter::Format::default(),
             last_status: None,
+            line_numbers: false,
+            active_line: false,
+            bracket: None,
         }
     }
 
@@ -302,6 +420,34 @@ where
         self
     }
 
+    /// Shows or hides the line-number gutter down the left edge (#41).
+    pub fn line_numbers(mut self, show: bool) -> Self {
+        self.line_numbers = show;
+        self
+    }
+
+    /// Enables or disables highlighting the line the caret is on (#41).
+    pub fn active_line(mut self, show: bool) -> Self {
+        self.active_line = show;
+        self
+    }
+
+    /// Sets the bracket pair to highlight, or `None` for no highlight (#41).
+    pub fn bracket_match(mut self, bracket: Option<BracketHighlight>) -> Self {
+        self.bracket = bracket;
+        self
+    }
+
+    /// The line-number gutter width for the current document at the current font
+    /// size, or `0.0` when the gutter is off (#41). Every phase that maps between
+    /// cursor and screen coordinates calls this so they reserve an identical
+    /// strip. Borrows the editor read-only for its line count.
+    fn gutter(&self, renderer: &Renderer) -> f32 {
+        let line_count = self.content.0.borrow().editor.line_count();
+        let text_size = self.text_size.unwrap_or_else(|| renderer.default_size());
+        gutter_width(self.line_numbers, line_count, text_size.0)
+    }
+
     /// Highlights the [`TextEditor`] using the given syntax and theme.
     #[cfg(feature = "highlighter")]
     pub fn highlight(
@@ -347,6 +493,9 @@ where
             highlighter_settings: settings,
             highlighter_format: to_format,
             last_status: self.last_status,
+            line_numbers: self.line_numbers,
+            active_line: self.active_line,
+            bracket: self.bracket,
         }
     }
 
@@ -396,7 +545,12 @@ where
         let bounds = layout.bounds();
         let internal = self.content.0.borrow_mut();
 
-        let text_bounds = bounds.shrink(self.padding);
+        // Reserve the line-number gutter (#41) so the pre-edit caret sits over
+        // the text, not the numbers. Computed from the editor's own line count to
+        // avoid re-borrowing `content` while `internal` is held.
+        let text_size = self.text_size.unwrap_or_else(|| renderer.default_size());
+        let gutter = gutter_width(self.line_numbers, internal.editor.line_count(), text_size.0);
+        let text_bounds = inset_left(bounds.shrink(self.padding), gutter);
         let translation = text_bounds.position() - Point::ORIGIN;
 
         let cursor = match internal.editor.selection() {
@@ -404,9 +558,7 @@ where
             Selection::Range(ranges) => ranges.first().cloned().unwrap_or_default().position(),
         };
 
-        let line_height = self
-            .line_height
-            .to_absolute(self.text_size.unwrap_or_else(|| renderer.default_size()));
+        let line_height = self.line_height.to_absolute(text_size);
 
         let position = cursor + translation;
 
@@ -770,7 +922,15 @@ where
 
         let font = self.font.unwrap_or_else(|| renderer.default_font());
         let text_size = self.text_size.unwrap_or_else(|| renderer.default_size());
-        let viewport = limits.shrink(self.padding).max();
+        // The line-number gutter (#41) eats into the text width, so the editor
+        // must wrap against the *reduced* width — otherwise wrapped lines would
+        // run under the gutter on the next row. Shrinking the viewport here is
+        // what keeps wrapping, click hit-testing and drawing consistent.
+        let gutter = gutter_width(self.line_numbers, internal.editor.line_count(), text_size.0);
+        let viewport = {
+            let v = limits.shrink(self.padding).max();
+            Size::new((v.width - gutter).max(0.0), v.height)
+        };
 
         internal.editor.update(
             viewport,
@@ -911,16 +1071,19 @@ where
         // is our own pan offset — hence the two thumbs take different updates.
         {
             let bounds = layout.bounds();
-            let text_bounds = bounds.shrink(self.padding);
-            let (content_width, content_height, scroll_top, line_height) = {
+            let (content_width, content_height, scroll_top, line_height, gutter) = {
                 let internal = self.content.0.borrow();
+                let text_size = self.text_size.unwrap_or_else(|| renderer.default_size());
                 (
                     internal.editor.min_bounds().width,
                     internal.editor.content_height(),
                     internal.editor.scroll_top(),
                     internal.editor.line_height(),
+                    gutter_width(self.line_numbers, internal.editor.line_count(), text_size.0),
                 )
             };
+            // The horizontal bar lives in the text area, right of the gutter (#41).
+            let text_bounds = inset_left(bounds.shrink(self.padding), gutter);
             let has_h_bar = content_width > text_bounds.width + 1.0;
             let has_v_bar = content_height > text_bounds.height + 1.0;
 
@@ -997,11 +1160,15 @@ where
             }
         }
 
+        // The gutter (#41) shifts the text right, so a click's x must have it
+        // subtracted (alongside the padding) to map onto the right character.
+        let gutter = self.gutter(renderer);
         if let Some(update) = Update::from_event(
             event,
             state,
             layout.bounds(),
             self.padding,
+            gutter,
             cursor,
             self.key_binding.as_deref(),
         ) {
@@ -1219,7 +1386,15 @@ where
             style.background,
         );
 
-        let text_bounds = bounds.shrink(self.padding);
+        // Reserve the line-number gutter (#41): the text sits to its right, and
+        // every coordinate below is relative to `text_bounds`, so the gutter, the
+        // caret and the highlights all stay aligned. `base` is the full area
+        // (gutter + text); `text_bounds` is just the text.
+        let text_size = self.text_size.unwrap_or_else(|| renderer.default_size());
+        let base = bounds.shrink(self.padding);
+        let gutter = gutter_width(self.line_numbers, internal.editor.line_count(), text_size.0);
+        let text_bounds = inset_left(base, gutter);
+        let line_h = f32::from(self.line_height.to_absolute(text_size));
 
         // Horizontal pan (#34): clamp the stored offset to what the content
         // actually overflows. `min_bounds().width` is the widest *visible* line
@@ -1228,6 +1403,74 @@ where
         let h_offset = state
             .horizontal_offset
             .clamp(0.0, (content_width - text_bounds.width).max(0.0));
+        let translation = text_bounds.position() - Point::ORIGIN - Vector::new(h_offset, 0.0);
+
+        // --- Active-line highlight (#41), painted behind the text ---
+        // A faint full-width band on the caret's line, only for a bare caret (a
+        // range selection draws its own highlight). Clipped so it never bleeds
+        // into the gutter or the padding.
+        if self.active_line
+            && let Selection::Caret(caret) = internal.editor.selection()
+        {
+            let band = Rectangle {
+                x: text_bounds.x,
+                y: text_bounds.y + caret.y,
+                width: text_bounds.width,
+                height: line_h,
+            };
+            if let Some(clipped) = text_bounds.intersection(&band) {
+                renderer.fill_quad(
+                    renderer::Quad {
+                        bounds: clipped,
+                        ..renderer::Quad::default()
+                    },
+                    faint(style.value, 0.08),
+                );
+            }
+        }
+
+        // --- Bracket-match highlight (#41), painted behind the text ---
+        // A faint rounded box behind the bracket next to the caret and its
+        // partner; green when matched, red when unbalanced (`partner == None`).
+        // Positions come from the shaped layout, so an off-screen bracket (or a
+        // caret at end-of-line) simply draws nothing.
+        if let Some(bracket) = self.bracket {
+            // Green when matched, red when unbalanced, from the theme's palette so
+            // both read in light and dark; a themeless theme falls back to fixed
+            // translucent tints.
+            let (matched, unmatched) = match theme.palette() {
+                Some(p) => (faint(p.success, 0.30), faint(p.danger, 0.30)),
+                None => (
+                    faint(style.value, 0.25),
+                    Color::from_rgba(0.9, 0.3, 0.3, 0.3),
+                ),
+            };
+            let color = if bracket.partner.is_some() {
+                matched
+            } else {
+                unmatched
+            };
+            for pos in std::iter::once(bracket.here).chain(bracket.partner) {
+                if let Some((gx, top, w)) = internal.editor.glyph_bounds(pos.line, pos.column) {
+                    let box_bounds = Rectangle {
+                        x: text_bounds.x + gx - h_offset,
+                        y: text_bounds.y + top,
+                        width: w,
+                        height: line_h,
+                    };
+                    if let Some(clipped) = text_bounds.intersection(&box_bounds) {
+                        renderer.fill_quad(
+                            renderer::Quad {
+                                bounds: clipped,
+                                border: Border::default().rounded(2.0),
+                                ..renderer::Quad::default()
+                            },
+                            color,
+                        );
+                    }
+                }
+            }
+        }
 
         if internal.editor.is_empty() {
             if let Some(placeholder) = self.placeholder.clone() {
@@ -1235,7 +1478,7 @@ where
                     Text {
                         content: placeholder.into_owned(),
                         bounds: text_bounds.size(),
-                        size: self.text_size.unwrap_or_else(|| renderer.default_size()),
+                        size: text_size,
                         line_height: self.line_height,
                         font,
                         align_x: text::Alignment::Default,
@@ -1256,8 +1499,6 @@ where
                 text_bounds,
             );
         }
-
-        let translation = text_bounds.position() - Point::ORIGIN - Vector::new(h_offset, 0.0);
 
         if let Some(focus) = state.focus.as_ref() {
             match internal.editor.selection() {
@@ -1371,6 +1612,69 @@ where
                 },
             );
         }
+
+        // --- Line-number gutter (#41) ---
+        // One right-aligned number per visible buffer line, scroll-synced via the
+        // shaped layout so a soft-wrapped line is numbered once, on its top row.
+        // The caret's line is drawn at full strength, the rest muted.
+        if gutter > 0.0 {
+            let active = internal.editor.cursor().position.line;
+            let right = base.x + gutter - GUTTER_PAD;
+            let clip = Rectangle {
+                x: base.x,
+                y: text_bounds.y,
+                width: gutter,
+                height: text_bounds.height,
+            };
+            // A hairline separating the gutter from the text.
+            renderer.fill_quad(
+                renderer::Quad {
+                    bounds: Rectangle {
+                        x: base.x + gutter - 1.0,
+                        y: text_bounds.y,
+                        width: 1.0,
+                        height: text_bounds.height,
+                    },
+                    ..renderer::Quad::default()
+                },
+                faint(style.value, 0.1),
+            );
+            for (line_i, top) in internal.editor.visible_line_tops(text_bounds.height) {
+                let color = if line_i == active {
+                    style.value
+                } else {
+                    faint(style.value, 0.5)
+                };
+                let label = (line_i + 1).to_string();
+                // Right-align by hand rather than with `Alignment::Right`: iced's
+                // per-item damage bounds are `Rectangle::new(position, size)` —
+                // measured *rightward* from `position` — while a right-aligned
+                // render draws *leftward* from it, so the damaged rectangle would
+                // miss the digits and the gutter would only repaint on a full
+                // redraw (resize). Left-anchoring the render at a position we
+                // right-align ourselves (via the same 0.6-em estimate the gutter
+                // width uses) keeps render and damage in the same place, so the
+                // numbers update the instant a line is added, removed or scrolled.
+                let est_w = label.len() as f32 * text_size.0 * 0.6;
+                let left = (right - est_w).max(base.x + 1.0);
+                renderer.fill_text(
+                    Text {
+                        content: label,
+                        bounds: Size::new(gutter, line_h),
+                        size: text_size,
+                        line_height: self.line_height,
+                        font,
+                        align_x: text::Alignment::Default,
+                        align_y: alignment::Vertical::Top,
+                        shaping: text::Shaping::Basic,
+                        wrapping: Wrapping::None,
+                    },
+                    Point::new(left, text_bounds.y + top),
+                    color,
+                    clip,
+                );
+            }
+        }
     }
 
     fn mouse_interaction(
@@ -1379,7 +1683,7 @@ where
         layout: Layout<'_>,
         cursor: mouse::Cursor,
         _viewport: &Rectangle,
-        _renderer: &Renderer,
+        renderer: &Renderer,
     ) -> mouse::Interaction {
         let is_disabled = self.on_edit.is_none();
         let state = tree.state.downcast_ref::<State<Highlighter>>();
@@ -1391,15 +1695,18 @@ where
         }
         if let Some(position) = cursor.position() {
             let bounds = layout.bounds();
-            let text_bounds = bounds.shrink(self.padding);
-            let (content_width, content_height, scroll_top) = {
+            let (content_width, content_height, scroll_top, gutter) = {
                 let internal = self.content.0.borrow();
+                let text_size = self.text_size.unwrap_or_else(|| renderer.default_size());
                 (
                     internal.editor.min_bounds().width,
                     internal.editor.content_height(),
                     internal.editor.scroll_top(),
+                    gutter_width(self.line_numbers, internal.editor.line_count(), text_size.0),
                 )
             };
+            // The horizontal bar sits in the text area, right of the gutter (#41).
+            let text_bounds = inset_left(bounds.shrink(self.padding), gutter);
             let over_h = content_width > text_bounds.width + 1.0
                 && horizontal_bar(text_bounds, content_width, state.horizontal_offset)
                     .thumb
@@ -1611,6 +1918,7 @@ impl<Message> Update<Message> {
         state: &State<H>,
         bounds: Rectangle,
         padding: Padding,
+        gutter: f32,
         cursor: mouse::Cursor,
         key_binding: Option<&dyn Fn(KeyPress) -> Option<Binding<Message>>>,
     ) -> Option<Self> {
@@ -1621,7 +1929,7 @@ impl<Message> Update<Message> {
                 mouse::Event::ButtonPressed(mouse::Button::Left) => {
                     if let Some(cursor_position) = cursor.position_in(bounds) {
                         let cursor_position = cursor_position
-                            - Vector::new(padding.left, padding.top)
+                            - Vector::new(padding.left + gutter, padding.top)
                             + Vector::new(state.horizontal_offset, 0.0);
 
                         let click = mouse::Click::new(
@@ -1641,7 +1949,7 @@ impl<Message> Update<Message> {
                 mouse::Event::CursorMoved { .. } => match state.drag_click {
                     Some(mouse::click::Kind::Single) => {
                         let cursor_position = cursor.position_in(bounds)?
-                            - Vector::new(padding.left, padding.top)
+                            - Vector::new(padding.left + gutter, padding.top)
                             + Vector::new(state.horizontal_offset, 0.0);
 
                         Some(Update::Drag(cursor_position))
@@ -1847,4 +2155,58 @@ pub(crate) fn convert_macos_shortcut(
     };
 
     Some(keyboard::Key::Named(key))
+}
+
+#[cfg(test)]
+mod tests {
+    //! Headless tests for the pure gutter geometry (#41). The rendering itself
+    //! needs a GPU/window and is exercised by running the app; these cover the
+    //! width maths that `layout`, `update` and `draw` must all agree on.
+    use super::*;
+
+    #[test]
+    fn gutter_is_zero_when_disabled() {
+        assert_eq!(gutter_width(false, 100_000, 14.0), 0.0);
+    }
+
+    #[test]
+    fn gutter_grows_with_the_line_count_digits() {
+        // Same font, more digits ⇒ a wider gutter; each order of magnitude adds a
+        // digit's worth of width, and it never shrinks.
+        let one = gutter_width(true, 9, 14.0);
+        let two = gutter_width(true, 99, 14.0);
+        let three = gutter_width(true, 999, 14.0);
+        assert!(one < two, "two digits must be wider than one");
+        assert!(two < three, "three digits must be wider than two");
+        // A single-line document still reserves room for "1".
+        assert!(gutter_width(true, 1, 14.0) > 0.0);
+    }
+
+    #[test]
+    fn gutter_scales_with_font_size() {
+        assert!(gutter_width(true, 100, 24.0) > gutter_width(true, 100, 12.0));
+    }
+
+    #[test]
+    fn digit_count_counts_decimal_digits() {
+        assert_eq!(digit_count(0), 1); // empty/one-line document → "1"
+        assert_eq!(digit_count(1), 1);
+        assert_eq!(digit_count(9), 1);
+        assert_eq!(digit_count(10), 2);
+        assert_eq!(digit_count(999), 3);
+        assert_eq!(digit_count(1000), 4);
+    }
+
+    #[test]
+    fn inset_left_never_produces_a_negative_width() {
+        let rect = Rectangle {
+            x: 10.0,
+            y: 0.0,
+            width: 20.0,
+            height: 5.0,
+        };
+        let inset = inset_left(rect, 50.0); // gutter wider than the rect
+        assert_eq!(inset.width, 0.0);
+        assert_eq!(inset.x, 60.0);
+    }
 }

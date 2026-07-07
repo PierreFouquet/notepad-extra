@@ -16,6 +16,7 @@
 #![forbid(unsafe_code)]
 
 pub mod app;
+pub mod brackets;
 pub mod find;
 pub mod history;
 pub mod io;
@@ -25,6 +26,7 @@ pub mod status;
 pub mod text;
 
 pub use app::{Document, Effect, FindOption, FindState, Message, State, TabId, update};
+pub use brackets::BracketMatch;
 pub use find::{Match, Matcher, Replacement, SearchError, SearchOptions};
 pub use history::{Edit, History, diff};
 pub use prefs::Preferences;

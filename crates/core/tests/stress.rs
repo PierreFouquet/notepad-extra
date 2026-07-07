@@ -5,7 +5,7 @@
 //! catastrophic regexes, huge-document replace-all, and thousands of Find Next.
 
 use notepad_core::find::{self, goto_line_offset};
-use notepad_core::{Effect, Matcher, Message, SearchOptions, State, status, update};
+use notepad_core::{Effect, Matcher, Message, SearchOptions, State, brackets, status, update};
 use std::path::PathBuf;
 
 /// A regex-mode [`SearchOptions`].
@@ -404,4 +404,58 @@ fn monotonic_zoom_to_each_extreme_settles_exactly_on_the_bound() {
         update(&mut s, Message::ZoomOut);
     }
     assert_eq!(s.font_size(), State::MIN_FONT_SIZE);
+}
+
+// ---- Bracket matching (#41) ----
+
+#[test]
+fn deeply_nested_brackets_match_without_stack_overflow() {
+    // 100k nested pairs: the depth scan is iterative, so this must resolve
+    // without recursing (a recursive matcher would blow the stack here).
+    let n = 100_000;
+    let text = format!("{}{}", "(".repeat(n), ")".repeat(n));
+
+    // The outermost '(' (caret at 0) pairs with the very last ')'.
+    let m = brackets::match_at(&text, 0).expect("outer opener matches");
+    assert_eq!(m.here, 0);
+    assert_eq!(m.partner, Some(text.len() - 1));
+
+    // The innermost pair sits back-to-back at the middle: '(' at n-1, ')' at n.
+    let inner = brackets::match_at(&text, n).expect("innermost opener matches");
+    assert_eq!(inner.here, n - 1);
+    assert_eq!(inner.partner, Some(n));
+}
+
+#[test]
+fn unbalanced_bracket_storm_scans_fully_without_panicking() {
+    // A single enormous run of openers with no closer: matching from the front
+    // scans the whole document to conclude there is no partner, and from the back
+    // finds nothing to its left — either way, no panic and no false match.
+    let text = "(".repeat(200_000);
+    let from_front = brackets::match_at(&text, 0).expect("touches the first '('");
+    assert_eq!(
+        from_front,
+        brackets::BracketMatch {
+            here: 0,
+            partner: None
+        }
+    );
+    let from_back = brackets::match_at(&text, text.len()).expect("touches the last '('");
+    assert_eq!(from_back.here, text.len() - 1);
+    assert_eq!(from_back.partner, None);
+}
+
+#[test]
+fn sweeping_the_caret_across_a_huge_bracket_document_stays_bounded() {
+    // A million-character line of balanced pairs; probing thousands of caret
+    // positions must never panic and must keep matched pairs consistent.
+    let text = "()".repeat(500_000); // 1,000,000 chars
+    for k in (0..text.len()).step_by(997) {
+        if let Some(m) = brackets::match_at(&text, k)
+            && let Some(p) = m.partner
+        {
+            // Every "()" is a self-contained pair, so partners are adjacent.
+            assert_eq!(p.abs_diff(m.here), 1);
+        }
+    }
 }

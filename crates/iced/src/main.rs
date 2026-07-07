@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 // The free `text_editor` fn and `Cursor`/`Position` mirror iced's own so the
 // rest of the shell is unchanged.
 mod text_editor;
-use text_editor::{Cursor, Position, text_editor};
+use text_editor::{BracketHighlight, Cursor, Position, text_editor};
 
 pub fn main() -> iced::Result {
     let window = iced::window::Settings {
@@ -179,6 +179,11 @@ enum Message {
     /// Toggle soft word-wrap. Driven by the toolbar button; a key accelerator
     /// arrives with the rest in #39.
     ToggleWordWrap,
+
+    // ---- Line numbers (#41) ----
+    /// Toggle the line-number gutter. Driven by the toolbar button; a key
+    /// accelerator arrives with the rest in #39.
+    ToggleLineNumbers,
 
     // ---- Preferences persistence (#38) ----
     /// A preferences write finished. The result is intentionally ignored: a
@@ -414,6 +419,9 @@ impl Shell {
             Message::ZoomOut => self.apply_core(core::Message::ZoomOut, false),
             Message::ZoomReset => self.apply_core(core::Message::ZoomReset, false),
             Message::ToggleWordWrap => self.apply_core(core::Message::ToggleWordWrap, false),
+            // The gutter is a view-only preference the editor reads from
+            // `show_line_numbers()`; it never rewrites the buffer, so resync=false.
+            Message::ToggleLineNumbers => self.apply_core(core::Message::ToggleLineNumbers, false),
 
             // The preferences write landed (#38). Nothing to do: its result is
             // deliberately swallowed so a failed save never disrupts editing.
@@ -578,6 +586,27 @@ impl Shell {
         core::status(doc, caret, anchor)
     }
 
+    /// The bracket pair to highlight for the active document (#41), derived from
+    /// the pure core plus the editor widget's live caret. Mirrors [`Shell::status`]:
+    /// it reads the caret (no renderer needed, so this is headless-testable),
+    /// turns it into a byte offset with `find::offset_at`, asks the core which
+    /// brackets match, and maps the result back to the widget's `(line, column)`
+    /// positions with `find::line_col_of` — the same conversion `RevealRange` uses.
+    fn active_bracket(&self) -> Option<BracketHighlight> {
+        let content = &self.core.active_doc().content;
+        let cursor = self.editor.cursor();
+        let caret = core::find::offset_at(content, cursor.position.line, cursor.position.column);
+        let m = core::brackets::match_at(content, caret)?;
+        let to_pos = |off: usize| {
+            let (line, column) = core::find::line_col_of(content, off);
+            Position { line, column }
+        };
+        Some(BracketHighlight {
+            here: to_pos(m.here),
+            partner: m.partner.map(to_pos),
+        })
+    }
+
     fn view(&self) -> Element<'_, Message> {
         let find_style = if self.core.find.open {
             button::primary
@@ -586,6 +615,12 @@ impl Shell {
         };
         // The Wrap button reads as "pressed" (primary) while wrapping is on (#34).
         let wrap_style = if self.core.word_wrap() {
+            button::primary
+        } else {
+            button::secondary
+        };
+        // The line-number button reads as "pressed" while the gutter is on (#41).
+        let nums_style = if self.core.show_line_numbers() {
             button::primary
         } else {
             button::secondary
@@ -615,6 +650,10 @@ impl Shell {
             button("Wrap")
                 .style(wrap_style)
                 .on_press(Message::ToggleWordWrap),
+            // Line-number gutter toggle (#41): lit while the gutter is shown.
+            button("#")
+                .style(nums_style)
+                .on_press(Message::ToggleLineNumbers),
             // About panel toggle (#40): lit while the panel is showing.
             button("About")
                 .style(about_style)
@@ -650,6 +689,11 @@ impl Shell {
             } else {
                 Wrapping::None
             })
+            // Editor niceties (#41): the gutter follows the persisted toggle,
+            // active-line and bracket matching are always on.
+            .line_numbers(self.core.show_line_numbers())
+            .active_line(true)
+            .bracket_match(self.active_bracket())
             .height(Fill);
 
         let status: Element<'_, Message> = match &self.error {
@@ -1410,6 +1454,56 @@ mod tests {
         let _ = shell.view();
         let _ = shell.update(Message::ToggleWordWrap);
         let _ = shell.view();
+    }
+
+    // ---- Editor niceties (#41) ----
+
+    #[test]
+    fn line_numbers_toggle_flips_core_state_and_the_view_still_builds() {
+        // The "#" button routes straight through to the core, like Wrap, and must
+        // not resync/clear the editor. The gutter is on by default.
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::Edit(paste("keep me")));
+        assert!(shell.core.show_line_numbers(), "starts on");
+
+        let _ = shell.update(Message::ToggleLineNumbers);
+        assert!(!shell.core.show_line_numbers());
+        let _ = shell.view(); // the gutter-off view builds
+        let _ = shell.update(Message::ToggleLineNumbers);
+        assert!(shell.core.show_line_numbers());
+        let _ = shell.view(); // the gutter-on view builds
+
+        assert_eq!(shell.editor.text().trim_end(), "keep me");
+        assert!(shell.core.active_doc().dirty());
+    }
+
+    #[test]
+    fn active_bracket_highlights_the_pair_next_to_the_caret() {
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::Edit(paste("(x)")));
+        // Paste leaves the caret just after ')', so ')' (col 2) matches '(' (col 0).
+        let b = shell.active_bracket().expect("a bracket next to the caret");
+        assert_eq!(b.here, Position { line: 0, column: 2 });
+        assert_eq!(b.partner, Some(Position { line: 0, column: 0 }));
+    }
+
+    #[test]
+    fn active_bracket_is_none_when_the_caret_touches_no_bracket() {
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::Edit(paste("abc")));
+        assert!(shell.active_bracket().is_none());
+    }
+
+    #[test]
+    fn active_bracket_marks_an_unbalanced_bracket_with_no_partner() {
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::Edit(paste("(")));
+        // The caret after the lone '(': it is highlighted, but has no partner.
+        let b = shell
+            .active_bracket()
+            .expect("the lone bracket is highlighted");
+        assert_eq!(b.here, Position { line: 0, column: 0 });
+        assert_eq!(b.partner, None);
     }
 
     // ---- Preferences persistence (#38) ----

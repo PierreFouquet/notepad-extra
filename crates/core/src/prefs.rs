@@ -41,6 +41,19 @@ pub struct Preferences {
     /// filled from its default — on — rather than failing the parse.
     #[serde(default = "default_show_line_numbers")]
     pub show_line_numbers: bool,
+    /// The bundled font family the editor buffer renders in (#61). A display name
+    /// like `"Cascadia Code"`; the shell resolves it against its bundled-font
+    /// registry, falling back to the default face if the name is unknown (so a
+    /// hand-edited or stale value can never leave the editor unrenderable).
+    /// Applied through [`State::apply_preferences`], which drops an empty value
+    /// back to the default. Additive, defaulted for older configs.
+    #[serde(default = "default_editor_font")]
+    pub editor_font: String,
+    /// The bundled font family the UI chrome renders in (#61). Independent of
+    /// `editor_font` — two separate pickers — and resolved / defaulted the same
+    /// way. Additive, defaulted for older configs.
+    #[serde(default = "default_ui_font")]
+    pub ui_font: String,
 }
 
 fn default_version() -> u32 {
@@ -59,6 +72,14 @@ fn default_show_line_numbers() -> bool {
     true
 }
 
+fn default_editor_font() -> String {
+    State::DEFAULT_EDITOR_FONT.to_string()
+}
+
+fn default_ui_font() -> String {
+    State::DEFAULT_UI_FONT.to_string()
+}
+
 impl Default for Preferences {
     /// The out-of-the-box preferences: the same values a fresh [`State`] starts
     /// with, so a missing or unreadable config behaves identically to first run.
@@ -68,6 +89,8 @@ impl Default for Preferences {
             font_size: default_font_size(),
             word_wrap: default_word_wrap(),
             show_line_numbers: default_show_line_numbers(),
+            editor_font: default_editor_font(),
+            ui_font: default_ui_font(),
         }
     }
 }
@@ -118,6 +141,8 @@ mod tests {
             font_size: 22,
             word_wrap: true,
             show_line_numbers: false,
+            editor_font: "JetBrains Mono".to_string(),
+            ui_font: "Inter".to_string(),
         };
         assert_eq!(Preferences::from_json(&prefs.to_json()), prefs);
     }
@@ -131,6 +156,8 @@ mod tests {
         assert_eq!(prefs.font_size, state.font_size());
         assert_eq!(prefs.word_wrap, state.word_wrap());
         assert_eq!(prefs.show_line_numbers, state.show_line_numbers());
+        assert_eq!(prefs.editor_font, state.editor_font());
+        assert_eq!(prefs.ui_font, state.ui_font());
     }
 
     #[test]
@@ -170,6 +197,10 @@ mod tests {
         assert_eq!(prefs.version, CURRENT_VERSION);
         // An older config predating the gutter key loads with it defaulted on.
         assert!(prefs.show_line_numbers);
+        // Likewise a config predating the font keys (#61) loads with both faces
+        // filled from their defaults rather than empty.
+        assert_eq!(prefs.editor_font, default_editor_font());
+        assert_eq!(prefs.ui_font, default_ui_font());
     }
 
     #[test]
@@ -196,12 +227,16 @@ mod tests {
             font_size in any::<u16>(),
             word_wrap in any::<bool>(),
             show_line_numbers in any::<bool>(),
+            editor_font in any::<String>(),
+            ui_font in any::<String>(),
         ) {
             let prefs = Preferences {
                 version: CURRENT_VERSION,
                 font_size,
                 word_wrap,
                 show_line_numbers,
+                editor_font,
+                ui_font,
             };
             prop_assert_eq!(Preferences::from_json(&prefs.to_json()), prefs);
         }

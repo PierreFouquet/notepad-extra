@@ -136,6 +136,15 @@ pub struct State {
     /// [`Message::ToggleLineNumbers`]. On by default, matching the WebView build's
     /// CodeMirror gutter. Persisted by #38.
     show_line_numbers: bool,
+    /// The bundled font family the editor buffer renders in (#61). A display name
+    /// the shell maps to a registered face; never empty (see [`State::set_editor_font`]).
+    /// App-wide, shared by every tab. Read via [`State::editor_font`], changed by
+    /// [`Message::SetEditorFont`]. Persisted by #38.
+    editor_font: String,
+    /// The bundled font family the UI chrome renders in (#61). Independent of
+    /// `editor_font` (two separate pickers); never empty. Read via
+    /// [`State::ui_font`], changed by [`Message::SetUiFont`]. Persisted by #38.
+    ui_font: String,
     /// A document (by stable id) that must be closed once its in-flight
     /// "save before closing" write lands (#31). Set by [`Message::TabCloseSave`],
     /// consumed by [`Message::FileSaved`], and cleared by [`Message::SaveAbandoned`]
@@ -155,6 +164,8 @@ impl Default for State {
             font_size: State::DEFAULT_FONT_SIZE,
             word_wrap: false,
             show_line_numbers: true,
+            editor_font: State::DEFAULT_EDITOR_FONT.to_string(),
+            ui_font: State::DEFAULT_UI_FONT.to_string(),
             pending_close: None,
             next_id: 1,
         };
@@ -175,6 +186,17 @@ impl State {
     pub const DEFAULT_FONT_SIZE: u16 = 14;
     /// How much one zoom step moves the font size, in points.
     const FONT_SIZE_STEP: u16 = 1;
+
+    /// The font family the editor buffer opens in (#61). This is the single
+    /// family the shell **bundles** (embedded as bytes), so a fresh install
+    /// renders with zero system fonts — the offline guarantee. The pickers let
+    /// the user switch to any OS-installed family, but the default stays the
+    /// bundled one. Monospaced, for correctly aligned code.
+    pub const DEFAULT_EDITOR_FONT: &'static str = "DejaVu Sans Mono";
+    /// The font family the UI chrome opens in (#61). Defaults to the same bundled
+    /// family as the editor so the whole app is guaranteed to render offline; the
+    /// UI-font picker can switch it to any installed family independently.
+    pub const DEFAULT_UI_FONT: &'static str = "DejaVu Sans Mono";
 
     fn alloc_id(&mut self) -> TabId {
         let id = self.next_id;
@@ -200,6 +222,19 @@ impl State {
         self.show_line_numbers
     }
 
+    /// The editor buffer's font family (#61). The shell resolves this against its
+    /// bundled-font registry when it renders the `text_editor`. Never empty.
+    pub fn editor_font(&self) -> &str {
+        &self.editor_font
+    }
+
+    /// The UI chrome's font family (#61). The shell resolves this against its
+    /// bundled-font registry when it renders the toolbar / status bar / etc.
+    /// Never empty.
+    pub fn ui_font(&self) -> &str {
+        &self.ui_font
+    }
+
     /// Whether the About panel is currently showing (#40). The shell reads this
     /// when it renders to decide whether to draw the About panel.
     pub fn about_open(&self) -> bool {
@@ -214,6 +249,8 @@ impl State {
             font_size: self.font_size,
             word_wrap: self.word_wrap,
             show_line_numbers: self.show_line_numbers,
+            editor_font: self.editor_font.clone(),
+            ui_font: self.ui_font.clone(),
         }
     }
 
@@ -225,6 +262,8 @@ impl State {
         self.set_font_size(prefs.font_size);
         self.word_wrap = prefs.word_wrap;
         self.show_line_numbers = prefs.show_line_numbers;
+        self.set_editor_font(&prefs.editor_font);
+        self.set_ui_font(&prefs.ui_font);
     }
 
     /// Enlarge the editor font by one step, clamped to `MAX_FONT_SIZE` (Ctrl+ +).
@@ -249,6 +288,30 @@ impl State {
     /// a persisted preference later, #38).
     fn set_font_size(&mut self, size: u16) {
         self.font_size = size.clamp(Self::MIN_FONT_SIZE, Self::MAX_FONT_SIZE);
+    }
+
+    /// The choke point for the editor font family (#61). Trims surrounding
+    /// whitespace and falls back to [`Self::DEFAULT_EDITOR_FONT`] for an empty
+    /// name, so neither a picker glitch nor a hand-edited config can ever leave
+    /// the field blank. Resolving an *unknown* (non-empty) family to a usable
+    /// face is the shell registry's job, not the core's.
+    fn set_editor_font(&mut self, name: &str) {
+        let name = name.trim();
+        self.editor_font = if name.is_empty() {
+            Self::DEFAULT_EDITOR_FONT.to_string()
+        } else {
+            name.to_string()
+        };
+    }
+
+    /// The choke point for the UI font family (#61); see [`Self::set_editor_font`].
+    fn set_ui_font(&mut self, name: &str) {
+        let name = name.trim();
+        self.ui_font = if name.is_empty() {
+            Self::DEFAULT_UI_FONT.to_string()
+        } else {
+            name.to_string()
+        };
     }
 
     /// The focused document.
@@ -348,6 +411,13 @@ pub enum Message {
     // ---- Line numbers (#41) ----
     /// Show or hide the line-number gutter, app-wide.
     ToggleLineNumbers,
+
+    // ---- Font family selection (#61) ----
+    /// Set the editor buffer's font family (from the editor-font picker). An
+    /// empty name is normalised back to the default by the core.
+    SetEditorFont(String),
+    /// Set the UI chrome's font family (from the UI-font picker).
+    SetUiFont(String),
 
     // ---- About dialog + external links (#40) ----
     /// Show the About panel.
@@ -659,6 +729,20 @@ pub fn update(state: &mut State, message: Message) -> Vec<Effect> {
         // persisted on each toggle (#38).
         Message::ToggleLineNumbers => {
             state.show_line_numbers = !state.show_line_numbers;
+            vec![Effect::SavePreferences(state.preferences())]
+        }
+
+        // ---- Font family selection (#61) ----
+        // Like the toggles above, picking a font only changes an app-wide render
+        // preference the shell reads (from `editor_font()` / `ui_font()`) — no
+        // buffer or title change — and is persisted on each change (#38). The
+        // setters normalise an empty name back to the default.
+        Message::SetEditorFont(name) => {
+            state.set_editor_font(&name);
+            vec![Effect::SavePreferences(state.preferences())]
+        }
+        Message::SetUiFont(name) => {
+            state.set_ui_font(&name);
             vec![Effect::SavePreferences(state.preferences())]
         }
 
@@ -1782,6 +1866,61 @@ mod tests {
         assert!(s.word_wrap(), "an odd toggle count ends on");
     }
 
+    // ---- Font family selection (#61) ----
+
+    #[test]
+    fn default_fonts_are_the_bundled_defaults() {
+        let s = State::default();
+        assert_eq!(s.editor_font(), State::DEFAULT_EDITOR_FONT);
+        assert_eq!(s.ui_font(), State::DEFAULT_UI_FONT);
+    }
+
+    #[test]
+    fn set_editor_and_ui_fonts_change_independently_and_persist() {
+        let mut s = State::default();
+        let fx = update(&mut s, Message::SetEditorFont("Iosevka".into()));
+        assert_eq!(s.editor_font(), "Iosevka");
+        // Unchanged: the two pickers are independent.
+        assert_eq!(s.ui_font(), State::DEFAULT_UI_FONT);
+        // Picking a font is a persisted preference (#38).
+        assert_eq!(fx, vec![Effect::SavePreferences(s.preferences())]);
+
+        let fx = update(&mut s, Message::SetUiFont("Inter".into()));
+        assert_eq!(s.ui_font(), "Inter");
+        assert_eq!(s.editor_font(), "Iosevka", "editor font untouched");
+        assert_eq!(fx, vec![Effect::SavePreferences(s.preferences())]);
+    }
+
+    #[test]
+    fn empty_or_whitespace_font_name_falls_back_to_default() {
+        // A picker glitch or hand-edited config must never blank the field: an
+        // empty (or all-whitespace) name normalises to the default face.
+        let mut s = State::default();
+        update(&mut s, Message::SetEditorFont("Hack".into()));
+        update(&mut s, Message::SetEditorFont(String::new()));
+        assert_eq!(s.editor_font(), State::DEFAULT_EDITOR_FONT);
+
+        update(&mut s, Message::SetUiFont("   ".into()));
+        assert_eq!(s.ui_font(), State::DEFAULT_UI_FONT);
+    }
+
+    #[test]
+    fn font_name_is_trimmed() {
+        let mut s = State::default();
+        update(&mut s, Message::SetEditorFont("  JetBrains Mono  ".into()));
+        assert_eq!(s.editor_font(), "JetBrains Mono");
+    }
+
+    #[test]
+    fn unknown_font_name_is_kept_verbatim_for_the_shell_to_resolve() {
+        // The core does not police family names against the bundled set — that is
+        // the shell registry's job (it falls back when rendering). A non-empty
+        // unknown name is stored as-is so the shell can decide.
+        let mut s = State::default();
+        update(&mut s, Message::SetEditorFont("Nonexistent Face".into()));
+        assert_eq!(s.editor_font(), "Nonexistent Face");
+    }
+
     // ---- Preferences persistence (#38) ----
 
     #[test]
@@ -1804,6 +1943,8 @@ mod tests {
             font_size: 25,
             word_wrap: true,
             show_line_numbers: false,
+            editor_font: "Fira Code".to_string(),
+            ui_font: "Noto Sans".to_string(),
         };
         let mut s = State::default();
         s.apply_preferences(&prefs);
@@ -1813,6 +1954,8 @@ mod tests {
             !s.show_line_numbers(),
             "the off gutter must be restored too"
         );
+        assert_eq!(s.editor_font(), "Fira Code", "editor font restored");
+        assert_eq!(s.ui_font(), "Noto Sans", "UI font restored");
         assert_eq!(s.preferences(), prefs);
     }
 
@@ -1824,16 +1967,14 @@ mod tests {
         s.apply_preferences(&Preferences {
             version: 1,
             font_size: u16::MAX,
-            word_wrap: false,
-            show_line_numbers: true,
+            ..Preferences::default()
         });
         assert_eq!(s.font_size(), State::MAX_FONT_SIZE);
 
         s.apply_preferences(&Preferences {
             version: 1,
             font_size: 0,
-            word_wrap: false,
-            show_line_numbers: true,
+            ..Preferences::default()
         });
         assert_eq!(s.font_size(), State::MIN_FONT_SIZE);
     }
@@ -1959,6 +2100,22 @@ mod tests {
             // Word wrap (#34): flip it inside long random streams so nothing else
             // in the core depends on its value.
             Just(Message::ToggleWordWrap),
+            // Font family selection (#61): mix known families with arbitrary /
+            // empty strings so the empty→default normalisation and verbatim
+            // pass-through are both driven under long random streams.
+            prop_oneof![
+                Just("Cascadia Code".to_string()),
+                Just("Iosevka".to_string()),
+                Just(String::new()),
+                any::<String>(),
+            ]
+            .prop_map(Message::SetEditorFont),
+            prop_oneof![
+                Just("DejaVu Sans".to_string()),
+                Just("Inter".to_string()),
+                any::<String>(),
+            ]
+            .prop_map(Message::SetUiFont),
         ]
     }
 

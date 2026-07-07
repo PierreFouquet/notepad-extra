@@ -10,6 +10,7 @@
 //! owns only *where* the file lives and the actual read/write syscalls.
 
 use crate::app::State;
+use notepad_syntax::ThemeMode;
 use serde::{Deserialize, Serialize};
 
 /// The current on-disk schema version. Bump this only when the *meaning* of an
@@ -54,6 +55,12 @@ pub struct Preferences {
     /// way. Additive, defaulted for older configs.
     #[serde(default = "default_ui_font")]
     pub ui_font: String,
+    /// The UI light/dark theme, paired with a matching syntect highlight theme
+    /// (#36). Additive, so a config written by an older build (before this key
+    /// existed) loads with the field defaulted to light rather than failing the
+    /// parse. The wire form is `"light"` / `"dark"` (see [`ThemeMode`]).
+    #[serde(default = "default_theme")]
+    pub theme: ThemeMode,
 }
 
 fn default_version() -> u32 {
@@ -80,6 +87,10 @@ fn default_ui_font() -> String {
     State::DEFAULT_UI_FONT.to_string()
 }
 
+fn default_theme() -> ThemeMode {
+    ThemeMode::default()
+}
+
 impl Default for Preferences {
     /// The out-of-the-box preferences: the same values a fresh [`State`] starts
     /// with, so a missing or unreadable config behaves identically to first run.
@@ -91,6 +102,7 @@ impl Default for Preferences {
             show_line_numbers: default_show_line_numbers(),
             editor_font: default_editor_font(),
             ui_font: default_ui_font(),
+            theme: default_theme(),
         }
     }
 }
@@ -143,8 +155,28 @@ mod tests {
             show_line_numbers: false,
             editor_font: "JetBrains Mono".to_string(),
             ui_font: "Inter".to_string(),
+            theme: ThemeMode::Dark,
         };
         assert_eq!(Preferences::from_json(&prefs.to_json()), prefs);
+    }
+
+    #[test]
+    fn theme_serialises_to_a_stable_wire_form() {
+        // The persisted form is the lowercase variant name, so a hand-editable
+        // config reads naturally and stays stable across releases (#36).
+        let dark = Preferences {
+            theme: ThemeMode::Dark,
+            ..Preferences::default()
+        };
+        assert!(
+            dark.to_json().contains("\"theme\": \"dark\""),
+            "dark theme should persist as \"theme\": \"dark\", got: {}",
+            dark.to_json()
+        );
+        assert_eq!(
+            Preferences::from_json(&dark.to_json()).theme,
+            ThemeMode::Dark
+        );
     }
 
     #[test]
@@ -158,6 +190,7 @@ mod tests {
         assert_eq!(prefs.show_line_numbers, state.show_line_numbers());
         assert_eq!(prefs.editor_font, state.editor_font());
         assert_eq!(prefs.ui_font, state.ui_font());
+        assert_eq!(prefs.theme, state.theme());
     }
 
     #[test]
@@ -201,17 +234,22 @@ mod tests {
         // filled from their defaults rather than empty.
         assert_eq!(prefs.editor_font, default_editor_font());
         assert_eq!(prefs.ui_font, default_ui_font());
+        // And a config predating the theme key (#36) loads with it defaulted to
+        // light rather than failing the parse.
+        assert_eq!(prefs.theme, ThemeMode::Light);
     }
 
     #[test]
     fn unknown_fields_are_ignored_forward_compat() {
-        // A file written by a newer build carrying a not-yet-known key (e.g. the
-        // theme from #36) must still load on this build.
+        // A file written by a newer build carrying a not-yet-known key must still
+        // load on this build (the `future` key here is deliberately unknown).
         let prefs = Preferences::from_json(
-            r#"{"version":9,"font_size":18,"word_wrap":true,"theme":"dark"}"#,
+            r#"{"version":9,"font_size":18,"word_wrap":true,"theme":"dark","future":"?"}"#,
         );
         assert_eq!(prefs.font_size, 18);
         assert!(prefs.word_wrap);
+        // The now-known theme key parses; the unknown `future` key is ignored.
+        assert_eq!(prefs.theme, ThemeMode::Dark);
         // An older schema is migrated up to the current version on load.
         assert_eq!(prefs.version, CURRENT_VERSION);
     }
@@ -229,6 +267,7 @@ mod tests {
             show_line_numbers in any::<bool>(),
             editor_font in any::<String>(),
             ui_font in any::<String>(),
+            dark in any::<bool>(),
         ) {
             let prefs = Preferences {
                 version: CURRENT_VERSION,
@@ -237,6 +276,7 @@ mod tests {
                 show_line_numbers,
                 editor_font,
                 ui_font,
+                theme: if dark { ThemeMode::Dark } else { ThemeMode::Light },
             };
             prop_assert_eq!(Preferences::from_json(&prefs.to_json()), prefs);
         }

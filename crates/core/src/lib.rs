@@ -18,6 +18,7 @@
 pub mod app;
 pub mod brackets;
 pub mod find;
+pub mod geometry;
 pub mod history;
 pub mod io;
 pub mod lang;

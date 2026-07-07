@@ -16,7 +16,7 @@
 #![forbid(unsafe_code)]
 
 use iced::widget::text::Wrapping;
-use iced::widget::{button, column, container, row, stack, text, text_input};
+use iced::widget::{button, column, container, pick_list, row, stack, text, text_input};
 use iced::{Element, Fill, Length, Subscription, Task};
 use notepad_core as core;
 use notepad_core::{Effect, FindOption, TabId};
@@ -29,16 +29,30 @@ use std::path::{Path, PathBuf};
 mod text_editor;
 use text_editor::{BracketHighlight, Cursor, Position, text_editor};
 
+// Font bundling + family resolution (#61): embeds the one guaranteed family and
+// resolves picker/pref family names (bundled or OS-installed) to `iced::Font`.
+mod fonts;
+
 pub fn main() -> iced::Result {
     let window = iced::window::Settings {
         icon: window_icon(),
         ..iced::window::Settings::default()
     };
-    iced::application(Shell::boot, Shell::update, Shell::view)
+    // Register the one bundled family (#61) so the app renders offline. Seed the
+    // app-wide `default_font` from the persisted UI font as a sensible first-paint
+    // baseline (read from the same file `boot` loads into the core); `view` then
+    // threads both the editor and UI fonts onto their widgets, so a picker change
+    // takes effect live within the session.
+    let ui_default = fonts::resolve(&load_preferences().ui_font);
+    let mut app = iced::application(Shell::boot, Shell::update, Shell::view)
         .title(Shell::title)
         .subscription(Shell::subscription)
-        .window(window)
-        .run()
+        .default_font(ui_default)
+        .window(window);
+    for face in fonts::BUNDLED_FONT_FACES {
+        app = app.font(*face);
+    }
+    app.run()
 }
 
 /// Map raw window events to shell messages for the drag-and-drop subscription
@@ -184,6 +198,13 @@ enum Message {
     /// Toggle the line-number gutter. Driven by the toolbar button; a key
     /// accelerator arrives with the rest in #39.
     ToggleLineNumbers,
+
+    // ---- Font family selection (#61) ----
+    /// The editor-font picker chose a family (bundled or OS-installed).
+    SetEditorFont(String),
+    /// The UI-font picker chose a family. Applied live to the chrome (via the
+    /// font threaded through `view`) and persisted immediately.
+    SetUiFont(String),
 
     // ---- Preferences persistence (#38) ----
     /// A preferences write finished. The result is intentionally ignored: a
@@ -422,6 +443,10 @@ impl Shell {
             // The gutter is a view-only preference the editor reads from
             // `show_line_numbers()`; it never rewrites the buffer, so resync=false.
             Message::ToggleLineNumbers => self.apply_core(core::Message::ToggleLineNumbers, false),
+            Message::SetEditorFont(family) => {
+                self.apply_core(core::Message::SetEditorFont(family), false)
+            }
+            Message::SetUiFont(family) => self.apply_core(core::Message::SetUiFont(family), false),
 
             // The preferences write landed (#38). Nothing to do: its result is
             // deliberately swallowed so a failed save never disrupts editing.
@@ -607,6 +632,14 @@ impl Shell {
         })
     }
 
+    /// The UI-chrome font as an [`iced::Font`] (#61), resolved from the persisted
+    /// `ui_font` preference. Threaded onto every chrome widget in `view` and the
+    /// sub-panels so the UI-font picker applies live (there is no runtime-mutable
+    /// app-wide default font in iced).
+    fn ui_font(&self) -> iced::Font {
+        fonts::resolve(self.core.ui_font())
+    }
+
     fn view(&self) -> Element<'_, Message> {
         let find_style = if self.core.find.open {
             button::primary
@@ -631,31 +664,37 @@ impl Shell {
         } else {
             button::secondary
         };
+        // The UI-chrome font (#61), resolved from the persisted preference and
+        // applied to every chrome widget below so the UI-font picker takes effect
+        // *live* (iced has no app-wide runtime default font — each widget must
+        // carry it). `Font` is `Copy`, so `ui` is threaded by value.
+        let ui = self.ui_font();
+        // A toolbar/label button whose text renders in the UI font.
+        let tbtn = |label: &'static str| button(text(label).font(ui));
         let toolbar = row![
-            button("New").on_press(Message::NewTab),
-            button("Open").on_press(Message::Open),
-            button("Save").on_press(Message::Save),
-            button("Save As").on_press(Message::SaveAs),
-            button("Undo").on_press(Message::Undo),
-            button("Redo").on_press(Message::Redo),
-            button("Find")
-                .style(find_style)
-                .on_press(Message::ToggleFind),
+            tbtn("New").on_press(Message::NewTab),
+            tbtn("Open").on_press(Message::Open),
+            tbtn("Save").on_press(Message::Save),
+            tbtn("Save As").on_press(Message::SaveAs),
+            tbtn("Undo").on_press(Message::Undo),
+            tbtn("Redo").on_press(Message::Redo),
+            tbtn("Find").style(find_style).on_press(Message::ToggleFind),
             // Zoom group (#35): shrink / reset / enlarge. The middle button shows
             // the current point size and resets it when clicked (Ctrl+0 in #39).
-            button("A\u{2212}").on_press(Message::ZoomOut),
-            button(text(format!("{} pt", self.core.font_size()))).on_press(Message::ZoomReset),
-            button("A+").on_press(Message::ZoomIn),
+            tbtn("A\u{2212}").on_press(Message::ZoomOut),
+            button(text(format!("{} pt", self.core.font_size())).font(ui))
+                .on_press(Message::ZoomReset),
+            tbtn("A+").on_press(Message::ZoomIn),
             // Word wrap toggle (#34): lit while wrapping is on.
-            button("Wrap")
+            tbtn("Wrap")
                 .style(wrap_style)
                 .on_press(Message::ToggleWordWrap),
             // Line-number gutter toggle (#41): lit while the gutter is shown.
-            button("#")
+            tbtn("#")
                 .style(nums_style)
                 .on_press(Message::ToggleLineNumbers),
             // About panel toggle (#40): lit while the panel is showing.
-            button("About")
+            tbtn("About")
                 .style(about_style)
                 .on_press(Message::ToggleAbout),
         ]
@@ -674,15 +713,16 @@ impl Shell {
                 button::secondary
             };
             tabs = tabs.push(
-                button(text(label))
+                button(text(label).font(ui))
                     .style(style)
                     .on_press(Message::TabSelected(i)),
             );
-            tabs = tabs.push(button("\u{00d7}").on_press(Message::TabClosed(i)));
+            tabs = tabs.push(button(text("\u{00d7}").font(ui)).on_press(Message::TabClosed(i)));
         }
 
         let editor = text_editor(&self.editor)
             .on_action(Message::Edit)
+            .font(fonts::resolve(self.core.editor_font()))
             .size(f32::from(self.core.font_size()))
             .wrapping(if self.core.word_wrap() {
                 Wrapping::Word
@@ -697,31 +737,58 @@ impl Shell {
             .height(Fill);
 
         let status: Element<'_, Message> = match &self.error {
-            Some(e) => text(format!("Error: {e}")).into(),
+            Some(e) => text(format!("Error: {e}")).font(ui).into(),
             None => {
                 let s = self.status();
                 // Caret position first, then a selection count only when there
                 // is one, then document size, language, EOL and encoding.
-                let mut cells = row![text(format!("Ln {}, Col {}", s.line, s.column))].spacing(16);
+                let mut cells =
+                    row![text(format!("Ln {}, Col {}", s.line, s.column)).font(ui)].spacing(16);
                 if s.selection > 0 {
-                    cells = cells.push(text(format!("Sel {}", s.selection)));
+                    cells = cells.push(text(format!("Sel {}", s.selection)).font(ui));
                 }
                 cells
-                    .push(text(format!("{} chars", s.chars)))
-                    .push(text(format!("{} lines", s.lines)))
-                    .push(text(s.language))
-                    .push(text(s.eol))
-                    .push(text(s.encoding))
+                    .push(text(format!("{} chars", s.chars)).font(ui))
+                    .push(text(format!("{} lines", s.lines)).font(ui))
+                    .push(text(s.language).font(ui))
+                    .push(text(s.eol).font(ui))
+                    .push(text(s.encoding).font(ui))
                     .into()
             }
         };
+
+        // Font pickers (#61): the editor-buffer font and the UI-chrome font, each
+        // a dropdown over the bundled family plus every OS-installed family. Both
+        // apply live — the editor font on the editor widget, the UI font on every
+        // chrome widget (including these pickers themselves).
+        let families = fonts::available_families();
+        let font_row = row![
+            text("Editor font:").font(ui),
+            pick_list(
+                families,
+                Some(self.core.editor_font().to_string()),
+                Message::SetEditorFont,
+            )
+            .font(ui)
+            .text_size(14),
+            text("UI font:").font(ui),
+            pick_list(
+                families,
+                Some(self.core.ui_font().to_string()),
+                Message::SetUiFont,
+            )
+            .font(ui)
+            .text_size(14),
+        ]
+        .spacing(6)
+        .align_y(iced::Alignment::Center);
 
         // The root column must fill the window on both axes. Left at its default
         // `Shrink`, iced's flex layout hands the editor a wrap width equal to the
         // widest non-fill sibling (the toolbar) instead of the window width, so
         // `Wrapping::Word` never has a real boundary to wrap against and long
         // lines overflow with no way to scroll (#34).
-        let mut layout = column![toolbar, tabs]
+        let mut layout = column![toolbar, tabs, font_row]
             .spacing(8)
             .padding(10)
             .width(Fill)
@@ -739,7 +806,7 @@ impl Shell {
         // While a file drags over the window, float the "drop to open" overlay on
         // top of everything (#42); otherwise the plain layout.
         if self.drag_hover {
-            stack![content, Self::drop_overlay()].into()
+            stack![content, Self::drop_overlay(ui)].into()
         } else {
             content.into()
         }
@@ -754,23 +821,24 @@ impl Shell {
             return row![].into(); // never rendered unless set; empty as a guard
         };
         let id = pending.id;
+        let ui = self.ui_font();
         let prompt = format!("\u{201c}{}\u{201d} has unsaved changes.", pending.title);
         container(
             row![
-                text(prompt),
-                button("Save")
+                text(prompt).font(ui),
+                button(text("Save").font(ui))
                     .style(button::primary)
                     .on_press(Message::CloseChoiceMade {
                         id,
                         choice: CloseChoice::Save,
                     }),
-                button("Don\u{2019}t Save").style(button::danger).on_press(
-                    Message::CloseChoiceMade {
+                button(text("Don\u{2019}t Save").font(ui))
+                    .style(button::danger)
+                    .on_press(Message::CloseChoiceMade {
                         id,
                         choice: CloseChoice::Discard,
-                    }
-                ),
-                button("Cancel")
+                    }),
+                button(text("Cancel").font(ui))
                     .style(button::secondary)
                     .on_press(Message::CloseChoiceMade {
                         id,
@@ -788,8 +856,8 @@ impl Shell {
     /// a "Drop files to open" card, mirroring the WebView build's drop overlay so
     /// the user sees a drop will land. Purely visual — it captures no input and
     /// disappears the instant the drag drops or leaves.
-    fn drop_overlay<'a>() -> Element<'a, Message> {
-        let card = container(text("Drop files to open").size(22))
+    fn drop_overlay<'a>(font: iced::Font) -> Element<'a, Message> {
+        let card = container(text("Drop files to open").font(font).size(22))
             .padding([16, 28])
             .style(|theme: &iced::Theme| {
                 let palette = theme.extended_palette();
@@ -824,22 +892,23 @@ impl Shell {
     /// message dialog, and an in-app panel stays fully offline and headlessly
     /// testable.
     fn about_panel(&self) -> Element<'_, Message> {
+        let ui = self.ui_font();
         let heading = format!("{APP_NAME} {}", env!("NOTEPAD_EXTRA_VERSION"));
         container(
             column![
-                text(heading).size(20),
-                text(LICENSE),
+                text(heading).font(ui).size(20),
+                text(LICENSE).font(ui),
                 row![
-                    button("Homepage")
+                    button(text("Homepage").font(ui))
                         .style(button::secondary)
                         .on_press(Message::OpenLink(HOMEPAGE_URL.to_string())),
-                    button("License")
+                    button(text("License").font(ui))
                         .style(button::secondary)
                         .on_press(Message::OpenLink(LICENSE_URL.to_string())),
-                    button("Report an issue")
+                    button(text("Report an issue").font(ui))
                         .style(button::secondary)
                         .on_press(Message::OpenLink(ISSUES_URL.to_string())),
-                    button("Close")
+                    button(text("Close").font(ui))
                         .style(button::primary)
                         .on_press(Message::CloseAbout),
                 ]
@@ -856,6 +925,7 @@ impl Shell {
     /// only renders it and maps widget events back to shell messages.
     fn find_bar(&self) -> Element<'_, Message> {
         let find = &self.core.find;
+        let ui = self.ui_font();
 
         let readout = if let Some(err) = &find.error {
             format!("\u{26a0} {err}")
@@ -871,32 +941,40 @@ impl Shell {
 
         let find_row = row![
             text_input("Find", &find.query)
+                .font(ui)
                 .on_input(Message::FindQueryChanged)
                 .on_submit(Message::FindNext)
                 .width(Length::Fixed(220.0)),
-            button("Prev").on_press(Message::FindPrev),
-            button("Next").on_press(Message::FindNext),
-            option_button("Aa", find.options.case_sensitive, FindOption::CaseSensitive),
-            option_button("W", find.options.whole_word, FindOption::WholeWord),
-            option_button(".*", find.options.regex, FindOption::Regex),
-            text(readout),
-            button("\u{00d7}").on_press(Message::CloseFind),
+            button(text("Prev").font(ui)).on_press(Message::FindPrev),
+            button(text("Next").font(ui)).on_press(Message::FindNext),
+            option_button(
+                "Aa",
+                find.options.case_sensitive,
+                FindOption::CaseSensitive,
+                ui
+            ),
+            option_button("W", find.options.whole_word, FindOption::WholeWord, ui),
+            option_button(".*", find.options.regex, FindOption::Regex, ui),
+            text(readout).font(ui),
+            button(text("\u{00d7}").font(ui)).on_press(Message::CloseFind),
         ]
         .spacing(6);
 
         let replace_row = row![
             text_input("Replace with", &find.replacement)
+                .font(ui)
                 .on_input(Message::ReplaceQueryChanged)
                 .on_submit(Message::ReplaceOne)
                 .width(Length::Fixed(220.0)),
-            button("Replace").on_press(Message::ReplaceOne),
-            button("All").on_press(Message::ReplaceAll),
-            text("Go to line:"),
+            button(text("Replace").font(ui)).on_press(Message::ReplaceOne),
+            button(text("All").font(ui)).on_press(Message::ReplaceAll),
+            text("Go to line:").font(ui),
             text_input("n", &self.goto_input)
+                .font(ui)
                 .on_input(Message::GoToInputChanged)
                 .on_submit(Message::GoToSubmit)
                 .width(Length::Fixed(70.0)),
-            button("Go").on_press(Message::GoToSubmit),
+            button(text("Go").font(ui)).on_press(Message::GoToSubmit),
         ]
         .spacing(6);
 
@@ -907,17 +985,19 @@ impl Shell {
 }
 
 /// A search-option toggle button, highlighted (primary) while the option is on.
+/// Takes the UI font (#61) so it matches the rest of the chrome.
 fn option_button<'a>(
     label: &'a str,
     active: bool,
     option: FindOption,
+    font: iced::Font,
 ) -> iced::widget::Button<'a, Message> {
     let style = if active {
         button::primary
     } else {
         button::secondary
     };
-    button(text(label))
+    button(text(label).font(font))
         .style(style)
         .on_press(Message::ToggleOption(option))
 }
@@ -1523,6 +1603,8 @@ mod tests {
         let _ = session1.update(Message::ToggleWordWrap);
         let _ = session1.update(Message::ZoomIn);
         let _ = session1.update(Message::ZoomIn);
+        let _ = session1.update(Message::SetEditorFont("Fira Code".into()));
+        let _ = session1.update(Message::SetUiFont("Inter".into()));
         let saved_size = session1.core.font_size();
         assert_ne!(
             saved_size,
@@ -1540,6 +1622,33 @@ mod tests {
             .apply_preferences(&load_preferences_from(&path));
         assert_eq!(session2.core.font_size(), saved_size, "zoom restored");
         assert!(session2.core.word_wrap(), "word-wrap restored");
+        assert_eq!(
+            session2.core.editor_font(),
+            "Fira Code",
+            "editor font restored"
+        );
+        assert_eq!(session2.core.ui_font(), "Inter", "UI font restored");
+    }
+
+    #[test]
+    fn font_pickers_change_the_core_fonts_independently() {
+        // The two pickers drive independent core prefs; picking one leaves the
+        // other untouched (both start at the bundled default).
+        let (mut shell, _) = Shell::new();
+        assert_eq!(shell.core.editor_font(), fonts::BUNDLED_FAMILY);
+        assert_eq!(shell.core.ui_font(), fonts::BUNDLED_FAMILY);
+
+        let _ = shell.update(Message::SetEditorFont("Iosevka".into()));
+        assert_eq!(shell.core.editor_font(), "Iosevka");
+        assert_eq!(
+            shell.core.ui_font(),
+            fonts::BUNDLED_FAMILY,
+            "UI font untouched by the editor picker"
+        );
+
+        let _ = shell.update(Message::SetUiFont("Noto Sans".into()));
+        assert_eq!(shell.core.ui_font(), "Noto Sans");
+        assert_eq!(shell.core.editor_font(), "Iosevka", "editor font untouched");
     }
 
     #[test]

@@ -31,6 +31,16 @@
 //!     }
 //! }
 //! ```
+//!
+//! ---
+//!
+//! **VENDORED FORK.** This is a fork of iced 0.14's `text_editor` widget, carried
+//! in-tree because it adds capabilities the upstream widget does not expose: a
+//! visible scrollbar + scroll offset (#34), a line-number gutter / active-line /
+//! bracket-match (#41), and (later) syntect highlighting (#32). Every local
+//! change is tagged `// NOTEPAD-EXTRA(#NN): …` so `rg NOTEPAD-EXTRA` lists the
+//! full divergence set and re-basing onto a newer iced is mechanical. See
+//! `crates/iced/VENDORED.md` for provenance and the re-vendor policy.
 use iced_core::alignment;
 use iced_core::clipboard::{self, Clipboard};
 use iced_core::input_method;
@@ -59,6 +69,11 @@ use std::ops;
 use std::ops::DerefMut;
 use std::sync::Arc;
 
+// NOTEPAD-EXTRA(#79): the renderer-free gutter/scrollbar maths lives in the pure,
+// coverage-gated `notepad_core::geometry`; this widget keeps only the `iced`-typed
+// assembly around it.
+use notepad_core::geometry;
+
 pub use text::editor::{Action, Cursor, Edit, Line, LineEnding, Motion, Position, Selection};
 
 /// Creates a new [`TextEditor`] from the given [`Content`]. Mirrors the helper
@@ -74,6 +89,7 @@ pub fn text_editor<Message>(content: &Content) -> TextEditor<'_, highlighter::Pl
 /// buffer. Reaching it is the whole reason this widget is vendored (#34): with
 /// it we can size and place a real scrollbar thumb, which iced's own
 /// `text_editor` never draws.
+// NOTEPAD-EXTRA(#34): the scroll offset the generic `Editor` trait doesn't expose.
 pub trait ScrollOffset {
     /// Pixels scrolled past the top of the content (0.0 when at the top).
     fn scroll_top(&self) -> f32;
@@ -97,6 +113,7 @@ pub trait ScrollOffset {
     fn glyph_bounds(&self, line: usize, byte_col: usize) -> Option<(f32, f32, f32)>;
 }
 
+// NOTEPAD-EXTRA(#34): read the concrete software-renderer editor's scroll state.
 impl ScrollOffset for iced_graphics::text::Editor {
     fn scroll_top(&self) -> f32 {
         // cosmic-text stores the scroll as `{ line, vertical, horizontal }`
@@ -183,6 +200,7 @@ impl ScrollOffset for iced_graphics::text::Editor {
 /// from the core's byte offsets with `find::line_col_of`. `partner == None`
 /// marks an unbalanced bracket, which the widget draws in a distinct colour.
 #[derive(Debug, Clone, Copy, PartialEq)]
+// NOTEPAD-EXTRA(#41): bracket-match pair the shell asks the widget to highlight.
 pub struct BracketHighlight {
     /// The bracket adjacent to the caret.
     pub here: Position,
@@ -190,39 +208,15 @@ pub struct BracketHighlight {
     pub partner: Option<Position>,
 }
 
-/// Padding on each side of the numbers inside the line-number gutter (#41).
-const GUTTER_PAD: f32 = 6.0;
-
-/// Width in logical pixels of the line-number gutter for a document of
-/// `line_count` lines at `text_size` px, or `0.0` when disabled (#41).
-///
-/// Sized to hold the widest line number (its digit count) plus a little padding
-/// each side; numbers are right-aligned within it. A **pure** function so
-/// `layout`, `update`, `mouse_interaction` and `draw` all reserve exactly the
-/// same strip — they must agree or clicks land on the wrong column — and so it
-/// is unit-testable with no renderer.
-fn gutter_width(enabled: bool, line_count: usize, text_size: f32) -> f32 {
-    if !enabled {
-        return 0.0;
-    }
-    // ~0.6 em per digit is a safe overestimate for the proportional default
-    // font; right-aligned numbers simply sit within the reserved column.
-    let digits = digit_count(line_count) as f32;
-    (digits * text_size * 0.6).ceil() + GUTTER_PAD * 2.0
-}
-
-/// Number of decimal digits in `n`, at least 1 (a one-line document still shows
-/// "1"). Used to size the gutter to its largest line number.
-fn digit_count(n: usize) -> u32 {
-    n.max(1).ilog10() + 1
-}
-
+// NOTEPAD-EXTRA(#79): gutter width, digit count and the inset clamp moved to
+// `notepad_core::geometry` (tested under the coverage gate). This widget keeps
+// only the `Rectangle` assembly around those numbers.
 /// Inset the left edge of `rect` by `gutter` pixels, clamping the width at 0 so a
 /// gutter wider than the widget can never make it negative (#41).
 fn inset_left(rect: Rectangle, gutter: f32) -> Rectangle {
     Rectangle {
         x: rect.x + gutter,
-        width: (rect.width - gutter).max(0.0),
+        width: geometry::inset_width(rect.width, gutter),
         ..rect
     }
 }
@@ -295,6 +289,7 @@ where
     highlighter_settings: Highlighter::Settings,
     highlighter_format: fn(&Highlighter::Highlight, &Theme) -> highlighter::Format<Renderer::Font>,
     last_status: Option<Status>,
+    // NOTEPAD-EXTRA(#41): editor-niceties state — gutter, active line, bracket.
     /// Whether to draw the line-number gutter (#41).
     line_numbers: bool,
     /// Whether to highlight the caret's line (#41).
@@ -420,6 +415,7 @@ where
         self
     }
 
+    // NOTEPAD-EXTRA(#41): builder setters + `gutter()` for the editor niceties.
     /// Shows or hides the line-number gutter down the left edge (#41).
     pub fn line_numbers(mut self, show: bool) -> Self {
         self.line_numbers = show;
@@ -445,7 +441,7 @@ where
     fn gutter(&self, renderer: &Renderer) -> f32 {
         let line_count = self.content.0.borrow().editor.line_count();
         let text_size = self.text_size.unwrap_or_else(|| renderer.default_size());
-        gutter_width(self.line_numbers, line_count, text_size.0)
+        geometry::gutter_width(self.line_numbers, line_count, text_size.0)
     }
 
     /// Highlights the [`TextEditor`] using the given syntax and theme.
@@ -549,7 +545,8 @@ where
         // the text, not the numbers. Computed from the editor's own line count to
         // avoid re-borrowing `content` while `internal` is held.
         let text_size = self.text_size.unwrap_or_else(|| renderer.default_size());
-        let gutter = gutter_width(self.line_numbers, internal.editor.line_count(), text_size.0);
+        let gutter =
+            geometry::gutter_width(self.line_numbers, internal.editor.line_count(), text_size.0);
         let text_bounds = inset_left(bounds.shrink(self.padding), gutter);
         let translation = text_bounds.position() - Point::ORIGIN;
 
@@ -747,6 +744,7 @@ enum ThumbDrag {
 /// Shared by `draw` (to render) and `update` (to hit-test the thumb) so the two
 /// never disagree about where the thumb is.
 #[derive(Clone, Copy)]
+// NOTEPAD-EXTRA(#34): scrollbar track/thumb geometry + the `*_bar` helpers below.
 struct BarGeometry {
     track: Rectangle,
     thumb: Rectangle,
@@ -763,20 +761,17 @@ fn horizontal_bar(text_bounds: Rectangle, content_width: f32, offset: f32) -> Ba
         width: text_bounds.width,
         height: thickness,
     };
-    let ratio = (text_bounds.width / content_width).min(1.0);
-    let thumb_width = (track.width * ratio).max(24.0);
-    let max_offset = (content_width - text_bounds.width).max(1.0);
-    let travel = track.width - thumb_width;
-    let x = track.x + travel * (offset.clamp(0.0, max_offset) / max_offset);
+    // NOTEPAD-EXTRA(#79): thumb sizing/placement is the tested `geometry::scroll_thumb`.
+    let thumb = geometry::scroll_thumb(text_bounds.width, content_width, offset, track.width);
     BarGeometry {
         track,
         thumb: Rectangle {
-            x,
+            x: track.x + thumb.offset_along_track,
             y: track.y,
-            width: thumb_width,
+            width: thumb.length,
             height: thickness,
         },
-        max_offset,
+        max_offset: thumb.max_scroll,
     }
 }
 
@@ -796,20 +791,18 @@ fn vertical_bar(
         width: thickness,
         height: text_bounds.height,
     };
-    let ratio = (text_bounds.height / content_height).min(1.0);
-    let thumb_height = (track.height * ratio).max(24.0);
-    let max_offset = (content_height - text_bounds.height).max(1.0);
-    let travel = track.height - thumb_height;
-    let y = track.y + travel * (scroll_top.clamp(0.0, max_offset) / max_offset);
+    // NOTEPAD-EXTRA(#79): thumb sizing/placement is the tested `geometry::scroll_thumb`.
+    let thumb =
+        geometry::scroll_thumb(text_bounds.height, content_height, scroll_top, track.height);
     BarGeometry {
         track,
         thumb: Rectangle {
             x: track.x,
-            y,
+            y: track.y + thumb.offset_along_track,
             width: thickness,
-            height: thumb_height,
+            height: thumb.length,
         },
-        max_offset,
+        max_offset: thumb.max_scroll,
     }
 }
 
@@ -926,7 +919,8 @@ where
         // must wrap against the *reduced* width — otherwise wrapped lines would
         // run under the gutter on the next row. Shrinking the viewport here is
         // what keeps wrapping, click hit-testing and drawing consistent.
-        let gutter = gutter_width(self.line_numbers, internal.editor.line_count(), text_size.0);
+        let gutter =
+            geometry::gutter_width(self.line_numbers, internal.editor.line_count(), text_size.0);
         let viewport = {
             let v = limits.shrink(self.padding).max();
             Size::new((v.width - gutter).max(0.0), v.height)
@@ -1079,7 +1073,11 @@ where
                     internal.editor.content_height(),
                     internal.editor.scroll_top(),
                     internal.editor.line_height(),
-                    gutter_width(self.line_numbers, internal.editor.line_count(), text_size.0),
+                    geometry::gutter_width(
+                        self.line_numbers,
+                        internal.editor.line_count(),
+                        text_size.0,
+                    ),
                 )
             };
             // The horizontal bar lives in the text area, right of the gutter (#41).
@@ -1392,7 +1390,8 @@ where
         // (gutter + text); `text_bounds` is just the text.
         let text_size = self.text_size.unwrap_or_else(|| renderer.default_size());
         let base = bounds.shrink(self.padding);
-        let gutter = gutter_width(self.line_numbers, internal.editor.line_count(), text_size.0);
+        let gutter =
+            geometry::gutter_width(self.line_numbers, internal.editor.line_count(), text_size.0);
         let text_bounds = inset_left(base, gutter);
         let line_h = f32::from(self.line_height.to_absolute(text_size));
 
@@ -1619,7 +1618,7 @@ where
         // The caret's line is drawn at full strength, the rest muted.
         if gutter > 0.0 {
             let active = internal.editor.cursor().position.line;
-            let right = base.x + gutter - GUTTER_PAD;
+            let right = base.x + gutter - geometry::GUTTER_PAD;
             let clip = Rectangle {
                 x: base.x,
                 y: text_bounds.y,
@@ -1702,7 +1701,11 @@ where
                     internal.editor.min_bounds().width,
                     internal.editor.content_height(),
                     internal.editor.scroll_top(),
-                    gutter_width(self.line_numbers, internal.editor.line_count(), text_size.0),
+                    geometry::gutter_width(
+                        self.line_numbers,
+                        internal.editor.line_count(),
+                        text_size.0,
+                    ),
                 )
             };
             // The horizontal bar sits in the text area, right of the gutter (#41).
@@ -2159,46 +2162,102 @@ pub(crate) fn convert_macos_shortcut(
 
 #[cfg(test)]
 mod tests {
-    //! Headless tests for the pure gutter geometry (#41). The rendering itself
-    //! needs a GPU/window and is exercised by running the app; these cover the
-    //! width maths that `layout`, `update` and `draw` must all agree on.
+    //! Headless tests for the widget's thin geometry wrappers. The pure gutter /
+    //! scrollbar maths itself is tested in `notepad_core::geometry` (#79, under
+    //! the coverage gate); this only checks the `Rectangle` assembly around it.
+    //!
+    //! Plus guards for the `// NOTEPAD-EXTRA(#NN)` divergence markers (#78): this
+    //! is a *fork* of iced's widget, and those markers are how a re-vendor knows
+    //! what to re-apply. The tests below fail if a marker is malformed, if a known
+    //! divergence loses the marker above it, or if a whole issue's markers vanish
+    //! — so the fork can never quietly drift out of sync with its documentation.
     use super::*;
 
+    /// The issue number in a `// NOTEPAD-EXTRA(#NN): <description>` marker line,
+    /// or `None` if the line is not a well-formed marker. Doubles as the format
+    /// check: a non-empty description after `): ` is required.
+    fn marker_issue(line: &str) -> Option<u32> {
+        let rest = line.trim_start().strip_prefix("// NOTEPAD-EXTRA(#")?;
+        let (digits, description) = rest.split_once("): ")?;
+        if description.trim().is_empty() {
+            return None;
+        }
+        digits.parse::<u32>().ok()
+    }
+
+    /// This file's own source, embedded at compile time so the check is hermetic.
+    const SOURCE: &str = include_str!("text_editor.rs");
+
     #[test]
-    fn gutter_is_zero_when_disabled() {
-        assert_eq!(gutter_width(false, 100_000, 14.0), 0.0);
+    fn every_marker_line_is_well_formed() {
+        for (i, line) in SOURCE.lines().enumerate() {
+            if line.trim_start().starts_with("// NOTEPAD-EXTRA(") {
+                assert!(
+                    marker_issue(line).is_some(),
+                    "malformed NOTEPAD-EXTRA marker on line {}: {line:?}\n\
+                     expected `// NOTEPAD-EXTRA(#<issue>): <description>`",
+                    i + 1,
+                );
+            }
+        }
     }
 
     #[test]
-    fn gutter_grows_with_the_line_count_digits() {
-        // Same font, more digits ⇒ a wider gutter; each order of magnitude adds a
-        // digit's worth of width, and it never shrinks.
-        let one = gutter_width(true, 9, 14.0);
-        let two = gutter_width(true, 99, 14.0);
-        let three = gutter_width(true, 999, 14.0);
-        assert!(one < two, "two digits must be wider than one");
-        assert!(two < three, "three digits must be wider than two");
-        // A single-line document still reserves room for "1".
-        assert!(gutter_width(true, 1, 14.0) > 0.0);
+    fn each_key_divergence_keeps_its_marker() {
+        let lines: Vec<&str> = SOURCE.lines().collect();
+        // (issue, a substring uniquely identifying a divergent item). The nearest
+        // marker *above* each must be for that issue — so renaming or moving a
+        // divergence without re-marking it fails here.
+        let anchors: &[(u32, &str)] = &[
+            (34, "pub trait ScrollOffset {"),
+            (34, "impl ScrollOffset for iced_graphics::text::Editor {"),
+            (34, "struct BarGeometry {"),
+            (41, "pub struct BracketHighlight {"),
+            (41, "    line_numbers: bool,"),
+            (
+                41,
+                "    pub fn line_numbers(mut self, show: bool) -> Self {",
+            ),
+            (79, "use notepad_core::geometry;"),
+            (
+                79,
+                "fn inset_left(rect: Rectangle, gutter: f32) -> Rectangle {",
+            ),
+        ];
+        for &(issue, anchor) in anchors {
+            let idx = lines
+                .iter()
+                .position(|l| l.contains(anchor))
+                .unwrap_or_else(|| {
+                    panic!("divergence anchor vanished (moved/renamed?): {anchor:?}")
+                });
+            let nearest = (0..idx).rev().find_map(|j| marker_issue(lines[j]));
+            assert_eq!(
+                nearest,
+                Some(issue),
+                "the nearest NOTEPAD-EXTRA marker above {anchor:?} (line {}) is {nearest:?}, \
+                 not #{issue}",
+                idx + 1,
+            );
+        }
     }
 
     #[test]
-    fn gutter_scales_with_font_size() {
-        assert!(gutter_width(true, 100, 24.0) > gutter_width(true, 100, 12.0));
+    fn every_documented_divergence_issue_has_a_marker() {
+        let issues: std::collections::BTreeSet<u32> =
+            SOURCE.lines().filter_map(marker_issue).collect();
+        // The divergences catalogued in VENDORED.md: scrollbar (#34), editor
+        // niceties (#41), and the geometry extraction (#79).
+        for expected in [34u32, 41, 79] {
+            assert!(
+                issues.contains(&expected),
+                "no NOTEPAD-EXTRA(#{expected}) marker remains — a documented divergence lost its tag",
+            );
+        }
     }
 
     #[test]
-    fn digit_count_counts_decimal_digits() {
-        assert_eq!(digit_count(0), 1); // empty/one-line document → "1"
-        assert_eq!(digit_count(1), 1);
-        assert_eq!(digit_count(9), 1);
-        assert_eq!(digit_count(10), 2);
-        assert_eq!(digit_count(999), 3);
-        assert_eq!(digit_count(1000), 4);
-    }
-
-    #[test]
-    fn inset_left_never_produces_a_negative_width() {
+    fn inset_left_applies_the_core_clamp_to_a_rectangle() {
         let rect = Rectangle {
             x: 10.0,
             y: 0.0,
@@ -2206,7 +2265,10 @@ mod tests {
             height: 5.0,
         };
         let inset = inset_left(rect, 50.0); // gutter wider than the rect
+        // Width clamps at zero (via `geometry::inset_width`), x shifts by the gutter.
         assert_eq!(inset.width, 0.0);
         assert_eq!(inset.x, 60.0);
+        assert_eq!(inset.y, rect.y, "other fields are preserved");
+        assert_eq!(inset.height, rect.height);
     }
 }

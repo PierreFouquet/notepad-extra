@@ -83,7 +83,7 @@ jobs:
           echo "shell started and ran under xvfb"
 
   coverage:
-    name: "core — coverage gate"
+    name: "core + syntax — coverage gate"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

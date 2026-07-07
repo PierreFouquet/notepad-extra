@@ -1698,7 +1698,10 @@ mod tests {
             path: PathBuf::from("/tmp/x.rs"),
             result: Ok("fn main() {}\n".to_string()),
         });
-        assert_ne!(shell.repaint_nudge, base, "opening a file must flip the nudge");
+        assert_ne!(
+            shell.repaint_nudge, base,
+            "opening a file must flip the nudge"
+        );
         let after_open = shell.repaint_nudge;
 
         // A message that doesn't change the language must NOT flip it.

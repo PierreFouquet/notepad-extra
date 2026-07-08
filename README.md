@@ -40,11 +40,13 @@ under `src-tauri/dist/vendor/codemirror/mode/`, add it to `MODE_SCRIPTS`, then r
 | Open | `Ctrl/Cmd + O` |
 | Save | `Ctrl/Cmd + S` |
 | Save As | `Ctrl/Cmd + Shift + S` |
+| Undo / Redo | `Ctrl/Cmd + Z` / `Ctrl/Cmd + Shift + Z` or `Ctrl/Cmd + Y` |
 | Find | `Ctrl/Cmd + F` |
 | Replace | `Ctrl/Cmd + H` |
 | Find next / previous | `F3` / `Shift + F3` |
 | Go to line | `Ctrl/Cmd + G` |
 | Zoom in / out / reset | `Ctrl/Cmd + +` / `-` / `0` |
+| Close find bar / About panel | `Esc` |
 
 ## Native rewrite (in progress)
 

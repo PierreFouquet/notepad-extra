@@ -89,6 +89,126 @@ fn on_window_event(
     }
 }
 
+/// Map a key press to a shell [`Message`] for the global keyboard-shortcut
+/// subscription (#39). Pure and unit-testable, like [`on_window_event`]. Handles
+/// both the named-key shortcuts and the Ctrl/Cmd character accelerators so every
+/// shortcut works from any focus (and immediately after launch, before the editor
+/// is clicked) — matching the WebView build's document-level listener.
+///
+/// * **F3 / Shift+F3** — find next / previous.
+/// * **Escape** — dismiss the About panel or find bar (resolved against live
+///   state in [`Shell::dispatch`]).
+/// * the [`command_shortcut`] table — Ctrl/Cmd+N/O/S/Z/… .
+///
+/// A passive subscription can't stop the *focused* editor from also inserting the
+/// character an accelerator is built from (Ctrl+= would type "="), so
+/// [`editor_key_binding`] suppresses that insertion in the widget; this stays the
+/// single place a shortcut's message is published.
+fn on_key(key: iced::keyboard::Key, modifiers: iced::keyboard::Modifiers) -> Option<Message> {
+    use iced::keyboard::Key;
+    use iced::keyboard::key::Named;
+
+    match key.as_ref() {
+        Key::Named(Named::F3) => {
+            return Some(if modifiers.shift() {
+                Message::FindPrev
+            } else {
+                Message::FindNext
+            });
+        }
+        Key::Named(Named::Escape) => return Some(Message::Escape),
+        _ => {}
+    }
+    command_shortcut(&key, modifiers)
+}
+
+/// The Ctrl/Cmd **character** accelerator table (#39), shared by the global
+/// [`on_key`] subscription (which publishes the message) and [`editor_key_binding`]
+/// (which suppresses the matching character insertion in the focused editor). The
+/// table matches the WebView build's global shortcuts (`src-tauri/dist/main.js`):
+///
+/// * **Ctrl/Cmd+N / O / S** — new / open / save (**+Shift** on `S` = save as).
+/// * **Ctrl/Cmd+Z / Ctrl/Cmd+Shift+Z / Ctrl/Cmd+Y** — undo / redo.
+/// * **Ctrl/Cmd+F / H / G** — open the find bar (its find, replace and go-to
+///   fields share one bar, so all three simply open it).
+/// * **Ctrl/Cmd+ = / + / - / _ / 0** — zoom in / out / reset.
+///
+/// The "command" key is Ctrl elsewhere and ⌘ on macOS ([`iced::keyboard::Modifiers::command`]),
+/// so one table serves every platform. We read the unmodified `key` plus the
+/// modifier bits (not the shifted `modified_key`) so the match is layout
+/// independent. Anything else — plain typing, or the editor's own Ctrl+C/V/X/A —
+/// maps to `None`.
+fn command_shortcut(
+    key: &iced::keyboard::Key,
+    modifiers: iced::keyboard::Modifiers,
+) -> Option<Message> {
+    use iced::keyboard::Key;
+
+    if !modifiers.command() {
+        return None;
+    }
+    let Key::Character(c) = key.as_ref() else {
+        return None;
+    };
+    match c.to_ascii_lowercase().as_str() {
+        "n" => Some(Message::NewTab),
+        "o" => Some(Message::Open),
+        "s" => Some(if modifiers.shift() {
+            Message::SaveAs
+        } else {
+            Message::Save
+        }),
+        "z" => Some(if modifiers.shift() {
+            Message::Redo
+        } else {
+            Message::Undo
+        }),
+        "y" => Some(Message::Redo),
+        "f" | "h" | "g" => Some(Message::OpenFind),
+        "=" | "+" => Some(Message::ZoomIn),
+        "-" | "_" => Some(Message::ZoomOut),
+        "0" => Some(Message::ZoomReset),
+        _ => None,
+    }
+}
+
+/// The editor's key-binding closure (#39). Its sole job is to stop the *focused*
+/// editor from typing the character behind a Ctrl/Cmd accelerator: [`on_key`]
+/// already publishes the message from the global subscription (from any focus),
+/// but the focused editor would still insert e.g. "=" for Ctrl+=. When the editor
+/// is focused and the key is one of our accelerators ([`command_shortcut`]), we
+/// return an empty `Binding::Sequence`, which the widget *consumes* (so nothing is
+/// inserted) while doing nothing itself — keeping the subscription the single
+/// place the message is published, with no double-fire. Every other key defers to
+/// the widget's stock [`text_editor::Binding::from_key_press`] (typing, motions,
+/// copy/paste, …).
+fn editor_key_binding(key_press: text_editor::KeyPress) -> Option<text_editor::Binding<Message>> {
+    if matches!(key_press.status, text_editor::Status::Focused { .. })
+        && command_shortcut(&key_press.key, key_press.modifiers).is_some()
+    {
+        // Consume the key without acting; `on_key` publishes the message globally.
+        return Some(text_editor::Binding::Sequence(Vec::new()));
+    }
+    text_editor::Binding::from_key_press(key_press)
+}
+
+/// Route a raw runtime event to a shell message for the passive subscription:
+/// keyboard shortcuts go through [`on_key`] (#39), every other event through the
+/// drag-and-drop window mapper ([`on_window_event`], #42). The focused editor's
+/// stray character insertion is suppressed separately (see [`editor_key_binding`]).
+fn on_event(
+    event: iced::Event,
+    status: iced::event::Status,
+    id: iced::window::Id,
+) -> Option<Message> {
+    match &event {
+        iced::Event::Keyboard(iced::keyboard::Event::KeyPressed { key, modifiers, .. }) => {
+            on_key(key.clone(), *modifiers)
+        }
+        _ => on_window_event(event, status, id),
+    }
+}
+
 /// The window / taskbar icon, decoded from the embedded `icons/icon.png` (#66).
 ///
 /// The PNG travels *inside* the binary via `include_bytes!`, so the icon needs
@@ -170,6 +290,11 @@ enum Message {
     // ---- Find / Replace / Go-to-line (#33) ----
     /// Show or hide the find / replace bar.
     ToggleFind,
+    /// Open the find / replace bar (idempotent — a no-op if already open). The
+    /// Ctrl+F / Ctrl+H / Ctrl+G accelerators (#39) all route here: the native bar
+    /// shows the find, replace and go-to fields together, so one "open" serves
+    /// all three.
+    OpenFind,
     /// Close the find / replace bar.
     CloseFind,
     /// The search pattern input changed.
@@ -190,26 +315,26 @@ enum Message {
     GoToSubmit,
 
     // ---- Editor zoom / font size (#35) ----
-    /// Enlarge / shrink / reset the editor font. Key accelerators (Ctrl+ +/-/0)
-    /// are wired with the rest of the shortcuts in #39; these drive the toolbar
-    /// buttons for now.
+    /// Enlarge / shrink / reset the editor font. Driven by the toolbar zoom group
+    /// and the Ctrl+ = / + / - / _ / 0 accelerators (#39).
     ZoomIn,
     ZoomOut,
     ZoomReset,
 
     // ---- Word wrap (#34) ----
-    /// Toggle soft word-wrap. Driven by the toolbar button; a key accelerator
-    /// arrives with the rest in #39.
+    /// Toggle soft word-wrap. Toolbar-driven, with no key accelerator — the
+    /// WebView build bound none for it either, so #39 adds none (its shortcut set
+    /// mirrors that build's).
     ToggleWordWrap,
 
     // ---- Line numbers (#41) ----
-    /// Toggle the line-number gutter. Driven by the toolbar button; a key
-    /// accelerator arrives with the rest in #39.
+    /// Toggle the line-number gutter. Toolbar-driven, no key accelerator (see
+    /// [`Message::ToggleWordWrap`]).
     ToggleLineNumbers,
 
     // ---- Light / Dark theme (#36) ----
-    /// Toggle the UI theme between light and dark. Driven by the toolbar button;
-    /// a key accelerator arrives with the rest in #39.
+    /// Toggle the UI theme between light and dark. Toolbar-driven, no key
+    /// accelerator (see [`Message::ToggleWordWrap`]).
     ToggleTheme,
 
     // ---- Font family selection (#61) ----
@@ -243,6 +368,14 @@ enum Message {
     /// app stays offline and a failed hand-off to the OS handler must not
     /// interrupt editing (mirrors `PreferencesSaved`).
     LinkOpened,
+
+    // ---- Keyboard shortcuts (#39) ----
+    /// The Escape key: contextually dismiss the top-most transient panel — the
+    /// About panel first, then the find bar — matching the WebView build's
+    /// priority. A no-op when neither is open. The remaining accelerators reuse
+    /// the existing intents (New, Save, Undo, …); only Escape needs the current
+    /// state to decide what it means, so only it gets its own message.
+    Escape,
 }
 
 /// The user's answer to the close-with-unsaved prompt (#31).
@@ -376,7 +509,8 @@ impl Shell {
             Message::Save => self.apply_core(core::Message::SaveRequested, false),
             Message::SaveAs => self.apply_core(core::Message::SaveAsRequested, false),
             // Undo/redo rewrite the buffer in the core, so resync the editor from
-            // it. Keyboard accelerators (Ctrl+Z / Ctrl+Y) are wired in #39.
+            // it. Reached from the toolbar and the Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y
+            // accelerators (#39).
             Message::Undo => self.apply_core(core::Message::Undo, true),
             Message::Redo => self.apply_core(core::Message::Redo, true),
             Message::TabSelected(i) => self.apply_core(core::Message::TabSelected(i), true),
@@ -478,6 +612,15 @@ impl Shell {
                 };
                 self.apply_core(msg, false)
             }
+            // Idempotent open (#39): only ask the core to open if it isn't already,
+            // so a repeated Ctrl+F never toggles the bar shut.
+            Message::OpenFind => {
+                if self.core.find.open {
+                    Task::none()
+                } else {
+                    self.apply_core(core::Message::FindOpened, false)
+                }
+            }
             Message::CloseFind => self.apply_core(core::Message::FindClosed, false),
             Message::FindQueryChanged(q) => {
                 self.apply_core(core::Message::FindQueryChanged(q), false)
@@ -553,6 +696,19 @@ impl Shell {
             // The external open finished; its result is swallowed (see the doc on
             // `Message::LinkOpened`).
             Message::LinkOpened => Task::none(),
+
+            // Escape (#39): dismiss the top-most transient panel, About first then
+            // the find bar (matching the WebView priority); a no-op otherwise. The
+            // vendored editor separately unfocuses on Escape, which is harmless.
+            Message::Escape => {
+                if self.core.about_open() {
+                    self.apply_core(core::Message::AboutClosed, false)
+                } else if self.core.find.open {
+                    self.apply_core(core::Message::FindClosed, false)
+                } else {
+                    Task::none()
+                }
+            }
         }
     }
 
@@ -571,11 +727,11 @@ impl Shell {
         })
     }
 
-    /// Passive subscriptions: currently just drag-and-drop file opening (#42),
-    /// which surfaces as raw window `FileDropped` events mapped by
-    /// [`on_window_event`].
+    /// Passive subscriptions: global keyboard shortcuts (#39) and drag-and-drop
+    /// file opening (#42), both surfaced as raw runtime events and mapped to shell
+    /// messages by [`on_event`] (which fans out to [`on_key`] / [`on_window_event`]).
     fn subscription(&self) -> Subscription<Message> {
-        iced::event::listen_with(on_window_event)
+        iced::event::listen_with(on_event)
     }
 
     /// Feed one message through the pure core, run every [`Effect`] it returns,
@@ -831,6 +987,10 @@ impl Shell {
 
         let editor = text_editor(&self.editor)
             .on_action(Message::Edit)
+            // Keyboard shortcuts (#39): the character accelerators (Ctrl+S, Ctrl+=,
+            // …) are handled here so the widget consumes the key rather than typing
+            // its character; F3/Escape stay global (see `on_key`).
+            .key_binding(editor_key_binding)
             .font(fonts::resolve(self.core.editor_font()))
             .size(f32::from(self.core.font_size()))
             .wrapping(if self.core.word_wrap() {
@@ -2034,6 +2194,253 @@ mod tests {
         assert!(shell.error.is_none());
         assert_eq!(shell.editor.text().trim_end(), "in progress");
         assert!(shell.core.active_doc().dirty());
+    }
+
+    // ---- Keyboard shortcuts (#39) ----
+
+    use iced::keyboard::key::Named;
+    use iced::keyboard::{Key, Modifiers};
+
+    /// A character key, as the runtime delivers it (unmodified logical key).
+    fn ch(c: &str) -> Key {
+        Key::Character(c.into())
+    }
+
+    /// The cross-platform "command" modifier (Ctrl elsewhere, ⌘ on macOS) so the
+    /// tests exercise the same `command()` path the app sees on every platform.
+    fn cmd() -> Modifiers {
+        Modifiers::COMMAND
+    }
+
+    /// A focused-editor [`text_editor::KeyPress`] for `key` + `modifiers`, the way
+    /// the widget hands one to [`editor_key_binding`]. `focused` toggles the
+    /// status the closure gates on.
+    fn key_press(key: Key, modifiers: Modifiers, focused: bool) -> text_editor::KeyPress {
+        // Real typed characters carry their `text`; the widget's default binding
+        // reads it to produce an `Insert`, so mirror that for character keys.
+        let text = match &key {
+            Key::Character(c) => Some(c.clone()),
+            _ => None,
+        };
+        text_editor::KeyPress {
+            key: key.clone(),
+            modified_key: key,
+            physical_key: iced::keyboard::key::Physical::Unidentified(
+                iced::keyboard::key::NativeCode::Unidentified,
+            ),
+            modifiers,
+            text,
+            status: if focused {
+                text_editor::Status::Focused { is_hovered: false }
+            } else {
+                text_editor::Status::Active
+            },
+        }
+    }
+
+    #[test]
+    fn command_char_accelerators_map_to_their_intents() {
+        // The core of #39: each Ctrl/Cmd letter maps to the matching editing
+        // intent, matching the WebView build's global shortcut table. `on_key`
+        // publishes them from the global subscription (working from any focus).
+        assert!(matches!(on_key(ch("n"), cmd()), Some(Message::NewTab)));
+        assert!(matches!(on_key(ch("o"), cmd()), Some(Message::Open)));
+        assert!(matches!(on_key(ch("s"), cmd()), Some(Message::Save)));
+        assert!(matches!(on_key(ch("z"), cmd()), Some(Message::Undo)));
+        assert!(matches!(on_key(ch("y"), cmd()), Some(Message::Redo)));
+        // Find / Replace / Go-to all open the one shared bar.
+        for c in ["f", "h", "g"] {
+            assert!(
+                matches!(on_key(ch(c), cmd()), Some(Message::OpenFind)),
+                "Ctrl+{c} should open the find bar"
+            );
+        }
+    }
+
+    #[test]
+    fn shift_variants_select_the_secondary_intent() {
+        // Shift promotes Save→Save As and Undo→Redo, and F3→Find Prev.
+        assert!(matches!(
+            on_key(ch("s"), cmd() | Modifiers::SHIFT),
+            Some(Message::SaveAs)
+        ));
+        assert!(matches!(
+            on_key(ch("z"), cmd() | Modifiers::SHIFT),
+            Some(Message::Redo)
+        ));
+        assert!(matches!(
+            on_key(Key::Named(Named::F3), Modifiers::SHIFT),
+            Some(Message::FindPrev)
+        ));
+    }
+
+    #[test]
+    fn zoom_accelerators_cover_both_glyphs_of_each_key() {
+        // Ctrl+= and Ctrl++ both zoom in; Ctrl+- and Ctrl+_ both zoom out; Ctrl+0
+        // resets — mirroring the WebView's `case '=': case '+':` grouping.
+        for c in ["=", "+"] {
+            assert!(matches!(on_key(ch(c), cmd()), Some(Message::ZoomIn)));
+        }
+        for c in ["-", "_"] {
+            assert!(matches!(on_key(ch(c), cmd()), Some(Message::ZoomOut)));
+        }
+        assert!(matches!(on_key(ch("0"), cmd()), Some(Message::ZoomReset)));
+    }
+
+    #[test]
+    fn f3_and_escape_fire_without_the_command_modifier() {
+        // The two named-key shortcuts fire on their own, no command modifier.
+        assert!(matches!(
+            on_key(Key::Named(Named::F3), Modifiers::empty()),
+            Some(Message::FindNext)
+        ));
+        assert!(matches!(
+            on_key(Key::Named(Named::Escape), Modifiers::empty()),
+            Some(Message::Escape)
+        ));
+    }
+
+    #[test]
+    fn accelerators_ignore_the_letter_case_of_the_key() {
+        // Some layouts deliver the shifted (upper-case) character; the mapping
+        // lower-cases it, so Ctrl+Shift+S still resolves to Save As, not nothing.
+        assert!(matches!(
+            on_key(ch("S"), cmd() | Modifiers::SHIFT),
+            Some(Message::SaveAs)
+        ));
+        assert!(matches!(on_key(ch("N"), cmd()), Some(Message::NewTab)));
+    }
+
+    #[test]
+    fn plain_keys_and_unbound_accelerators_are_left_alone() {
+        // Plain typing (no command modifier) is never intercepted, so the editor
+        // still receives it.
+        assert!(on_key(ch("n"), Modifiers::empty()).is_none());
+        assert!(on_key(ch("a"), Modifiers::empty()).is_none());
+        // The editor's own Ctrl+C/V/X/A bindings and any other unbound accelerator
+        // map to nothing here, so the widget's default binding keeps them.
+        for c in ["c", "v", "x", "a", "q", "1"] {
+            assert!(
+                on_key(ch(c), cmd()).is_none(),
+                "Ctrl+{c} is not a shell accelerator"
+            );
+        }
+        // A non-character, non-shortcut named key is ignored too.
+        assert!(on_key(Key::Named(Named::Enter), Modifiers::empty()).is_none());
+    }
+
+    #[test]
+    fn editor_key_binding_suppresses_accelerator_insertion_only_while_focused() {
+        use text_editor::Binding;
+
+        // The insertion-bug fix (#39): a focused editor turns an accelerator key
+        // (Ctrl+=, Ctrl+S, …) into an empty `Sequence`, which the widget *consumes*
+        // (so nothing is typed) while doing nothing itself — `on_key` remains the
+        // single place the message is published, so there is no double-fire.
+        for c in ["=", "s", "n", "0"] {
+            match editor_key_binding(key_press(ch(c), cmd(), true)) {
+                Some(Binding::Sequence(seq)) => assert!(
+                    seq.is_empty(),
+                    "Ctrl+{c} must be a no-op consume, not run sub-bindings"
+                ),
+                other => {
+                    panic!("Ctrl+{c} should be suppressed by an empty Sequence, got {other:?}")
+                }
+            }
+        }
+
+        // Unfocused, the closure never suppresses — it defers to the default
+        // binding (which is None for an unfocused editor), leaving the key for
+        // whichever widget *is* focused.
+        assert!(!matches!(
+            editor_key_binding(key_press(ch("="), cmd(), false)),
+            Some(Binding::Sequence(_))
+        ));
+
+        // A plain focused keystroke is left to the default binding (an Insert),
+        // never suppressed.
+        assert!(matches!(
+            editor_key_binding(key_press(ch("a"), Modifiers::empty(), true)),
+            Some(Binding::Insert('a'))
+        ));
+
+        // The editor's own Ctrl+C is deferred to the default (Copy), not ours.
+        assert!(matches!(
+            editor_key_binding(key_press(ch("c"), cmd(), true)),
+            Some(Binding::Copy)
+        ));
+    }
+
+    #[test]
+    fn on_event_routes_key_presses_and_falls_back_to_window_events() {
+        let id = iced::window::Id::unique();
+        let status = iced::event::Status::Ignored;
+
+        // A key press is mapped through the shortcut table (Ctrl+S → Save).
+        let key = iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+            key: ch("s"),
+            modified_key: ch("s"),
+            physical_key: iced::keyboard::key::Physical::Unidentified(
+                iced::keyboard::key::NativeCode::Unidentified,
+            ),
+            location: iced::keyboard::Location::Standard,
+            modifiers: cmd(),
+            text: None,
+            repeat: false,
+        });
+        assert!(matches!(on_event(key, status, id), Some(Message::Save)));
+
+        // A non-keyboard event still reaches the window mapper (drag-and-drop).
+        let dropped = iced::Event::Window(iced::window::Event::FileDropped("/tmp/x.txt".into()));
+        assert!(matches!(
+            on_event(dropped, status, id),
+            Some(Message::FileDropped(_))
+        ));
+
+        // A key *release* is not a shortcut trigger and maps to nothing.
+        let released = iced::Event::Keyboard(iced::keyboard::Event::KeyReleased {
+            key: ch("s"),
+            modified_key: ch("s"),
+            physical_key: iced::keyboard::key::Physical::Unidentified(
+                iced::keyboard::key::NativeCode::Unidentified,
+            ),
+            location: iced::keyboard::Location::Standard,
+            modifiers: cmd(),
+        });
+        assert!(on_event(released, status, id).is_none());
+    }
+
+    #[test]
+    fn open_find_is_idempotent() {
+        // Ctrl+F opens the bar; pressing it again must not toggle it shut (unlike
+        // the toolbar's ToggleFind), so repeated accelerators keep it open.
+        let (mut shell, _) = Shell::new();
+        assert!(!shell.core.find.open);
+        let _ = shell.update(Message::OpenFind);
+        assert!(shell.core.find.open);
+        let _ = shell.update(Message::OpenFind);
+        assert!(shell.core.find.open, "a second open keeps the bar up");
+    }
+
+    #[test]
+    fn escape_dismisses_about_then_find_then_is_inert() {
+        let (mut shell, _) = Shell::new();
+
+        // Nothing open: Escape is a harmless no-op.
+        let _ = shell.update(Message::Escape);
+        assert!(!shell.core.about_open() && !shell.core.find.open);
+
+        // With both open, Escape closes About first (WebView priority)…
+        let _ = shell.update(Message::OpenFind);
+        let _ = shell.update(Message::ToggleAbout);
+        assert!(shell.core.about_open() && shell.core.find.open);
+        let _ = shell.update(Message::Escape);
+        assert!(!shell.core.about_open(), "About closes first");
+        assert!(shell.core.find.open, "the find bar is still up");
+
+        // …then a second Escape closes the find bar.
+        let _ = shell.update(Message::Escape);
+        assert!(!shell.core.find.open, "the find bar closes next");
     }
 
     // ---- Drag-and-drop file open wiring (#42) ----

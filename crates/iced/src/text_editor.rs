@@ -1499,9 +1499,31 @@ where
             );
         }
 
-        if let Some(focus) = state.focus.as_ref() {
-            match internal.editor.selection() {
-                Selection::Caret(position) if focus.is_cursor_visible() => {
+        // NOTEPAD-EXTRA(#33): a range selection (e.g. the current find match) is
+        // painted even when the editor is unfocused. Stock iced draws the
+        // selection only inside `if let Some(focus)`, so every find match vanished
+        // the instant focus moved to the find field — the find bar could never
+        // show what it had highlighted. The blinking caret still shows only while
+        // focused (and only when its blink phase is visible).
+        match internal.editor.selection() {
+            Selection::Range(ranges) => {
+                for range in ranges
+                    .into_iter()
+                    .filter_map(|range| text_bounds.intersection(&(range + translation)))
+                {
+                    renderer.fill_quad(
+                        renderer::Quad {
+                            bounds: range,
+                            ..renderer::Quad::default()
+                        },
+                        style.selection,
+                    );
+                }
+            }
+            Selection::Caret(position) => {
+                if let Some(focus) = state.focus.as_ref()
+                    && focus.is_cursor_visible()
+                {
                     let cursor = Rectangle::new(
                         position + translation,
                         Size::new(
@@ -1524,21 +1546,6 @@ where
                         );
                     }
                 }
-                Selection::Range(ranges) => {
-                    for range in ranges
-                        .into_iter()
-                        .filter_map(|range| text_bounds.intersection(&(range + translation)))
-                    {
-                        renderer.fill_quad(
-                            renderer::Quad {
-                                bounds: range,
-                                ..renderer::Quad::default()
-                            },
-                            style.selection,
-                        );
-                    }
-                }
-                Selection::Caret(_) => {}
             }
         }
 
@@ -2209,6 +2216,7 @@ mod tests {
         // marker *above* each must be for that issue — so renaming or moving a
         // divergence without re-marking it fails here.
         let anchors: &[(u32, &str)] = &[
+            (33, "Selection::Range(ranges) => {"),
             (34, "pub trait ScrollOffset {"),
             (34, "impl ScrollOffset for iced_graphics::text::Editor {"),
             (34, "struct BarGeometry {"),
@@ -2246,9 +2254,10 @@ mod tests {
     fn every_documented_divergence_issue_has_a_marker() {
         let issues: std::collections::BTreeSet<u32> =
             SOURCE.lines().filter_map(marker_issue).collect();
-        // The divergences catalogued in VENDORED.md: scrollbar (#34), editor
-        // niceties (#41), and the geometry extraction (#79).
-        for expected in [34u32, 41, 79] {
+        // The divergences catalogued in VENDORED.md: find-match highlighting while
+        // unfocused (#33), scrollbar (#34), editor niceties (#41), and the
+        // geometry extraction (#79).
+        for expected in [33u32, 34, 41, 79] {
             assert!(
                 issues.contains(&expected),
                 "no NOTEPAD-EXTRA(#{expected}) marker remains — a documented divergence lost its tag",

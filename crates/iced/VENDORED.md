@@ -30,6 +30,11 @@ iced 0.14's stock `text_editor`:
    These are drawn/measured inside the widget's `layout` and `draw`, which cannot
    be extended from outside.
 3. **Will host syntect highlighting (#32).** Also a widget-internal concern.
+4. **Paints a range selection only while focused (#33).** Stock iced draws the
+   selection highlight inside `if let Some(focus)`, so a find match disappeared the
+   moment the find field took focus. The fork paints a *range* selection regardless
+   of focus (the caret still blinks only while focused) so find highlighting stays
+   visible.
 
 None of these can be layered on top of the upstream widget from the shell, so the
 widget is forked. Keeping the fork small and *documented* is the point of this
@@ -48,6 +53,7 @@ mechanical. The divergences, by area:
 
 | Area | Issue | Key added items |
 |---|---|---|
+| Find-match highlighting while unfocused | #33 | the selection-drawing block in `draw` paints a `Selection::Range` regardless of focus (caret still gated on focus) |
 | Scrollbar + scroll offset | #34 | `trait ScrollOffset` + its `impl`; `struct BarGeometry`; `fn horizontal_bar`; `fn vertical_bar`; scrollbar drawing in `draw` |
 | Line-number gutter, active-line, bracket match | #41 | `struct BracketHighlight`; `const GUTTER_PAD`; `fn gutter_width`, `fn digit_count`, `fn inset_left`, `fn faint`; the `line_numbers` / `active_line` / `bracket` fields; the `line_numbers()` / `active_line()` / `bracket_match()` builder methods + private `gutter()`; gutter/active-line/bracket drawing + gutter reservation in `layout`/`draw` |
 

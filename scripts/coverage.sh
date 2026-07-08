@@ -14,7 +14,7 @@
 # Pass extra flags through:  scripts/coverage.sh --html
 set -euo pipefail
 
-GATE="${COVERAGE_GATE:-98}"
+GATE="${COVERAGE_GATE:-99}"
 
 exec cargo llvm-cov \
     --package notepad-core \

@@ -54,7 +54,25 @@ jq -r '.data[0]
         | "  \(.summary.lines.percent * 100 | round / 100)%\t\(.summary.lines.covered)/\(.summary.lines.count)\t\(.filename | sub(".*/notepad-extra/"; ""))" )
     ' "$COV_JSON" | { column -t -s $'\t' 2>/dev/null || cat; }
 
-# 5. Collect any gate violations — the aggregate falling short, or any single file
+# 5. Guard against llvm-cov silently dropping a file: it omits any source file with
+#    no executed regions, so an untested or undeclared module could pass the gate
+#    unseen. Require every `.rs` under the gated crates that defines a `fn` to appear
+#    in the report; declaration-only files (mod/use/type — e.g. notepad-core's
+#    lib.rs) have nothing to cover and are legitimately absent.
+reported=$(jq -r '.data[0].files[].filename' "$COV_JSON")
+missing=()
+while IFS= read -r src; do
+    grep -qE '^[[:space:]]*[a-z()" ]*fn[[:space:]]' "$src" || continue
+    abs="$(cd "$(dirname "$src")" && pwd)/$(basename "$src")"
+    grep -Fxq "$abs" <<<"$reported" || missing+=("$src")
+done < <(find crates/core/src crates/syntax/src -name '*.rs')
+if [[ ${#missing[@]} -gt 0 ]]; then
+    echo "coverage.sh: code-bearing file absent from coverage (untested or not compiled?):" >&2
+    printf '  - %s\n' "${missing[@]}" >&2
+    exit 1
+fi
+
+# 6. Collect any gate violations — the aggregate falling short, or any single file
 #    below the per-file floor — and fail with the list if there are any.
 offenders=$(jq -r --argjson agg "$GATE" --argjson each "$PER_FILE_GATE" '
     [ ( if .data[0].totals.lines.percent < $agg

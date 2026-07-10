@@ -52,8 +52,7 @@ so `rg 'NOTEPAD-EXTRA'` lists the full set, and a future diff against upstream i
 mechanical. The divergences, by area:
 
 | Area | Issue | Key added items |
-|------|-------|-----------------|
-
+| --- | --- | --- |
 | Find-match highlighting while unfocused | #33 | the selection-drawing block in `draw` paints a `Selection::Range` regardless of focus (caret still gated on focus) |
 | Scrollbar + scroll offset | #34 | `trait ScrollOffset` + its `impl`; `struct BarGeometry`; `fn horizontal_bar`; `fn vertical_bar`; scrollbar drawing in `draw` |
 | Line-number gutter, active-line, bracket match | #41 | `struct BracketHighlight`; `const GUTTER_PAD`; `fn gutter_width`, `fn digit_count`, `fn inset_left`, `fn faint`; the `line_numbers` / `active_line` / `bracket` fields; the `line_numbers()` / `active_line()` / `bracket_match()` builder methods + private `gutter()`; gutter/active-line/bracket drawing + gutter reservation in `layout`/`draw` |

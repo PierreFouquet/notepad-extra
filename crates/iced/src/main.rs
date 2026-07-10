@@ -415,17 +415,21 @@ struct Shell {
     /// Whether a file drag is currently hovering over the window (#42); drives the
     /// "drop to open" overlay in [`Shell::view`].
     drag_hover: bool,
-    /// A one-bit flag flipped whenever the active tab's effective language changes
-    /// (#32), read by [`Shell::app_style`] to force a full-window repaint on that
-    /// frame. This works around an iced 0.14 software-renderer damage limitation:
-    /// the `pick_list` draws its selected label with a vertically-centred
-    /// `fill_text`, but the compositor's damage rectangle for that text is anchored
-    /// at the label's centre and only extends downward, so a programmatic label
-    /// change with no pointer event over the widget (opening a file) leaves the top
-    /// halves of the old glyphs on screen — "garbled" until a hover repaints the
-    /// button quad. Nudging the background colour by 1/255 makes iced's `present`
-    /// see a changed clear-colour and redraw the whole surface once, clearing it.
-    /// Same class of bug as the vendored `text_editor`'s repaint gotcha.
+    /// A one-bit flag flipped on *every* `update` call, read by [`Shell::app_style`]
+    /// to force a full-window repaint on that frame. This works around an iced
+    /// 0.14 software-renderer damage limitation: the `tiny-skia`/`softbuffer`
+    /// compositor diffs each frame's layers against a buffer-age-indexed history
+    /// to compute a minimal damage rectangle, and on Wayland that history goes
+    /// stale under fast, continuous updates (e.g. every keystroke while typing),
+    /// producing visible tearing as the partial redraw lands on a buffer whose
+    /// prior contents don't match what was diffed against. The `pick_list` label
+    /// garbling this originally worked around (a programmatic label change with no
+    /// pointer event over the widget leaves stale glyph halves on screen) is the
+    /// same class of bug. Nudging the background colour by 1/255 makes iced's
+    /// `present` see a changed clear-colour every frame and always take the
+    /// full-surface redraw path, trading the partial-damage optimisation (cheap
+    /// for this app's small window) for correctness. Same class of bug as the
+    /// vendored `text_editor`'s repaint gotcha.
     repaint_nudge: bool,
 }
 
@@ -465,17 +469,12 @@ impl Shell {
         self.title.clone()
     }
 
-    /// The iced entry point. Dispatches the message, then detects whether the
-    /// active tab's effective language changed as a result (opening a file,
-    /// auto-detect, a manual pick, or switching tabs) and, if so, flips
+    /// The iced entry point. Dispatches the message, then unconditionally flips
     /// [`Shell::repaint_nudge`] so the next frame forces a full repaint — see the
     /// field's docs for the underlying iced damage limitation this dodges (#32).
     fn update(&mut self, message: Message) -> Task<Message> {
-        let language_before = self.core.active_doc().language();
         let task = self.dispatch(message);
-        if self.core.active_doc().language() != language_before {
-            self.repaint_nudge = !self.repaint_nudge;
-        }
+        self.repaint_nudge = !self.repaint_nudge;
         task
     }
 
@@ -1883,12 +1882,13 @@ mod tests {
     }
 
     #[test]
-    fn language_change_flips_the_repaint_nudge_to_force_a_full_redraw() {
-        // The pick_list's selected label is drawn with a vertically-centred
-        // `fill_text` that iced's software compositor under-damages on a
-        // programmatic change, leaving garbled pixels until a hover. Flipping the
-        // nudge on every effective-language change forces a full redraw that clears
-        // it (see `Shell::repaint_nudge` / `app_style`).
+    fn every_update_flips_the_repaint_nudge_to_force_a_full_redraw() {
+        // iced's software compositor diffs each frame's layers against a
+        // buffer-age-indexed history to compute a minimal damage rectangle; under
+        // fast continuous updates (e.g. every keystroke) that history goes stale
+        // on Wayland, producing visible tearing. Flipping the nudge on every
+        // `update` call forces a full redraw every frame instead, sidestepping the
+        // partial-damage path entirely (see `Shell::repaint_nudge` / `app_style`).
         let (mut shell, _) = Shell::new();
         let base = shell.repaint_nudge;
 
@@ -1903,16 +1903,18 @@ mod tests {
         );
         let after_open = shell.repaint_nudge;
 
-        // A message that doesn't change the language must NOT flip it.
+        // Even a message that doesn't change the language flips it — every
+        // `update` forces a full redraw now, not just language changes.
         let _ = shell.update(Message::ToggleWordWrap);
-        assert_eq!(
+        assert_ne!(
             shell.repaint_nudge, after_open,
-            "a non-language change must not flip the nudge"
+            "every update must flip the nudge, not just language changes"
         );
+        let after_toggle = shell.repaint_nudge;
 
         // A manual pick changes it again → flips.
         let _ = shell.update(Message::SetLanguage("Python".to_string()));
-        assert_ne!(shell.repaint_nudge, after_open);
+        assert_ne!(shell.repaint_nudge, after_toggle);
 
         // The nudged background differs from the plain one, so `present` sees a
         // changed clear-colour and repaints the whole surface.

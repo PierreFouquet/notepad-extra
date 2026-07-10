@@ -515,6 +515,28 @@ mod tests {
         assert!(!h.dirty(), "the saved 'ab' is intact and reachable");
     }
 
+    #[test]
+    fn coalescing_into_an_unsaved_top_step_ignores_a_lower_saved_baseline() {
+        // The saved-boundary guard only blocks merging into the *saved* entry
+        // itself. With a saved baseline sitting below a newer (unsaved) top step,
+        // adjacent typing must still coalesce into that top step.
+        let mut h = History::new();
+        let mut c = String::new();
+        type_into(&mut h, &mut c, "a");
+        h.mark_saved(); // clean = At("a")
+        h.coalescible = false; // seal so the next type starts a fresh top step
+        type_into(&mut h, &mut c, "ab"); // new top step; the saved baseline is below it
+        type_into(&mut h, &mut c, "abc"); // adjacent -> coalesces into the "ab" top
+        assert_eq!(
+            h.undo_depth(),
+            2,
+            "the two post-save types collapse into one step above the saved one"
+        );
+        undo(&mut h, &mut c);
+        assert_eq!(c, "a");
+        assert!(!h.dirty(), "one undo lands back on the saved baseline");
+    }
+
     // ---- History: depth cap ----
 
     #[test]
@@ -542,5 +564,27 @@ mod tests {
         assert!(h.dirty());
         while undo(&mut h, &mut c) {}
         assert!(h.dirty(), "the original saved state is unreachable");
+    }
+
+    #[test]
+    fn evicting_a_saved_entry_marks_it_gone() {
+        // Saving *after* a real edit pins the clean baseline to that entry (unlike
+        // the empty-baseline case above, which is `Clean::Empty`). When the depth
+        // cap later drains that entry off the bottom, the saved state is
+        // unreachable and the buffer stays dirty for good.
+        let mut h = History::new();
+        let mut c = String::new();
+        type_into(&mut h, &mut c, "0\n"); // a first sealed step
+        h.mark_saved(); // clean = At(that entry), not Empty
+        assert!(!h.dirty());
+        for i in 1..=(MAX_UNDO + 1) {
+            let next = format!("{c}{i}\n");
+            type_into(&mut h, &mut c, &next);
+        }
+        assert_eq!(h.undo_depth(), MAX_UNDO, "history stays bounded");
+        assert!(
+            h.dirty(),
+            "the evicted saved entry can never be reached again"
+        );
     }
 }

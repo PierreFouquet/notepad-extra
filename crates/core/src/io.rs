@@ -226,20 +226,33 @@ mod tests {
     }
 
     #[test]
-    fn open_external_forwards_safe_url_argv_to_spawn() {
-        // On the safe-URL path the entry point hands the spawn step the platform
-        // argv from `opener_argv` — verified without launching a real handler by
-        // capturing what the injected spawn receives.
-        let url = "https://github.com/PierreFouquet/notepad-extra";
-        let spawned = std::cell::Cell::new(false);
-        let result = open_external_with(url, |program: &str, args: &[String]| {
+    // `&spy` is deliberate: reusing one stand-in across both calls exercises its
+    // body on the safe path (a fresh closure per call would leave the never-run
+    // one uncovered). Clippy's needless-borrow heuristic doesn't see the reuse.
+    #[allow(clippy::needless_borrows_for_generic_args)]
+    fn open_external_spawns_iff_the_url_is_safe() {
+        // The URL guard runs *before* the spawn: an unsafe URL is rejected without
+        // the spawn ever being reached, while a safe URL forwards its platform argv
+        // (from `opener_argv`) to the spawn. One call-counting stand-in proves both,
+        // without launching a real handler.
+        let calls = std::cell::Cell::new(0u32);
+        let forwarded = std::cell::RefCell::new(None);
+        let spy = |program: &str, args: &[String]| {
+            calls.set(calls.get() + 1);
             assert!(!program.is_empty());
-            assert_eq!(args.last().map(String::as_str), Some(url));
-            spawned.set(true);
+            *forwarded.borrow_mut() = args.last().cloned();
             Ok(())
-        });
-        assert!(result.is_ok());
-        assert!(spawned.get(), "spawn must run for a safe URL");
+        };
+
+        // Unsafe URL: the guard rejects it and the spawn is never invoked.
+        assert!(open_external_with("javascript:alert(1)", &spy).is_err());
+        assert_eq!(calls.get(), 0, "spawn must not run for an unsafe URL");
+
+        // Safe URL: the spawn runs exactly once and receives the URL as its last arg.
+        let url = "https://github.com/PierreFouquet/notepad-extra";
+        assert!(open_external_with(url, &spy).is_ok());
+        assert_eq!(calls.get(), 1, "spawn runs once for a safe URL");
+        assert_eq!(forwarded.borrow().as_deref(), Some(url));
     }
 
     #[test]
@@ -251,16 +264,6 @@ mod tests {
             |_program: &str, _args: &[String]| Err("boom".to_string()),
         );
         assert_eq!(result, Err("boom".to_string()));
-    }
-
-    #[test]
-    fn open_external_guard_runs_before_spawn() {
-        // The URL guard rejects an unsafe URL *before* the spawn is reached, so
-        // the injected spawn (which would panic) is never invoked.
-        let result = open_external_with("javascript:alert(1)", |_: &str, _: &[String]| {
-            panic!("spawn must not run for an unsafe URL");
-        });
-        assert!(result.is_err());
     }
 
     #[test]

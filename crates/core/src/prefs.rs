@@ -168,15 +168,12 @@ mod tests {
             theme: ThemeMode::Dark,
             ..Preferences::default()
         };
+        let json = dark.to_json();
         assert!(
-            dark.to_json().contains("\"theme\": \"dark\""),
-            "dark theme should persist as \"theme\": \"dark\", got: {}",
-            dark.to_json()
+            json.contains("\"theme\": \"dark\""),
+            "dark theme should persist as \"theme\": \"dark\", got: {json}"
         );
-        assert_eq!(
-            Preferences::from_json(&dark.to_json()).theme,
-            ThemeMode::Dark
-        );
+        assert_eq!(Preferences::from_json(&json).theme, ThemeMode::Dark);
     }
 
     #[test]

@@ -2280,4 +2280,73 @@ mod tests {
         assert_eq!(inset.y, rect.y, "other fields are preserved");
         assert_eq!(inset.height, rect.height);
     }
+
+    // --- Widget-level large-file soak (#80) ---
+    //
+    // The pure-core soak (`notepad-core/tests/stress.rs`) hammers the logic layer
+    // with million-line buffers, and #32's `highlight.rs` soak covers syntect on a
+    // huge input — but neither drives the vendored widget's own cosmic-text editor,
+    // which shapes every line *up front* on open. These tests exercise that path
+    // for #80's representative inputs — a big multi-line buffer and a single very
+    // long line — through open + scroll + edit + select-all, asserting the widget
+    // stays correct and panic-free.
+    //
+    // Sizes here are far smaller than the core soak on purpose: open cost is linear
+    // in line count (~20µs/line release, ~0.3ms/line debug), so a full million-line
+    // shape would take minutes in a debug test. That open-time ceiling — its
+    // measured numbers and the mitigation options for it — is tracked in #102.
+
+    /// A large multi-line buffer opens, scrolls both ways, takes an edit at the
+    /// end, and round-trips through select-all — all without panicking.
+    #[test]
+    fn huge_multiline_buffer_opens_scrolls_edits_and_round_trips() {
+        let text = "let value = 0;\n".repeat(8_000);
+        let mut content = Content::<iced::Renderer>::with_text(&text);
+        // Opening shaped the whole buffer; the trailing newline yields a final
+        // empty line, so the count is one more than the repeat.
+        assert_eq!(content.line_count(), 8_001);
+
+        // Scroll to the bottom and back. In cosmic-text this only moves the scroll
+        // offset (no reshape), but it must stay in-bounds and panic-free.
+        content.perform(Action::Scroll { lines: 8_000 });
+        content.perform(Action::Scroll { lines: -16_000 });
+
+        // Jump the caret to the document end and type: only the touched line
+        // reshapes, and the buffer must still be addressable afterwards.
+        content.perform(Action::Move(Motion::DocumentEnd));
+        content.perform(Action::Edit(Edit::Insert('X')));
+        assert_eq!(content.line_count(), 8_001, "a single insert adds no line");
+
+        // Select-all + copy must round-trip the whole buffer, including the edit.
+        content.perform(Action::SelectAll);
+        let selection = content.selection().expect("select-all yields a selection");
+        assert!(selection.contains("let value = 0;"));
+        assert!(
+            selection.ends_with('X'),
+            "the trailing edit survives the copy"
+        );
+    }
+
+    /// A single very long line (no newlines) opens, edits, and stays one line.
+    /// This is the other end of #80's input space: the cost is one enormous shaped
+    /// line rather than many, and editing it reshapes only that line.
+    #[test]
+    fn single_enormous_line_opens_edits_and_stays_one_line() {
+        let text = "a".repeat(250_000);
+        let mut content = Content::<iced::Renderer>::with_text(&text);
+        assert_eq!(
+            content.line_count(),
+            1,
+            "no newlines means exactly one line"
+        );
+
+        content.perform(Action::Move(Motion::DocumentEnd));
+        content.perform(Action::Edit(Edit::Insert('Z')));
+        assert_eq!(content.line_count(), 1, "editing keeps it a single line");
+
+        content.perform(Action::SelectAll);
+        let selection = content.selection().expect("select-all yields a selection");
+        assert_eq!(selection.len(), 250_001, "every character round-trips");
+        assert!(selection.ends_with('Z'));
+    }
 }

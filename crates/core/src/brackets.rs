@@ -167,6 +167,9 @@ mod tests {
     fn caret_after_a_closer_matches_its_opener() {
         // "()|" — the char before the caret is ')' at 1, matching '(' at 0.
         assert_eq!(pair("()", 2), Some((1, Some(0))));
+        // The backward scan resolves ']' and '}' closers too, not just ')'.
+        assert_eq!(pair("[]", 2), Some((1, Some(0))));
+        assert_eq!(pair("{}", 2), Some((1, Some(0))));
     }
 
     #[test]
@@ -228,6 +231,17 @@ mod tests {
         // A mid-'é' caret floors onto the 'é' boundary (byte 1); the char before
         // is '(' at 0, so it still matches — and it does not panic.
         assert_eq!(pair(text, 2), Some((0, Some("(é".len()))));
+    }
+
+    #[test]
+    fn resolve_reports_no_match_for_a_non_bracket() {
+        // `match_at` only ever hands `resolve` a bracket (it guards with
+        // `is_bracket`), so its final `else` is defensive: a stray non-bracket
+        // must report no partner rather than misbehave. Exercised directly since
+        // the public entry point can't reach it — this keeps the guard covered
+        // deterministically instead of leaving it to a lucky proptest draw.
+        let m = resolve("x", 0, 'x');
+        assert_eq!((m.here, m.partner), (0, None));
     }
 
     proptest! {

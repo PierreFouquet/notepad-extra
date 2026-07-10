@@ -39,9 +39,10 @@ pub fn write_file(path: &Path, content: &str) -> Result<(), String> {
 /// the OS's default handler (the user's own browser), or `None` when `url` is
 /// not a [safe external URL](is_safe_external_url).
 ///
-/// Split out from [`open_external`] so the platform mapping is pure and
-/// testable: the actual process spawn is then the only untested line. The app
-/// itself never touches the network — it only asks the OS to open the link (#40).
+/// Split out from [`open_external`] so the platform mapping is pure and testable
+/// on its own, separately from the [`spawn_detached`] step that actually launches
+/// the handler. The app itself never touches the network — it only asks the OS to
+/// open the link (#40).
 ///
 /// * **Windows:** `rundll32 url.dll,FileProtocolHandler <url>`.
 /// * **macOS:** `open <url>`.
@@ -74,8 +75,27 @@ fn opener_argv(url: &str) -> Option<(&'static str, Vec<String>)> {
 /// waiting on it), so a slow browser can't stall the editor. The app makes no
 /// network request of its own; it only delegates to the OS.
 pub fn open_external(url: &str) -> Result<(), String> {
+    open_external_with(url, spawn_detached)
+}
+
+/// [`open_external`] with the process spawn injected, so the URL guard and the
+/// argv wiring can be exercised without launching a real browser. The public
+/// wrapper passes [`spawn_detached`]; tests pass a stand-in that records what it
+/// receives (or forces a failure) instead of touching the OS.
+fn open_external_with(
+    url: &str,
+    spawn: impl FnOnce(&str, &[String]) -> Result<(), String>,
+) -> Result<(), String> {
     let (program, args) =
         opener_argv(url).ok_or_else(|| format!("Refusing to open unsafe URL: {url}"))?;
+    spawn(program, &args)
+}
+
+/// Spawn `program` with `args` as a *detached* child — launched but never waited
+/// on, so a slow browser can't stall the editor — mapping a launch failure to an
+/// error string. Split from [`open_external`] so this last OS-touching step can be
+/// driven in tests with a harmless command instead of a real URL handler.
+fn spawn_detached(program: &str, args: &[String]) -> Result<(), String> {
     std::process::Command::new(program)
         .args(args)
         .spawn()
@@ -203,5 +223,63 @@ mod tests {
         assert!(open_external("javascript:alert(1)").is_err());
         assert!(open_external("http://example.com").is_err());
         assert!(open_external("").is_err());
+    }
+
+    #[test]
+    // `&spy` is deliberate: reusing one stand-in across both calls exercises its
+    // body on the safe path (a fresh closure per call would leave the never-run
+    // one uncovered). Clippy's needless-borrow heuristic doesn't see the reuse.
+    #[allow(clippy::needless_borrows_for_generic_args)]
+    fn open_external_spawns_iff_the_url_is_safe() {
+        // The URL guard runs *before* the spawn: an unsafe URL is rejected without
+        // the spawn ever being reached, while a safe URL forwards its platform argv
+        // (from `opener_argv`) to the spawn. One call-counting stand-in proves both,
+        // without launching a real handler.
+        let calls = std::cell::Cell::new(0u32);
+        let forwarded = std::cell::RefCell::new(None);
+        let spy = |program: &str, args: &[String]| {
+            calls.set(calls.get() + 1);
+            assert!(!program.is_empty());
+            *forwarded.borrow_mut() = args.last().cloned();
+            Ok(())
+        };
+
+        // Unsafe URL: the guard rejects it and the spawn is never invoked.
+        assert!(open_external_with("javascript:alert(1)", &spy).is_err());
+        assert_eq!(calls.get(), 0, "spawn must not run for an unsafe URL");
+
+        // Safe URL: the spawn runs exactly once and receives the URL as its last arg.
+        let url = "https://github.com/PierreFouquet/notepad-extra";
+        assert!(open_external_with(url, &spy).is_ok());
+        assert_eq!(calls.get(), 1, "spawn runs once for a safe URL");
+        assert_eq!(forwarded.borrow().as_deref(), Some(url));
+    }
+
+    #[test]
+    fn open_external_propagates_spawn_failure() {
+        // A spawn failure (e.g. the handler binary is missing) surfaces through
+        // the same `Result` rather than panicking.
+        let result = open_external_with(
+            "https://example.com/ok",
+            |_program: &str, _args: &[String]| Err("boom".to_string()),
+        );
+        assert_eq!(result, Err("boom".to_string()));
+    }
+
+    #[test]
+    fn spawn_detached_launches_a_harmless_command() {
+        // The real spawn path: a no-op system command launches and detaches
+        // cleanly, returning Ok without waiting on the child.
+        #[cfg(windows)]
+        let (program, args) = ("cmd", vec!["/C".to_string(), "exit".to_string()]);
+        #[cfg(not(windows))]
+        let (program, args) = ("true", Vec::<String>::new());
+        assert!(spawn_detached(program, &args).is_ok());
+    }
+
+    #[test]
+    fn spawn_detached_maps_launch_failure_to_error() {
+        // A program that cannot be launched yields an error string, never a panic.
+        assert!(spawn_detached("notepad-extra-nonexistent-program-xyz", &[]).is_err());
     }
 }

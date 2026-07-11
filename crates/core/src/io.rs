@@ -4,7 +4,8 @@
 //! (no `serde_json`) now that there is no JS bridge to cross.
 
 use std::fs;
-use std::path::Path;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 /// Whether `url` is safe to hand to the OS URL handler for the About dialog's
 /// external links (#40). It must be an `https` URL with an actual host and no
@@ -33,6 +34,52 @@ pub fn write_file(path: &Path, content: &str) -> Result<(), String> {
         fs::create_dir_all(parent).map_err(|e| format!("Failed to create dir: {e}"))?;
     }
     fs::write(path, content).map_err(|e| format!("Failed to save file: {e}"))
+}
+
+/// The sibling temp path an atomic write stages into: `{path}.tmp` in the *same*
+/// directory, so the follow-up rename stays on one filesystem (the only place
+/// rename is atomic). Appending — not replacing the extension — keeps it beside
+/// the real file (`preferences.json` → `preferences.json.tmp`).
+fn tmp_sibling(path: &Path) -> PathBuf {
+    let mut name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    name.push(".tmp");
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(name),
+        _ => PathBuf::from(name),
+    }
+}
+
+/// Write `content` to `path` atomically: stage it in a sibling temp file, flush
+/// that to disk, then `rename` it over `path`. Because the rename is atomic on a
+/// single filesystem, a crash or power-cut mid-write leaves either the old file
+/// or the complete new one — never the truncated half-write a plain in-place
+/// [`write_file`] can produce. Used for the preferences file (#96), where a torn
+/// write would otherwise reset every setting to defaults (`Preferences::from_json`
+/// recovers to defaults on invalid JSON). A failed rename cleans up the temp so a
+/// stray `.tmp` is never left behind.
+pub fn write_file_atomic(path: &Path, content: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && !parent.exists()
+    {
+        fs::create_dir_all(parent).map_err(|e| format!("Failed to create dir: {e}"))?;
+    }
+    let tmp = tmp_sibling(path);
+    // Write and fsync the temp before the rename, so the bytes are durable on
+    // disk by the time the rename publishes them.
+    let write = (|| {
+        let mut f = fs::File::create(&tmp)?;
+        f.write_all(content.as_bytes())?;
+        f.sync_all()
+    })();
+    if let Err(e) = write {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("Failed to save file: {e}"));
+    }
+    fs::rename(&tmp, path).map_err(|e| {
+        let _ = fs::remove_file(&tmp); // don't leave a stray temp on a failed rename
+        format!("Failed to save file: {e}")
+    })
 }
 
 /// The platform command — program name and argument list — that hands `url` to
@@ -142,6 +189,50 @@ mod tests {
         let content = "line1\r\nline2\r\n";
         write_file(&path, content).expect("write");
         assert_eq!(fs::read(&path).expect("raw"), content.as_bytes());
+    }
+
+    #[test]
+    fn atomic_write_then_read_roundtrip_and_creates_dirs() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("cfg").join("preferences.json");
+        write_file_atomic(&path, "{\"v\":1}").expect("write");
+        assert_eq!(read_file(&path).expect("read"), "{\"v\":1}");
+    }
+
+    #[test]
+    fn atomic_write_overwrites_and_leaves_no_temp() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("preferences.json");
+        write_file_atomic(&path, "first").expect("w1");
+        write_file_atomic(&path, "second").expect("w2");
+        assert_eq!(read_file(&path).expect("read"), "second");
+        // The staged temp is renamed away, never left beside the real file.
+        assert!(!dir.path().join("preferences.json.tmp").exists());
+    }
+
+    #[test]
+    fn atomic_write_survives_a_torn_write() {
+        // #96: model a crash *after* the temp is staged but *before* the rename —
+        // the temp holds a half-written new snapshot, the rename never happened.
+        // Because the previous file is only replaced by the atomic rename, readers
+        // still see the last good bytes, not a truncated file that would reset to
+        // defaults.
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("preferences.json");
+        write_file_atomic(&path, "GOOD").expect("commit good");
+        fs::write(dir.path().join("preferences.json.tmp"), "TORN").expect("stage torn temp");
+        assert_eq!(read_file(&path).expect("read"), "GOOD");
+    }
+
+    #[test]
+    fn atomic_write_over_a_directory_errors_and_keeps_no_temp() {
+        // If the target path is a directory, the rename can't publish over it: the
+        // write surfaces an error (never a panic) and cleans up its staged temp.
+        let dir = tempdir().expect("tempdir");
+        let target = dir.path().join("preferences.json");
+        fs::create_dir(&target).expect("make target a dir");
+        assert!(write_file_atomic(&target, "data").is_err());
+        assert!(!dir.path().join("preferences.json.tmp").exists());
     }
 
     #[test]

@@ -51,13 +51,19 @@ pub fn main() -> iced::Result {
         icon: window_icon(),
         ..iced::window::Settings::default()
     };
-    // Register the one bundled family (#61) so the app renders offline. Seed the
-    // app-wide `default_font` from the persisted UI font as a sensible first-paint
-    // baseline (read from the same file `boot` loads into the core); `view` then
-    // threads both the editor and UI fonts onto their widgets, so a picker change
-    // takes effect live within the session.
-    let ui_default = fonts::resolve(&load_preferences().ui_font);
-    let mut app = iced::application(Shell::boot, Shell::update, Shell::view)
+    // Register the one bundled family (#61) so the app renders offline. Read the
+    // saved preferences once and use them for both the app-wide `default_font`
+    // first-paint baseline and the shell's initial state (#96) — `boot_with`
+    // takes the snapshot rather than re-reading the file. `view` then threads both
+    // the editor and UI fonts onto their widgets, so a picker change takes effect
+    // live within the session.
+    let prefs = load_preferences();
+    let ui_default = fonts::resolve(&prefs.ui_font);
+    let mut app = iced::application(
+        move || Shell::boot_with(prefs.clone()),
+        Shell::update,
+        Shell::view,
+    )
         .title(Shell::title)
         .subscription(Shell::subscription)
         .style(Shell::app_style)
@@ -475,6 +481,15 @@ struct Shell {
     /// repaint for (it changes no pixels; nudging would repaint the whole window
     /// on every mouse move, the churn the `repaint_nudge` workaround fights).
     cursor_in_editor: Point,
+    /// Whether a preferences write is currently in flight (#96). At most one runs
+    /// at a time; a change arriving while one is in flight is held in
+    /// [`Shell::pending_prefs`] rather than racing a second concurrent write.
+    prefs_writing: bool,
+    /// The latest preferences snapshot waiting to be written, if a write is
+    /// already in flight (#96). Only the *newest* is kept — a burst of changes
+    /// (holding Ctrl+"+") collapses to one follow-up write of the final state,
+    /// so an older snapshot can never be the last one persisted.
+    pending_prefs: Option<core::Preferences>,
     /// A one-bit flag flipped on *every* `update` call, read by [`Shell::app_style`]
     /// to force a full-window repaint on that frame. This works around an iced
     /// 0.14 software-renderer damage limitation: the `tiny-skia`/`softbuffer`
@@ -495,14 +510,16 @@ struct Shell {
 
 impl Shell {
     /// The real startup path used by `main`: build the default shell, then apply
-    /// the preferences saved on disk (#38). Kept separate from [`Shell::new`] so
-    /// the headless tests get a deterministic default shell that never reads the
-    /// user's real config.
-    fn boot() -> (Self, Task<Message>) {
+    /// the preferences already loaded from disk (#38). `main` reads the file once
+    /// — for the first-paint UI font *and* here — and passes the snapshot in, so
+    /// startup no longer reads the config twice (#96). Kept separate from
+    /// [`Shell::new`] so the headless tests get a deterministic default shell that
+    /// never reads the user's real config.
+    fn boot_with(prefs: core::Preferences) -> (Self, Task<Message>) {
         let (mut shell, task) = Self::new();
         // Font size / word-wrap are read live from the core by `view`, so simply
         // applying the loaded prefs is enough — no editor rebuild needed.
-        shell.core.apply_preferences(&load_preferences());
+        shell.core.apply_preferences(&prefs);
         (shell, task)
     }
 
@@ -527,6 +544,8 @@ impl Shell {
                 drag_hover: false,
                 context_menu: None,
                 cursor_in_editor: Point::ORIGIN,
+                prefs_writing: false,
+                pending_prefs: None,
                 repaint_nudge: false,
             },
             Task::none(),
@@ -855,9 +874,17 @@ impl Shell {
                 }
             }
 
-            // The preferences write landed (#38). Nothing to do: its result is
-            // deliberately swallowed so a failed save never disrupts editing.
-            Message::PreferencesSaved => Task::none(),
+            // The preferences write landed (#38). Its result is deliberately
+            // swallowed so a failed save never disrupts editing. Clear the
+            // in-flight flag and, if changes arrived while it ran, write the
+            // latest coalesced snapshot now (#96).
+            Message::PreferencesSaved => {
+                self.prefs_writing = false;
+                match self.pending_prefs.take() {
+                    Some(prefs) => self.queue_prefs_write(prefs),
+                    None => Task::none(),
+                }
+            }
 
             // ---- About dialog + external links (#40) ----
             Message::ToggleAbout => {
@@ -984,6 +1011,23 @@ impl Shell {
         self.apply_core(msg, false)
     }
 
+    /// Queue a preferences snapshot for persistence, serialising and coalescing
+    /// concurrent writes (#96). At most one write is ever in flight: if one is
+    /// already running, the snapshot is stashed in [`Shell::pending_prefs`]
+    /// (replacing any earlier stash, so only the newest survives) and written
+    /// once the current one lands — see [`Message::PreferencesSaved`]. This keeps
+    /// a rapid burst of changes (holding Ctrl+"+") from racing several
+    /// out-of-order writes, where an older snapshot could win the disk.
+    fn queue_prefs_write(&mut self, prefs: core::Preferences) -> Task<Message> {
+        if self.prefs_writing {
+            self.pending_prefs = Some(prefs); // coalesce: keep only the latest
+            Task::none()
+        } else {
+            self.prefs_writing = true;
+            prefs_write_task(prefs)
+        }
+    }
+
     /// Turn one core [`Effect`] into a real side effect.
     fn run_effect(&mut self, effect: Effect) -> Task<Message> {
         match effect {
@@ -1044,19 +1088,10 @@ impl Shell {
                 self.confirm_close = Some(PendingClose { id, title });
                 Task::none()
             }
-            // Persist preferences to the config file off the UI thread (#38).
-            // `write_file` creates the parent config dir as needed. With no
-            // config dir resolvable we simply don't persist — never an error the
-            // user sees. The write result is dropped (see [`Message::PreferencesSaved`]).
-            Effect::SavePreferences(prefs) => match config_path() {
-                Some(path) => {
-                    let json = prefs.to_json();
-                    Task::perform(async move { core::io::write_file(&path, &json) }, |_| {
-                        Message::PreferencesSaved
-                    })
-                }
-                None => Task::none(),
-            },
+            // Persist preferences to the config file off the UI thread (#38),
+            // coalescing concurrent writes so a burst never persists a stale
+            // snapshot (#96) — see [`Shell::queue_prefs_write`].
+            Effect::SavePreferences(prefs) => self.queue_prefs_write(prefs),
             // Hand an About-panel link to the OS's browser off the UI thread
             // (#40). The core already vetted the URL; `open_external` re-checks
             // and spawns the handler detached. The result is dropped — the app
@@ -1701,6 +1736,27 @@ async fn pick_save() -> Option<PathBuf> {
         .map(|h| h.path().to_path_buf())
 }
 
+/// Build the async task that persists one preferences snapshot to the config
+/// file off the UI thread (#38), via an atomic temp-file + rename so a torn
+/// write can't reset every setting to defaults (#96). With no config dir
+/// resolvable there is nothing to persist, but the task still reports
+/// [`Message::PreferencesSaved`] so the in-flight flag clears and any coalesced
+/// snapshot isn't stranded. The write result is otherwise swallowed — a failed
+/// save never interrupts editing. Serialised / coalesced by
+/// [`Shell::queue_prefs_write`], so only one runs at a time.
+fn prefs_write_task(prefs: core::Preferences) -> Task<Message> {
+    match config_path() {
+        Some(path) => {
+            let json = prefs.to_json();
+            Task::perform(
+                async move { core::io::write_file_atomic(&path, &json) },
+                |_| Message::PreferencesSaved,
+            )
+        }
+        None => Task::perform(async {}, |_| Message::PreferencesSaved),
+    }
+}
+
 /// Load the persisted preferences (#38), recovering to defaults on *any* failure
 /// — no config dir, a missing / unreadable file, or corrupt JSON. Never errors,
 /// so a bad config can never stop the app from starting.
@@ -1831,6 +1887,40 @@ mod tests {
         let _ = shell.update(Message::Undo);
         assert!(!shell.core.active_doc().dirty());
         assert_eq!(shell.title, "new.py — Notepad Extra");
+    }
+
+    #[test]
+    fn concurrent_pref_writes_coalesce_to_the_latest_snapshot() {
+        // #96: while one prefs write is in flight, further changes don't spawn
+        // racing writes — only the newest snapshot is held, then written when the
+        // current one lands. The returned Tasks are never polled here (no runtime),
+        // so no real config file is touched.
+        let (mut shell, _) = Shell::new();
+        let a = core::Preferences { font_size: 14, ..Default::default() };
+        let b = core::Preferences { font_size: 16, ..Default::default() };
+        let c = core::Preferences { font_size: 18, ..Default::default() };
+
+        // First change: nothing in flight → start writing it.
+        let _ = shell.run_effect(Effect::SavePreferences(a));
+        assert!(shell.prefs_writing);
+        assert!(shell.pending_prefs.is_none());
+
+        // Two more while it's in flight: they don't start writes; only the *latest*
+        // is kept pending.
+        let _ = shell.run_effect(Effect::SavePreferences(b));
+        let _ = shell.run_effect(Effect::SavePreferences(c.clone()));
+        assert_eq!(shell.pending_prefs.as_ref(), Some(&c));
+
+        // The in-flight write lands: the pending (latest) snapshot starts writing,
+        // and the queue empties.
+        let _ = shell.update(Message::PreferencesSaved);
+        assert!(shell.prefs_writing);
+        assert!(shell.pending_prefs.is_none());
+
+        // That final write lands with nothing queued: back to idle.
+        let _ = shell.update(Message::PreferencesSaved);
+        assert!(!shell.prefs_writing);
+        assert!(shell.pending_prefs.is_none());
     }
 
     #[test]

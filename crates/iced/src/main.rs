@@ -1898,6 +1898,66 @@ mod tests {
     }
 
     #[test]
+    fn reverting_a_new_doc_to_empty_clears_the_dirty_dot() {
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::Edit(paste("hello")));
+        assert!(shell.core.active_doc().dirty());
+        assert!(
+            shell.title.starts_with("\u{2022} "),
+            "dot appears: {}",
+            shell.title
+        );
+        // Select everything and delete it: back to the empty saved baseline.
+        let _ = shell.update(Message::Edit(text_editor::Action::SelectAll));
+        let _ = shell.update(Message::Edit(text_editor::Action::Edit(
+            text_editor::Edit::Backspace,
+        )));
+        assert_eq!(shell.active_editor().text().trim_end(), "");
+        assert!(
+            !shell.core.active_doc().dirty(),
+            "empty again == saved baseline"
+        );
+        assert!(
+            !shell.title.starts_with('\u{2022}'),
+            "dot cleared: {}",
+            shell.title
+        );
+    }
+
+    #[test]
+    fn reverting_a_saved_doc_to_its_baseline_clears_the_dirty_dot() {
+        let (mut shell, _) = Shell::new();
+        // Load a saved file "hello" (no trailing newline), like opening from disk.
+        let _ = shell.update(Message::FileRead {
+            path: PathBuf::from("/tmp/greeting.txt"),
+            result: Ok("hello".to_string()),
+        });
+        assert!(!shell.core.active_doc().dirty(), "freshly loaded == clean");
+        // Append "goodbye" then delete it again, ending back at "hello".
+        let _ = shell.update(Message::Edit(text_editor::Action::Move(
+            text_editor::Motion::DocumentEnd,
+        )));
+        let _ = shell.update(Message::Edit(paste("goodbye")));
+        assert!(shell.core.active_doc().dirty());
+        for _ in 0.."goodbye".len() {
+            let _ = shell.update(Message::Edit(text_editor::Action::Edit(
+                text_editor::Edit::Backspace,
+            )));
+        }
+        assert_eq!(shell.active_editor().text().trim_end(), "hello");
+        assert!(
+            !shell.core.active_doc().dirty(),
+            "back at the saved baseline, content={:?}",
+            shell.core.active_doc().content,
+        );
+        assert!(
+            !shell.title.starts_with('\u{2022}'),
+            "dot cleared: {}",
+            shell.title
+        );
+    }
+
+    #[test]
     fn concurrent_pref_writes_coalesce_to_the_latest_snapshot() {
         // #96: while one prefs write is in flight, further changes don't spawn
         // racing writes — only the newest snapshot is held, then written when the

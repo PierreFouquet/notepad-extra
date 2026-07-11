@@ -152,3 +152,9 @@ tests/                # Rust integration tests + frontend logic tests
 ## License
 
 Licensed under the GPL-3.0-or-later License — see [LICENSE](LICENSE) for details.
+
+The combined work includes a small amount of vendored third-party code and one
+bundled font under GPL-compatible permissive licenses — notably the iced
+`text_editor` widget (MIT) and DejaVu Sans Mono (Bitstream Vera derivative).
+[THIRD-PARTY.md](THIRD-PARTY.md) is the canonical record of what is vendored,
+from where, and under which license.

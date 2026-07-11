@@ -286,6 +286,10 @@ enum Message {
         path: PathBuf,
         result: Result<(), String>,
     },
+    /// Dismiss the read/save error banner (#97 item 7), so the status row
+    /// (Ln/Col, …) it hid comes back without waiting for a later operation. The
+    /// next real edit clears it too; this is the `×` for when there's no edit.
+    DismissError,
 
     // ---- Find / Replace / Go-to-line (#33) ----
     /// Show or hide the find / replace bar.
@@ -535,6 +539,10 @@ impl Shell {
                 let is_edit = action.is_edit();
                 self.editor.perform(action);
                 if is_edit {
+                    // A real edit means the user has moved on: clear any stale
+                    // read/save error so the status row (Ln/Col, …) returns
+                    // instead of staying hidden behind the banner (#97 item 7).
+                    self.error = None;
                     let text = self.editor.text();
                     // The editor owns the text now — don't clobber it by resyncing.
                     self.apply_core(core::Message::Edited(text), false)
@@ -601,6 +609,14 @@ impl Shell {
                     self.apply_core(core::Message::SaveAbandoned { id }, false)
                 }
             },
+
+            // Clear the error banner on demand (#97 item 7). No core round-trip:
+            // the error slot is shell-only chrome, so dropping it just re-reveals
+            // the status row on the next frame.
+            Message::DismissError => {
+                self.error = None;
+                Task::none()
+            }
 
             // ---- Find / Replace / Go-to-line (#33) ----
             Message::ToggleFind => {
@@ -1034,7 +1050,16 @@ impl Shell {
             .height(Fill);
 
         let status: Element<'_, Message> = match &self.error {
-            Some(e) => text(format!("Error: {e}")).font(ui).into(),
+            // A read/save error takes the status row, but with a `×` to dismiss it
+            // (#97 item 7) so Ln/Col etc. aren't hidden until some later operation
+            // happens to succeed. Editing clears it too (see the `Edit` handler).
+            Some(e) => row![
+                text(format!("Error: {e}")).font(ui),
+                button(text("\u{00d7}").font(ui)).on_press(Message::DismissError),
+            ]
+            .spacing(16)
+            .align_y(iced::Alignment::Center)
+            .into(),
             None => {
                 let s = self.status();
                 // Caret position first, then a selection count only when there
@@ -1534,6 +1559,50 @@ mod tests {
         });
         assert_eq!(shell.core.docs.len(), 1);
         assert_eq!(shell.error.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn a_real_edit_clears_the_error_banner_but_a_cursor_move_does_not() {
+        // The error banner hides the status row; the next *real* edit clears it
+        // so Ln/Col etc. come back, while a mere cursor move leaves it up
+        // (#97 item 7).
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::FileRead {
+            path: PathBuf::from("/tmp/nope"),
+            result: Err("boom".to_string()),
+        });
+        assert_eq!(shell.error.as_deref(), Some("boom"));
+
+        // A cursor move is not an edit: the banner must stay put.
+        let _ = shell.update(Message::Edit(text_editor::Action::Move(
+            text_editor::Motion::Right,
+        )));
+        assert_eq!(
+            shell.error.as_deref(),
+            Some("boom"),
+            "a non-edit action must not clear the banner"
+        );
+
+        // A real edit means the user has moved on: the banner clears.
+        let _ = shell.update(Message::Edit(paste("typed")));
+        assert!(shell.error.is_none(), "an edit clears the banner");
+    }
+
+    #[test]
+    fn dismissing_the_error_restores_the_status_row_without_touching_the_doc() {
+        // The `×` clears the banner on demand (#97 item 7) — no later operation
+        // needed — and leaves the buffer untouched.
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::Edit(paste("keep me")));
+        let _ = shell.update(Message::FileRead {
+            path: PathBuf::from("/tmp/nope"),
+            result: Err("boom".to_string()),
+        });
+        assert_eq!(shell.error.as_deref(), Some("boom"));
+
+        let _ = shell.update(Message::DismissError);
+        assert!(shell.error.is_none(), "dismiss clears the banner");
+        assert_eq!(shell.editor.text().trim_end(), "keep me");
     }
 
     #[test]

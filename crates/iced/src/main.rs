@@ -64,12 +64,12 @@ pub fn main() -> iced::Result {
         Shell::update,
         Shell::view,
     )
-        .title(Shell::title)
-        .subscription(Shell::subscription)
-        .style(Shell::app_style)
-        .theme(Shell::theme)
-        .default_font(ui_default)
-        .window(window);
+    .title(Shell::title)
+    .subscription(Shell::subscription)
+    .style(Shell::app_style)
+    .theme(Shell::theme)
+    .default_font(ui_default)
+    .window(window);
     for face in fonts::BUNDLED_FONT_FACES {
         app = app.font(*face);
     }
@@ -1867,8 +1867,16 @@ mod tests {
 
         // Editing crosses clean→dirty: the marker appears, the app name stays.
         let _ = shell.update(Message::Edit(paste("code")));
-        assert!(shell.title.starts_with("\u{2022} "), "dirty marker: {}", shell.title);
-        assert!(shell.title.contains("Notepad Extra"), "app name: {}", shell.title);
+        assert!(
+            shell.title.starts_with("\u{2022} "),
+            "dirty marker: {}",
+            shell.title
+        );
+        assert!(
+            shell.title.contains("Notepad Extra"),
+            "app name: {}",
+            shell.title
+        );
 
         // Saving clears dirty: the marker drops, the app name (and now the file
         // name) remain.
@@ -1896,9 +1904,18 @@ mod tests {
         // current one lands. The returned Tasks are never polled here (no runtime),
         // so no real config file is touched.
         let (mut shell, _) = Shell::new();
-        let a = core::Preferences { font_size: 14, ..Default::default() };
-        let b = core::Preferences { font_size: 16, ..Default::default() };
-        let c = core::Preferences { font_size: 18, ..Default::default() };
+        let a = core::Preferences {
+            font_size: 14,
+            ..Default::default()
+        };
+        let b = core::Preferences {
+            font_size: 16,
+            ..Default::default()
+        };
+        let c = core::Preferences {
+            font_size: 18,
+            ..Default::default()
+        };
 
         // First change: nothing in flight → start writing it.
         let _ = shell.run_effect(Effect::SavePreferences(a));

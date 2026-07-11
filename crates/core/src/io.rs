@@ -41,7 +41,10 @@ pub fn write_file(path: &Path, content: &str) -> Result<(), String> {
 /// rename is atomic). Appending — not replacing the extension — keeps it beside
 /// the real file (`preferences.json` → `preferences.json.tmp`).
 fn tmp_sibling(path: &Path) -> PathBuf {
-    let mut name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    let mut name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
     name.push(".tmp");
     match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent.join(name),

@@ -7,6 +7,8 @@ body:
     attributes:
       value: |
         Thanks for taking the time to report a bug! Please fill out the sections below so we can reproduce and fix it quickly.
+
+        Notepad Extra is developed **test-first**: every fix ships with a **regression test** (unit / `proptest` / fuzz as appropriate) that fails before the fix and passes after, so the bug can't come back. Clear, minimal reproduction steps below become that test — the more precise they are, the faster this gets fixed.
   - type: checkboxes
     id: preflight
     attributes:

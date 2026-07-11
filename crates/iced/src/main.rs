@@ -604,12 +604,11 @@ impl Shell {
 
             // ---- Find / Replace / Go-to-line (#33) ----
             Message::ToggleFind => {
-                let msg = if self.core.find.open {
-                    core::Message::FindClosed
+                if self.core.find.open {
+                    self.apply_core(core::Message::FindClosed, false)
                 } else {
-                    core::Message::FindOpened
-                };
-                self.apply_core(msg, false)
+                    self.open_find()
+                }
             }
             // Idempotent open (#39): only ask the core to open if it isn't already,
             // so a repeated Ctrl+F never toggles the bar shut.
@@ -617,7 +616,7 @@ impl Shell {
                 if self.core.find.open {
                     Task::none()
                 } else {
-                    self.apply_core(core::Message::FindOpened, false)
+                    self.open_find()
                 }
             }
             Message::CloseFind => self.apply_core(core::Message::FindClosed, false),
@@ -748,6 +747,23 @@ impl Shell {
         }
         let tasks: Vec<Task<Message>> = effects.into_iter().map(|e| self.run_effect(e)).collect();
         Task::batch(tasks)
+    }
+
+    /// Open the find bar, seeding the query from a single-line selection the way
+    /// the WebView's `openFind` did (#97 item 1): a selection with no newline
+    /// prefills the field, while a multi-line or empty selection opens it as-is.
+    /// Either way opening never moves the caret (item 2) — the core recounts but
+    /// leaves the search until Enter / Find Next.
+    fn open_find(&mut self) -> Task<Message> {
+        let msg = match self
+            .editor
+            .selection()
+            .filter(|sel| !sel.is_empty() && !sel.contains('\n'))
+        {
+            Some(sel) => core::Message::FindOpenedWith(sel),
+            None => core::Message::FindOpened,
+        };
+        self.apply_core(msg, false)
     }
 
     /// Turn one core [`Effect`] into a real side effect.
@@ -1771,6 +1787,51 @@ mod tests {
         assert_eq!(shell.core.find.count, 2); // case-insensitive
         let _ = shell.update(Message::ToggleOption(FindOption::CaseSensitive));
         assert_eq!(shell.core.find.count, 1);
+    }
+
+    #[test]
+    fn opening_find_prefills_from_a_single_line_selection() {
+        // #97 item 1: opening the bar seeds the field from a single-line
+        // selection — and searches the whole buffer, not just the selected
+        // occurrence. Build a partial "foo" selection with *no* prior query, so
+        // the seeded field can only have come from the selection (not a residual
+        // query left over from an earlier search).
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::Edit(paste("foo bar foo")));
+        let _ = shell.update(Message::Edit(text_editor::Action::Move(
+            text_editor::Motion::Home,
+        )));
+        for _ in 0..3 {
+            let _ = shell.update(Message::Edit(text_editor::Action::Select(
+                text_editor::Motion::Right,
+            )));
+        }
+        assert_eq!(shell.editor.selection().as_deref(), Some("foo"));
+        assert!(shell.core.find.query.is_empty(), "no query before opening");
+        let _ = shell.update(Message::ToggleFind);
+        assert!(shell.core.find.open);
+        // The field was seeded purely from the selection...
+        assert_eq!(shell.core.find.query, "foo");
+        // ...and it counts every occurrence, not just the selected one.
+        assert_eq!(shell.core.find.count, 2);
+        // The seed filled the field but selected no new match (item 2).
+        assert!(shell.core.find.current.is_none());
+    }
+
+    #[test]
+    fn opening_find_ignores_a_multiline_selection() {
+        // #97 item 1 prefills only from a *single-line* selection; a multi-line
+        // selection opens the bar with an empty field, matching the WebView.
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::Edit(paste("one\ntwo")));
+        let _ = shell.update(Message::Edit(text_editor::Action::SelectAll));
+        assert_eq!(shell.editor.selection().as_deref(), Some("one\ntwo"));
+        let _ = shell.update(Message::ToggleFind);
+        assert!(shell.core.find.open);
+        assert!(
+            shell.core.find.query.is_empty(),
+            "a multi-line selection must not prefill"
+        );
     }
 
     // ---- Status bar wiring (#37) ----

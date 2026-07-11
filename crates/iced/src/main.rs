@@ -987,8 +987,8 @@ impl Shell {
     /// Turn one core [`Effect`] into a real side effect.
     fn run_effect(&mut self, effect: Effect) -> Task<Message> {
         match effect {
-            Effect::SetTitle(t) => {
-                self.title = t;
+            Effect::SetTitle { title, dirty } => {
+                self.title = format_title(&title, dirty);
                 Task::none()
             }
             Effect::PickOpenPath => Task::perform(pick_open(), Message::OpenPicked),
@@ -1670,13 +1670,21 @@ const ISSUES_URL: &str = "https://github.com/PierreFouquet/notepad-extra/issues"
 /// panel (#40).
 const LICENSE_URL: &str = "https://github.com/PierreFouquet/notepad-extra/blob/main/LICENSE";
 
-/// The window title: the active document's, with a leading "• " when dirty and
-/// the app name appended. Kept in sync via [`Effect::SetTitle`] at runtime; this
-/// is only the initial value.
+/// Format the window title from a document `title` (basename or `Untitled`) and
+/// its `dirty` flag: a leading "• " when dirty, then the app name appended. The
+/// single source of the title format — used for the initial value
+/// ([`window_title`]) and for every runtime [`Effect::SetTitle`], so the dirty
+/// marker and app-name suffix survive past the first update (#93).
+fn format_title(title: &str, dirty: bool) -> String {
+    let dot = if dirty { "\u{2022} " } else { "" };
+    format!("{dot}{title} — Notepad Extra")
+}
+
+/// The initial window title, formatted from the active document. Runtime updates
+/// arrive via [`Effect::SetTitle`]; both go through [`format_title`].
 fn window_title(core: &core::State) -> String {
     let doc = core.active_doc();
-    let dot = if doc.dirty() { "\u{2022} " } else { "" };
-    format!("{dot}{} — Notepad Extra", doc.title())
+    format_title(doc.title(), doc.dirty())
 }
 
 async fn pick_open() -> Option<PathBuf> {
@@ -1790,8 +1798,39 @@ mod tests {
         let (shell, _) = Shell::new();
         assert_eq!(shell.core.docs.len(), 1);
         assert_eq!(shell.core.active_doc().title(), "Untitled");
-        assert!(shell.title.contains("Untitled"));
+        // Boot title is fully formatted: name + app name, no dirty marker (#93).
+        assert_eq!(shell.title, "Untitled — Notepad Extra");
         assert_eq!(shell.active_editor().text().trim_end(), "");
+    }
+
+    #[test]
+    fn title_keeps_dirty_marker_and_app_name_across_updates() {
+        // #93: the `•` and the "— Notepad Extra" suffix must survive past the
+        // first runtime SetTitle, not just the boot value.
+        let (mut shell, _) = Shell::new();
+
+        // Editing crosses clean→dirty: the marker appears, the app name stays.
+        let _ = shell.update(Message::Edit(paste("code")));
+        assert!(shell.title.starts_with("\u{2022} "), "dirty marker: {}", shell.title);
+        assert!(shell.title.contains("Notepad Extra"), "app name: {}", shell.title);
+
+        // Saving clears dirty: the marker drops, the app name (and now the file
+        // name) remain.
+        let id = shell.core.active_doc().id;
+        let _ = shell.update(Message::Saved {
+            id,
+            path: PathBuf::from("/tmp/new.py"),
+            result: Ok(()),
+        });
+        assert_eq!(shell.title, "new.py — Notepad Extra");
+
+        // Editing again re-adds the marker; undoing back to the saved state drops
+        // it — the title tracks `dirty()` both ways.
+        let _ = shell.update(Message::Edit(paste("!")));
+        assert!(shell.title.starts_with("\u{2022} "));
+        let _ = shell.update(Message::Undo);
+        assert!(!shell.core.active_doc().dirty());
+        assert_eq!(shell.title, "new.py — Notepad Extra");
     }
 
     #[test]

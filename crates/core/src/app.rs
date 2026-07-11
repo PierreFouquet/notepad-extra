@@ -509,8 +509,11 @@ pub enum Effect {
         path: PathBuf,
         content: String,
     },
-    /// Update the window title.
-    SetTitle(String),
+    /// Update the window title. Carries the active document's `title` (basename
+    /// or `Untitled`) and its `dirty` flag, both ingredients the shell needs to
+    /// render the full title — the leading "• " and the " — Notepad Extra"
+    /// suffix are the shell's to format, so the two stay single-sourced (#93).
+    SetTitle { title: String, dirty: bool },
     /// Select the byte range `[start, end)` in the active editor and scroll it
     /// into view. `start == end` is a bare caret (go-to-line); otherwise it
     /// highlights a find match or a freshly inserted replacement.
@@ -892,7 +895,11 @@ pub fn update(state: &mut State, message: Message) -> Vec<Effect> {
 }
 
 fn title_effect(state: &State) -> Vec<Effect> {
-    vec![Effect::SetTitle(state.active_doc().title().to_string())]
+    let doc = state.active_doc();
+    vec![Effect::SetTitle {
+        title: doc.title().to_string(),
+        dirty: doc.dirty(),
+    }]
 }
 
 /// Remove the document at `index`, preserving the two core invariants: the list
@@ -1179,7 +1186,13 @@ mod tests {
         let mut s = State::default();
         let fx = update(&mut s, Message::Edited("a".into()));
         assert!(s.active_doc().dirty());
-        assert_eq!(fx, vec![Effect::SetTitle("Untitled".into())]);
+        assert_eq!(
+            fx,
+            vec![Effect::SetTitle {
+                title: "Untitled".into(),
+                dirty: true, // the edit just crossed clean→dirty (#93)
+            }]
+        );
         // Second edit stays dirty; no redundant title effect.
         let fx2 = update(&mut s, Message::Edited("ab".into()));
         assert!(fx2.is_empty());
@@ -1288,7 +1301,13 @@ mod tests {
                 path: PathBuf::from("/tmp/x.rs"),
             },
         );
-        assert_eq!(fx, vec![Effect::SetTitle("Untitled".into())]);
+        assert_eq!(
+            fx,
+            vec![Effect::SetTitle {
+                title: "Untitled".into(),
+                dirty: false, // the active blank was never touched
+            }]
+        );
         assert_eq!(s.active_doc().language(), "Plain Text"); // untouched
     }
 
@@ -1654,7 +1673,13 @@ mod tests {
         let fx = update(&mut s, Message::TabCloseDiscard(9999));
         assert_eq!(s.docs.len(), 1); // nothing closed
         assert!(s.active_doc().dirty());
-        assert_eq!(fx, vec![Effect::SetTitle("Untitled".into())]);
+        assert_eq!(
+            fx,
+            vec![Effect::SetTitle {
+                title: "Untitled".into(),
+                dirty: true,
+            }]
+        );
     }
 
     #[test]
@@ -1832,7 +1857,10 @@ mod tests {
         let fx = update(&mut s, Message::ReplaceNext);
         assert_eq!(s.active_doc().content, "XYZ");
         assert!(s.active_doc().dirty(), "replacing dirties a clean doc");
-        assert!(fx.contains(&Effect::SetTitle("only.txt".into())));
+        assert!(fx.contains(&Effect::SetTitle {
+            title: "only.txt".into(),
+            dirty: true,
+        }));
         assert_eq!(s.find.current, None); // nothing left to find
         assert_eq!(reveal(&fx), Some((0, 3))); // falls back to the replacement
     }

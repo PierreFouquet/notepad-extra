@@ -4,9 +4,12 @@ name: "native-ci"
 # Deliberately scoped to the workspace's native crates so it does not build the
 # Tauri app (no webkit needed). The existing `ci.yml` stays as-is until the #45
 # CI migration / #46 cutover fold these together.
+# Feature branches are covered by the `pull_request` trigger; the old
+# `feat/iced-migration` push entry was the Phase 0 integration branch, merged
+# and deleted via #60 (#98 hygiene).
 on:
   push:
-    branches: [main, feat/iced-migration]
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -23,12 +26,14 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: swatinem/rust-cache@v2
+      # `notepad-syntax` rides along here (#98): it was only ever *tested* (via
+      # the coverage job), so fmt/clippy regressions in it slipped every gate.
       - name: rustfmt
-        run: cargo fmt --package notepad-core -- --check
+        run: cargo fmt --package notepad-core --package notepad-syntax -- --check
       - name: clippy (deny warnings)
-        run: cargo clippy --package notepad-core --all-targets -- -D warnings
+        run: cargo clippy --package notepad-core --package notepad-syntax --all-targets -- -D warnings
       - name: test (unit + proptest + stress)
-        run: cargo test --package notepad-core --all-targets --verbose
+        run: cargo test --package notepad-core --package notepad-syntax --all-targets --verbose
 
   shell:
     # Windows & macOS are first-class for this epic (#25), so the shell is built
@@ -73,7 +78,9 @@ jobs:
           # A clean startup that stays alive until `timeout` kills it (exit 124)
           # is success; any earlier exit means the window failed to come up.
           set +e
-          xvfb-run -a timeout 10 ./target/debug/notepad-iced
+          # The crate's binary is `notepad-extra` (#95) — the name the desktop
+          # entry and man page promise.
+          xvfb-run -a timeout 10 ./target/debug/notepad-extra
           code=$?
           set -e
           if [ "$code" != "124" ]; then
@@ -113,8 +120,14 @@ jobs:
       # linked libc` / `E0463: can't find crate for std`.
       - name: build fuzz targets
         run: cargo fuzz build --fuzz-dir crates/core/fuzz --target x86_64-unknown-linux-gnu
-      - name: smoke-run each target (15s)
+      # Loop over `cargo fuzz list` rather than naming targets (#98): the old
+      # explicit list silently skipped half the targets (edit_diff, prefs_parse,
+      # brackets_match were built but never run), and a list can't forget a
+      # future seventh target.
+      - name: smoke-run every target (15s each)
         run: |
-          cargo fuzz run --fuzz-dir crates/core/fuzz --target x86_64-unknown-linux-gnu update_sequence -- -max_total_time=15
-          cargo fuzz run --fuzz-dir crates/core/fuzz --target x86_64-unknown-linux-gnu text_helpers   -- -max_total_time=15
-          cargo fuzz run --fuzz-dir crates/core/fuzz --target x86_64-unknown-linux-gnu find_search     -- -max_total_time=15
+          for target in $(cargo fuzz list --fuzz-dir crates/core/fuzz); do
+            echo "::group::fuzz $target"
+            cargo fuzz run --fuzz-dir crates/core/fuzz --target x86_64-unknown-linux-gnu "$target" -- -max_total_time=15
+            echo "::endgroup::"
+          done

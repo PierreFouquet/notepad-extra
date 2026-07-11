@@ -75,8 +75,13 @@ pub fn main() -> iced::Result {
     // live within the session.
     let prefs = load_preferences();
     let ui_default = fonts::resolve(&prefs.ui_font);
+    // `FILE…` arguments open one tab each at startup (#92): the `.desktop`
+    // entry's `Exec=notepad-extra %F` and the man page promise exactly this.
+    // Collected once here; `boot_with` does the opening so it stays headless-
+    // testable with synthetic argv.
+    let files: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
     let mut app = iced::application(
-        move || Shell::boot_with(prefs.clone()),
+        move || Shell::boot_with(prefs.clone(), files.clone()),
         Shell::update,
         Shell::view,
     )
@@ -570,15 +575,39 @@ impl Shell {
     /// The real startup path used by `main`: build the default shell, then apply
     /// the preferences already loaded from disk (#38). `main` reads the file once
     /// — for the first-paint UI font *and* here — and passes the snapshot in, so
-    /// startup no longer reads the config twice (#96). Kept separate from
-    /// [`Shell::new`] so the headless tests get a deterministic default shell that
-    /// never reads the user's real config.
-    fn boot_with(prefs: core::Preferences) -> (Self, Task<Message>) {
+    /// startup no longer reads the config twice (#96). `files` are the `FILE`
+    /// arguments from the command line (#92). Kept separate from [`Shell::new`]
+    /// so the headless tests get a deterministic default shell that never reads
+    /// the user's real config.
+    fn boot_with(prefs: core::Preferences, files: Vec<PathBuf>) -> (Self, Task<Message>) {
         let (mut shell, task) = Self::new();
         // Font size / word-wrap are read live from the core by `view`, so simply
         // applying the loaded prefs is enough — no editor rebuild needed.
         shell.core.apply_preferences(&prefs);
-        (shell, task)
+        let open = shell.open_startup_files(files);
+        (shell, Task::batch([task, open]))
+    }
+
+    /// Open the files passed on the command line, one tab each (#92) — the
+    /// `Exec=notepad-extra %F` desktop entry and the man page's `FILE…` promise.
+    /// Each path lands through the same [`Message::FileRead`] arm a dropped file
+    /// uses (#42), so an unreadable path (missing, directory, non-UTF-8) is
+    /// skipped without opening a tab, with the error surfaced in the status bar.
+    /// The reads are deliberately *synchronous*: the window is not up yet, and
+    /// dispatching the results in argv order is what guarantees the tabs appear
+    /// in argument order with the **last** file focused — a `Task` per file
+    /// would land in whatever order the reads complete. (Finder on macOS hands
+    /// files over as Apple open-file events rather than argv; that path is a
+    /// documented follow-up — argv still covers the terminal and `open --args`.)
+    fn open_startup_files(&mut self, paths: Vec<PathBuf>) -> Task<Message> {
+        let tasks: Vec<Task<Message>> = paths
+            .into_iter()
+            .map(|path| {
+                let result = core::io::read_file(&path);
+                self.dispatch(Message::FileRead { path, result })
+            })
+            .collect();
+        Task::batch(tasks)
     }
 
     fn new() -> (Self, Task<Message>) {
@@ -1977,6 +2006,77 @@ mod tests {
         // Boot title is fully formatted: name + app name, no dirty marker (#93).
         assert_eq!(shell.title, "Untitled — Notepad Extra");
         assert_eq!(shell.active_editor().text().trim_end(), "");
+    }
+
+    #[test]
+    fn boot_with_no_files_keeps_the_single_untitled_tab() {
+        // #92: an argv-less launch is the pre-existing startup, unchanged.
+        let (shell, _) = Shell::boot_with(core::Preferences::default(), Vec::new());
+        assert_eq!(shell.core.docs.len(), 1);
+        assert_eq!(shell.core.active_doc().title(), "Untitled");
+    }
+
+    #[test]
+    fn boot_opens_cli_files_one_tab_each_and_focuses_the_last() {
+        // #92: `notepad-extra a.txt b.rs` opens both, in argv order, with the
+        // last one focused — the `.desktop` `%F` / man-page `FILE…` promise.
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.txt");
+        let b = dir.path().join("b.rs");
+        std::fs::write(&a, "alpha").unwrap();
+        std::fs::write(&b, "fn beta() {}").unwrap();
+
+        let (shell, _) = Shell::boot_with(core::Preferences::default(), vec![a.clone(), b.clone()]);
+        // The pristine blank boot tab is recycled by the first load, so two
+        // files mean exactly two tabs.
+        assert_eq!(shell.core.docs.len(), 2);
+        assert_eq!(shell.core.docs[0].path.as_deref(), Some(a.as_path()));
+        assert_eq!(shell.core.docs[1].path.as_deref(), Some(b.as_path()));
+        assert_eq!(shell.core.active_doc().path.as_deref(), Some(b.as_path()));
+        assert_eq!(shell.core.active_doc().content, "fn beta() {}");
+        // The editor buffer shows the focused file, and nothing is dirty.
+        assert_eq!(shell.active_editor().text().trim_end(), "fn beta() {}");
+        assert!(shell.core.docs.iter().all(|d| !d.dirty()));
+        assert!(shell.title.contains("b.rs"), "title: {}", shell.title);
+    }
+
+    #[test]
+    fn boot_skips_unreadable_cli_paths_and_surfaces_the_error() {
+        // #92: bad paths (missing file, directory) open no tab — same skip
+        // behaviour as a bad drag-and-drop (#42) — while good ones still open.
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("good.md");
+        std::fs::write(&good, "# ok").unwrap();
+        let missing = dir.path().join("no-such-file.txt");
+
+        let (shell, _) = Shell::boot_with(
+            core::Preferences::default(),
+            vec![good.clone(), missing, dir.path().to_path_buf()],
+        );
+        assert_eq!(shell.core.docs.len(), 1, "only the readable file opened");
+        assert_eq!(
+            shell.core.active_doc().path.as_deref(),
+            Some(good.as_path())
+        );
+        assert_eq!(shell.core.active_doc().content, "# ok");
+        assert!(
+            shell.error.is_some(),
+            "the failed read is surfaced in the status bar"
+        );
+    }
+
+    #[test]
+    fn boot_with_only_bad_paths_still_starts_usable() {
+        // #92 adversarial: nothing readable on the command line must never
+        // panic or strand the app — it starts as the plain untitled editor
+        // with the error banner up.
+        let (shell, _) = Shell::boot_with(
+            core::Preferences::default(),
+            vec![PathBuf::from("/definitely/not/here.txt")],
+        );
+        assert_eq!(shell.core.docs.len(), 1);
+        assert_eq!(shell.core.active_doc().title(), "Untitled");
+        assert!(shell.error.is_some());
     }
 
     #[test]

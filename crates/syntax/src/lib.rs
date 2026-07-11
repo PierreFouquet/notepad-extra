@@ -494,6 +494,49 @@ mod tests {
         assert_eq!(detect("Cargo.toml"), "TOML");
     }
 
+    /// The two shell grammars two-face bundles (see `GROUP_ORDER`'s "Scripting"
+    /// group). A shell dotfile may resolve to either; item 6's concern is only
+    /// that it resolves to *a* shell rather than degrading to Plain Text.
+    const SHELL_SYNTAXES: &[&str] = &["Bourne Again Shell (bash)", "ShellScript (Bash)"];
+
+    #[test]
+    fn shell_dotfiles_detect_as_a_shell_not_plain_text() {
+        // #97 item 6: the old CodeMirror table mapped shell rc/profile files to
+        // Shell, and the pre-cutover review flagged that the native `detect` —
+        // which leans on syntect's whole-filename tokens (step 2 of `detect`,
+        // since a leading-dot name has no extension) — *might* now fall back to
+        // Plain Text. It doesn't: the real on-disk dotfiles resolve to a shell
+        // grammar. Lock that in so a future set/dump change can't silently
+        // regress it back to Plain Text.
+        for name in [
+            ".bashrc",
+            ".zshrc",
+            ".profile",
+            ".bash_profile",
+            ".zprofile",
+        ] {
+            let got = detect(name);
+            assert!(
+                SHELL_SYNTAXES.contains(&got),
+                "{name} should detect as a shell, got {got:?}"
+            );
+        }
+        // A directory prefix doesn't disturb the whole-name match.
+        assert!(SHELL_SYNTAXES.contains(&detect("/home/user/.zshrc")));
+    }
+
+    #[test]
+    fn dotless_shell_config_names_are_intentionally_plain_text() {
+        // The old table also listed the *dot-less* forms `bashrc` / `zshrc` /
+        // `profile` (#97 item 6, `logic.js:77`). Those are not real on-disk
+        // filenames — the actual files carry a leading dot (`.bashrc`, …) — so
+        // treating a bare `bashrc` as an unknown, extension-less name (→ Plain
+        // Text) is deliberate, documented here so it isn't "fixed" by accident.
+        for name in ["bashrc", "zshrc", "profile"] {
+            assert_eq!(detect(name), PLAIN_TEXT, "{name} is not a real filename");
+        }
+    }
+
     #[test]
     fn is_known_recognises_plain_text_and_real_syntaxes() {
         assert!(is_known(PLAIN_TEXT));

@@ -48,3 +48,16 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.regex-automata]
 opt-level = 3
+
+# Shipped-binary tuning (#100): with iced + tiny-skia + syntect + two-face's
+# embedded dumps in the tree, the default release profile (no LTO, 16 codegen
+# units, symbols kept) produces the large, unstripped binary distro reviewers
+# and AppImage users notice first. Thin LTO + one codegen unit shrink and
+# de-duplicate across the 200+ crate graph; stripping drops the symbol tables
+# (before/after sizes are recorded in the #100 PR). `panic` deliberately stays
+# at the default `unwind`: rfd/ashpd run user callbacks where an abort would be
+# a surprise, and unwind keeps `RUST_BACKTRACE` builds useful.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

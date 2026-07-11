@@ -11,7 +11,7 @@ use std::path::PathBuf;
 // Built here rather than deriving `Arbitrary` on the core types, so the core
 // stays free of the `arbitrary` dependency.
 fn arb_message(u: &mut Unstructured) -> arbitrary::Result<Message> {
-    Ok(match u.int_in_range(0u8..=27)? {
+    Ok(match u.int_in_range(0u8..=30)? {
         0 => Message::NewTab,
         1 => Message::OpenRequested,
         2 => Message::SaveRequested,
@@ -60,7 +60,14 @@ fn arb_message(u: &mut Unstructured) -> arbitrary::Result<Message> {
         // font-size clamp is exercised alongside everything else.
         25 => Message::ZoomIn,
         26 => Message::ZoomOut,
-        _ => Message::ZoomReset,
+        27 => Message::ZoomReset,
+        // Quit / window-close guard (#69): drive the request / discard-all /
+        // save-all paths so `pending_quit` can never strand — a save-all that
+        // never drains, or an abandon that leaves the app primed to exit on an
+        // unrelated later save, would surface here as a broken invariant.
+        28 => Message::QuitRequested,
+        29 => Message::QuitDiscardAll,
+        _ => Message::QuitSaveAll,
     })
 }
 

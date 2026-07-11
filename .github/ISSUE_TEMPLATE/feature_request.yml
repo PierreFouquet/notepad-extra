@@ -7,6 +7,19 @@ body:
     attributes:
       value: |
         Thanks for the idea! Please describe what you'd like and why it would help.
+  - type: markdown
+    attributes:
+      value: |
+        ### How features get built here
+        Notepad Extra is developed **test-first**. Nothing ships until it's covered in CI, so a feature isn't "done" until it has:
+        1. **Unit tests** on the pure `update`/logic core (no window or GPU).
+        2. **Property-based tests** (`proptest`) wherever inputs vary.
+        3. **Adversarial / stress tests** for extreme actions (huge inputs, thousands of tabs, catastrophic regex, binary input, …).
+        4. **Edge & error-path tests** (cancelled dialogs, missing / permission-denied files, out-of-range input, …).
+        5. **Fuzz targets** (`cargo-fuzz`) for anything that parses or decodes bytes.
+        6. A green **coverage gate** — the build fails below threshold (logic ~100%; `view`/render smoke-tested).
+
+        You don't need to write any tests to file a request — just help us by listing the **scenarios and edge cases** the tests should cover in the field below.
   - type: checkboxes
     id: preflight
     attributes:
@@ -33,6 +46,18 @@ body:
     attributes:
       label: Alternatives considered
       description: Any workarounds or other approaches you've thought about.
+    validations:
+      required: false
+  - type: textarea
+    id: test-scenarios
+    attributes:
+      label: Test scenarios & edge cases
+      description: |
+        Since features here are built test-first, help us define "done": what should work, and what tricky inputs or situations should be handled correctly? Think normal cases, extremes, and error paths.
+      placeholder: |
+        - Normal: ...
+        - Edge / extreme: very large input, empty input, thousands of tabs, ...
+        - Error path: cancelled dialog, missing/read-only file, invalid input, ...
     validations:
       required: false
   - type: textarea

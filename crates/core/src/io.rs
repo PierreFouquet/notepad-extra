@@ -195,11 +195,35 @@ mod tests {
     }
 
     #[test]
+    fn tmp_sibling_uses_the_current_dir_when_path_has_no_parent() {
+        let path = PathBuf::from("preferences.json");
+        assert_eq!(tmp_sibling(&path), PathBuf::from("preferences.json.tmp"));
+    }
+
+    #[test]
+    fn write_reports_an_error_when_a_parent_cannot_be_created() {
+        let dir = tempdir().expect("tempdir");
+        let blocked = dir.path().join("blocked");
+        fs::write(&blocked, "x").expect("seed a file");
+        let path = blocked.join("nested").join("child.txt");
+        assert!(write_file(&path, "data").is_err());
+    }
+
+    #[test]
     fn atomic_write_then_read_roundtrip_and_creates_dirs() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("cfg").join("preferences.json");
         write_file_atomic(&path, "{\"v\":1}").expect("write");
         assert_eq!(read_file(&path).expect("read"), "{\"v\":1}");
+    }
+
+    #[test]
+    fn atomic_write_reports_an_error_when_the_temp_file_cannot_be_created() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("preferences.json");
+        let tmp = dir.path().join("preferences.json.tmp");
+        fs::create_dir(&tmp).expect("reserve the temp path as a directory");
+        assert!(write_file_atomic(&path, "data").is_err());
     }
 
     #[test]

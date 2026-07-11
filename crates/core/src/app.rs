@@ -39,6 +39,9 @@ pub struct Document {
     /// Undo/redo history; also the source of truth for the unsaved-changes
     /// ("•") marker (see [`Document::dirty`]).
     pub history: History,
+    /// The last content that was saved to disk. Used to decide whether the
+    /// current buffer still matches the saved baseline.
+    pub(crate) saved_content: String,
 }
 
 impl Document {
@@ -51,6 +54,7 @@ impl Document {
             detected_lang: notepad_syntax::PLAIN_TEXT,
             manual_lang: None,
             history: History::new(),
+            saved_content: String::new(),
         }
     }
 
@@ -61,10 +65,10 @@ impl Document {
         self.manual_lang.unwrap_or(self.detected_lang)
     }
 
-    /// Whether the buffer has unsaved changes (the tab's "•" marker), delegated
-    /// to the undo history so undoing back to a saved state clears it.
+    /// Whether the buffer has unsaved changes (the tab's "•" marker), based on
+    /// whether the current content still matches the last saved baseline.
     pub fn dirty(&self) -> bool {
-        self.history.dirty()
+        self.content != self.saved_content
     }
 
     /// The tab / window title: the file name, or `Untitled` for a fresh buffer.
@@ -559,22 +563,24 @@ pub fn update(state: &mut State, message: Message) -> Vec<Effect> {
                 // carried (this is a new document, not an existing manual pick).
                 let doc = &mut state.docs[0];
                 doc.path = Some(path);
-                doc.content = normalized;
+                doc.content = normalized.clone();
                 doc.eol = eol;
                 doc.detected_lang = language;
                 doc.manual_lang = None;
                 doc.history = History::new(); // loaded content is the clean baseline
+                doc.saved_content = normalized.clone();
                 state.active = 0;
             } else {
                 let id = state.alloc_id();
                 state.docs.push(Document {
                     id,
                     path: Some(path),
-                    content: normalized,
+                    content: normalized.clone(),
                     eol,
                     detected_lang: language,
                     manual_lang: None,
                     history: History::new(),
+                    saved_content: normalized.clone(),
                 });
                 state.active = state.docs.len() - 1;
             }
@@ -655,6 +661,7 @@ pub fn update(state: &mut State, message: Message) -> Vec<Effect> {
                 // manual language override untouched — saving must not clobber it.
                 doc.detected_lang = notepad_syntax::detect(path.to_str().unwrap_or(""));
                 doc.path = Some(path);
+                doc.saved_content = doc.content.clone();
                 doc.history.mark_saved();
             }
             // A "save before closing" was waiting on this write (#31): now that it
@@ -920,15 +927,16 @@ fn close_doc_at(state: &mut State, index: usize) {
 }
 
 /// Apply `new_content` to the active document as one undo-able edit, returning
-/// the title effect only when this crosses the clean→dirty edge (so the tab's
-/// "•" appears exactly once), mirroring [`Message::Edited`].
+/// the title effect whenever the dirty state changes so the shell can keep the
+/// window title and the tab's "•" marker in sync, including the dirty→clean
+/// transition when the document is reverted to its saved baseline.
 fn apply_edit(state: &mut State, new_content: String) -> Vec<Effect> {
     let doc = &mut state.docs[state.active];
     if let Some(edit) = crate::history::diff(&doc.content, &new_content) {
         let was_dirty = doc.dirty();
         doc.history.record(edit);
         doc.content = new_content;
-        if !was_dirty {
+        if was_dirty != doc.dirty() {
             return title_effect(state);
         }
     }
@@ -1196,6 +1204,33 @@ mod tests {
         // Second edit stays dirty; no redundant title effect.
         let fx2 = update(&mut s, Message::Edited("ab".into()));
         assert!(fx2.is_empty());
+    }
+
+    #[test]
+    fn reverting_to_the_saved_baseline_clears_the_dirty_marker() {
+        let mut s = State::default();
+        load(&mut s, "/tmp/example.txt", "saved\n");
+        assert!(!s.active_doc().dirty());
+
+        let fx = update(&mut s, Message::Edited("changed".into()));
+        assert!(s.active_doc().dirty());
+        assert_eq!(
+            fx,
+            vec![Effect::SetTitle {
+                title: "example.txt".into(),
+                dirty: true,
+            }]
+        );
+
+        let fx = update(&mut s, Message::Edited("saved\n".into()));
+        assert!(!s.active_doc().dirty());
+        assert_eq!(
+            fx,
+            vec![Effect::SetTitle {
+                title: "example.txt".into(),
+                dirty: false,
+            }]
+        );
     }
 
     #[test]

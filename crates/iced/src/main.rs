@@ -46,11 +46,27 @@ mod fonts;
 mod highlight;
 use highlight::SyntectHighlighter;
 
-pub fn main() -> iced::Result {
-    let window = iced::window::Settings {
+/// The window settings for the app. Kept a named helper rather than an inline
+/// literal so the close-guard invariant (`exit_on_close_request: false`, #69) is
+/// unit-testable — `main`'s builder chain itself can't be driven headlessly, and
+/// this is exactly the setting that, if lost, makes the OS ✕ silently discard
+/// unsaved tabs.
+fn window_settings() -> iced::window::Settings {
+    iced::window::Settings {
         icon: window_icon(),
+        // Hold the OS window-close / quit so a dirty tab isn't discarded silently
+        // (#69): with this off, a close request arrives as `window::Event::CloseRequested`
+        // (mapped to `Message::QuitRequested`) instead of exiting, and the shell
+        // drives the actual close via `request_exit` once the core says it is safe.
+        // This must live *inside* the `Settings` passed to `.window(..)` — that
+        // builder replaces the whole struct, so a separate `.exit_on_close_request`
+        // call before it would be clobbered back to the default.
+        exit_on_close_request: false,
         ..iced::window::Settings::default()
-    };
+    }
+}
+
+pub fn main() -> iced::Result {
     // Register the one bundled family (#61) so the app renders offline. Read the
     // saved preferences once and use them for both the app-wide `default_font`
     // first-paint baseline and the shell's initial state (#96) — `boot_with`
@@ -69,7 +85,7 @@ pub fn main() -> iced::Result {
     .style(Shell::app_style)
     .theme(Shell::theme)
     .default_font(ui_default)
-    .window(window);
+    .window(window_settings());
     for face in fonts::BUNDLED_FONT_FACES {
         app = app.font(*face);
     }
@@ -77,14 +93,17 @@ pub fn main() -> iced::Result {
 }
 
 /// Map raw window events to shell messages for the drag-and-drop subscription
-/// (#42). We track the three drag phases the toolkit reports: a file *hovering*
-/// over the window (raise the drop overlay), the cursor *leaving* with the files
-/// (drop it), and a file *dropped* (open it). Files are delivered **one path per
-/// event** — so hovering or dropping several fires these once each. `status` and
-/// `window::Id` are irrelevant (a drag is never captured by a widget, and there
-/// is a single window), so they are ignored. Kept a free `fn` (not a closure)
-/// because `iced::event::listen_with` takes a plain function pointer, and pure so
-/// the mapping is unit-testable without a runtime.
+/// (#42) and the window-close guard (#69). We track the three drag phases the
+/// toolkit reports: a file *hovering* over the window (raise the drop overlay),
+/// the cursor *leaving* with the files (drop it), and a file *dropped* (open it).
+/// Files are delivered **one path per event** — so hovering or dropping several
+/// fires these once each. A `CloseRequested` (title-bar ✕, `Alt+F4`, …) becomes a
+/// [`Message::QuitRequested`]: because `main` sets `exit_on_close_request(false)`,
+/// that request no longer closes the window on its own — the guard decides. `status`
+/// and `window::Id` are irrelevant (a drag is never captured by a widget, and there
+/// is a single window, closed via `window::latest`), so they are ignored. Kept a
+/// free `fn` (not a closure) because `iced::event::listen_with` takes a plain
+/// function pointer, and pure so the mapping is unit-testable without a runtime.
 fn on_window_event(
     event: iced::Event,
     _status: iced::event::Status,
@@ -98,8 +117,19 @@ fn on_window_event(
         iced::Event::Window(iced::window::Event::FileDropped(path)) => {
             Some(Message::FileDropped(path))
         }
+        iced::Event::Window(iced::window::Event::CloseRequested) => Some(Message::QuitRequested),
         _ => None,
     }
+}
+
+/// Close the sole application window, ending the iced `application` (#69). Called
+/// once the core says it is safe to exit — nothing was unsaved, the user discarded,
+/// or every save-before-quit landed. `window::latest` avoids threading a window id
+/// through the deferred save-all path, and `Task::<Option<_>>::and_then` runs the
+/// close only when a window exists (there always is one). iced 0.14 has no
+/// `iced::exit()`, so closing the last window *is* the process exit.
+fn request_exit() -> Task<Message> {
+    iced::window::latest().and_then(iced::window::close)
 }
 
 /// Map a key press to a shell [`Message`] for the global keyboard-shortcut
@@ -145,6 +175,7 @@ fn on_key(key: iced::keyboard::Key, modifiers: iced::keyboard::Modifiers) -> Opt
 /// * **Ctrl/Cmd+F / H / G** — open the find bar (its find, replace and go-to
 ///   fields share one bar, so all three simply open it).
 /// * **Ctrl/Cmd+ = / + / - / _ / 0** — zoom in / out / reset.
+/// * **Ctrl/Cmd+Q** — quit through the unsaved-changes guard (#69).
 ///
 /// The "command" key is Ctrl elsewhere and ⌘ on macOS ([`iced::keyboard::Modifiers::command`]),
 /// so one table serves every platform. We read the unmodified `key` plus the
@@ -181,6 +212,10 @@ fn command_shortcut(
         "=" | "+" => Some(Message::ZoomIn),
         "-" | "_" => Some(Message::ZoomOut),
         "0" => Some(Message::ZoomReset),
+        // Ctrl+Q / ⌘Q — quit through the unsaved-changes guard (#69). This is the
+        // explicit path for macOS, whose ⌘Q app-termination can bypass the window
+        // `CloseRequested` event; on Linux / Windows it is a keyboard alias for ✕.
+        "q" => Some(Message::QuitRequested),
         _ => None,
     }
 }
@@ -270,6 +305,12 @@ enum Message {
         id: TabId,
         choice: CloseChoice,
     },
+    /// The OS window-close / app-quit was requested — title-bar ✕, `Alt+F4`,
+    /// `Ctrl+Q` / `Cmd+Q` (#69). Routed through the core's unsaved-changes guard,
+    /// which either exits at once or asks via the quit-all confirm bar.
+    QuitRequested,
+    /// The user answered the quit-with-unsaved prompt (#69).
+    QuitChoiceMade(QuitChoice),
     /// The `text_editor` widget produced an action (typing, cursor move, …).
     Edit(text_editor::Action),
     /// The open dialog resolved (`None` = cancelled).
@@ -434,6 +475,18 @@ enum CloseChoice {
     Cancel,
 }
 
+/// The user's answer to the quit-with-unsaved prompt (#69) — the whole-app
+/// analogue of [`CloseChoice`].
+#[derive(Debug, Clone, Copy)]
+enum QuitChoice {
+    /// Save every dirty document, then quit.
+    SaveAll,
+    /// Discard every unsaved change and quit.
+    DiscardAll,
+    /// Keep the app open.
+    Cancel,
+}
+
 /// A document awaiting the user's answer to "close with unsaved changes?" (#31).
 /// Rendered as an in-app bar rather than a native dialog: the `xdg-portal`
 /// backend exposes no message dialog, and an in-app modal keeps the app fully
@@ -464,6 +517,11 @@ struct Shell {
     /// The tab whose close is awaiting confirmation, if any (#31); drives the
     /// in-app confirm bar in [`Shell::view`].
     confirm_close: Option<PendingClose>,
+    /// The dirty-document count while a *quit* awaits confirmation, if any (#69);
+    /// drives the quit-all confirm bar in [`Shell::view`]. `Some(n)` means the
+    /// core raised [`Effect::ConfirmQuit`] for `n` unsaved documents; `None` means
+    /// no quit is pending. The whole-app analogue of `confirm_close`.
+    confirm_quit: Option<usize>,
     /// Whether a file drag is currently hovering over the window (#42); drives the
     /// "drop to open" overlay in [`Shell::view`].
     drag_hover: bool,
@@ -541,6 +599,7 @@ impl Shell {
                 error: None,
                 goto_input: String::new(),
                 confirm_close: None,
+                confirm_quit: None,
                 drag_hover: false,
                 context_menu: None,
                 cursor_in_editor: Point::ORIGIN,
@@ -648,6 +707,19 @@ impl Shell {
                         self.apply_core(core::Message::TabCloseDiscard(id), false)
                     }
                     CloseChoice::Cancel => Task::none(),
+                }
+            }
+
+            // Quit / window-close guard (#69). The request routes through the core,
+            // which either exits at once (nothing dirty) or raises `ConfirmQuit` for
+            // the shell to show the quit-all bar; the answer maps back to the core.
+            Message::QuitRequested => self.apply_core(core::Message::QuitRequested, false),
+            Message::QuitChoiceMade(choice) => {
+                self.confirm_quit = None;
+                match choice {
+                    QuitChoice::SaveAll => self.apply_core(core::Message::QuitSaveAll, false),
+                    QuitChoice::DiscardAll => self.apply_core(core::Message::QuitDiscardAll, false),
+                    QuitChoice::Cancel => Task::none(),
                 }
             }
 
@@ -1088,6 +1160,19 @@ impl Shell {
                 self.confirm_close = Some(PendingClose { id, title });
                 Task::none()
             }
+            // Surface the quit-with-unsaved prompt as the in-app quit-all bar (#69);
+            // the buttons feed back a [`Message::QuitChoiceMade`]. Same rationale as
+            // `ConfirmClose` — an in-app bar, not a native dialog, keeps the app
+            // offline and headlessly testable.
+            Effect::ConfirmQuit { dirty } => {
+                self.confirm_quit = Some(dirty);
+                Task::none()
+            }
+            // The core says it is safe to exit (#69): close the sole window, which
+            // ends the iced `application`. `window::latest` avoids threading a
+            // window id through the deferred save-all-then-quit path, and there is
+            // no `iced::exit()` in iced 0.14.
+            Effect::Quit => request_exit(),
             // Persist preferences to the config file off the UI thread (#38),
             // coalescing concurrent writes so a burst never persists a stale
             // snapshot (#96) — see [`Shell::queue_prefs_write`].
@@ -1403,6 +1488,9 @@ impl Shell {
         if self.confirm_close.is_some() {
             layout = layout.push(self.confirm_bar());
         }
+        if self.confirm_quit.is_some() {
+            layout = layout.push(self.quit_confirm_bar());
+        }
         if self.core.find.open {
             layout = layout.push(self.find_bar());
         }
@@ -1448,6 +1536,38 @@ impl Shell {
                         id,
                         choice: CloseChoice::Cancel,
                     }),
+            ]
+            .spacing(8),
+        )
+        .padding(6)
+        .into()
+    }
+
+    /// The in-app "quit with unsaved changes?" bar, shown while a quit awaits the
+    /// user's answer (#69) — the whole-app analogue of [`Shell::confirm_bar`]. Save
+    /// all / Discard all / Cancel map to [`QuitChoice`]s. Rendered as an in-app bar
+    /// rather than a native dialog for the same reasons as `confirm_bar`: the
+    /// `xdg-portal` backend exposes no message dialog, and an in-app modal keeps the
+    /// app fully offline and headlessly testable.
+    fn quit_confirm_bar(&self) -> Element<'_, Message> {
+        let Some(dirty) = self.confirm_quit else {
+            return row![].into(); // never rendered unless set; empty as a guard
+        };
+        let ui = self.ui_font();
+        let noun = if dirty == 1 { "document" } else { "documents" };
+        let prompt = format!("{dirty} unsaved {noun}.");
+        container(
+            row![
+                text(prompt).font(ui),
+                button(text("Save all").font(ui))
+                    .style(button::primary)
+                    .on_press(Message::QuitChoiceMade(QuitChoice::SaveAll)),
+                button(text("Discard all").font(ui))
+                    .style(button::danger)
+                    .on_press(Message::QuitChoiceMade(QuitChoice::DiscardAll)),
+                button(text("Cancel").font(ui))
+                    .style(button::secondary)
+                    .on_press(Message::QuitChoiceMade(QuitChoice::Cancel)),
             ]
             .spacing(8),
         )
@@ -2463,6 +2583,169 @@ mod tests {
         assert_eq!(shell.core.docs.len(), 1);
     }
 
+    // ---- Quit / window-close guard wiring (#69) ----
+
+    #[test]
+    fn the_window_holds_the_close_request_for_the_quit_guard() {
+        // Regression guard (#69): the OS close request must NOT auto-exit — the
+        // shell has to intercept it as `QuitRequested` so unsaved tabs can prompt.
+        // If this flips back to `true` (e.g. a stray `.exit_on_close_request` call
+        // clobbered by `.window(..)`, the original bug), closing the window with a
+        // dirty tab silently discards it and no `CloseRequested` ever reaches us.
+        assert!(
+            !window_settings().exit_on_close_request,
+            "the window must hold its close request for the unsaved-changes guard"
+        );
+    }
+
+    #[test]
+    fn close_request_and_ctrl_q_route_to_the_quit_guard() {
+        // The window ✕ / Alt+F4 close request and the Ctrl/⌘+Q accelerator both
+        // enter the unsaved-changes guard rather than exiting outright (#69).
+        let id = iced::window::Id::unique();
+        let status = iced::event::Status::Ignored;
+        let close = iced::Event::Window(iced::window::Event::CloseRequested);
+        assert!(matches!(
+            on_window_event(close, status, id),
+            Some(Message::QuitRequested)
+        ));
+        // Ctrl/⌘+Q, regardless of the key's reported case…
+        assert!(matches!(
+            on_key(ch("q"), cmd()),
+            Some(Message::QuitRequested)
+        ));
+        assert!(matches!(
+            on_key(ch("Q"), cmd()),
+            Some(Message::QuitRequested)
+        ));
+        // …but a bare "q" with no command modifier is just typing.
+        assert!(on_key(ch("q"), Modifiers::empty()).is_none());
+    }
+
+    #[test]
+    fn quitting_with_a_dirty_tab_asks_before_exiting() {
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::Edit(paste("unsaved")));
+        assert!(shell.core.active_doc().dirty());
+        let _ = shell.update(Message::QuitRequested);
+        // Nothing exits; the quit-all bar is armed with the unsaved count instead.
+        assert_eq!(shell.confirm_quit, Some(1));
+        assert_eq!(shell.core.docs.len(), 1);
+        let _ = shell.view(); // the quit bar builds
+    }
+
+    #[test]
+    fn quitting_clean_exits_without_a_prompt() {
+        // A pristine window quits straight away — no bar, exactly as before the
+        // guard existed. (The core emits `Quit`; `run_effect` issues the window
+        // close, which can't be observed headlessly, so we assert the *absence* of
+        // a prompt — the branch that distinguishes clean from dirty.)
+        let (mut shell, _) = Shell::new();
+        assert!(!shell.core.active_doc().dirty());
+        let _ = shell.update(Message::QuitRequested);
+        assert!(
+            shell.confirm_quit.is_none(),
+            "a clean quit raises no prompt"
+        );
+    }
+
+    #[test]
+    fn the_quit_bar_counts_every_unsaved_document() {
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::Edit(paste("one"))); // doc 0 dirty
+        let _ = shell.update(Message::NewTab);
+        let _ = shell.update(Message::Edit(paste("two"))); // doc 1 dirty
+        let _ = shell.update(Message::QuitRequested);
+        assert_eq!(shell.confirm_quit, Some(2), "both unsaved docs are counted");
+        let _ = shell.view();
+    }
+
+    #[test]
+    fn cancelling_quit_keeps_the_app_and_clears_the_prompt() {
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::Edit(paste("stay")));
+        let _ = shell.update(Message::QuitRequested);
+        assert!(shell.confirm_quit.is_some());
+        let _ = shell.update(Message::QuitChoiceMade(QuitChoice::Cancel));
+        assert!(shell.confirm_quit.is_none());
+        assert_eq!(shell.core.docs.len(), 1);
+        assert!(shell.core.active_doc().dirty(), "the doc keeps its changes");
+        assert_eq!(shell.active_editor().text().trim_end(), "stay");
+    }
+
+    #[test]
+    fn discarding_all_on_quit_dismisses_the_prompt() {
+        // Discard-all clears the bar and hands the core a `QuitDiscardAll`, which
+        // emits `Quit` → the window close (unobservable headlessly). We assert the
+        // prompt is gone and the path runs without panicking.
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::Edit(paste("throwaway")));
+        let _ = shell.update(Message::QuitRequested);
+        assert!(shell.confirm_quit.is_some());
+        let _ = shell.update(Message::QuitChoiceMade(QuitChoice::DiscardAll));
+        assert!(shell.confirm_quit.is_none());
+    }
+
+    #[test]
+    fn saving_all_on_quit_writes_each_dirty_doc() {
+        // Save-all clears the bar and kicks off the writes; when a write lands (fed
+        // as the runtime would), the doc is marked saved — proof the save-all path
+        // wrote it. The final `Quit` (window close) is exercised by the core tests.
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::FileRead {
+            path: PathBuf::from("/tmp/doc.txt"),
+            result: Ok("orig".to_string()),
+        }); // doc 0: clean, titled
+        let _ = shell.update(Message::Edit(paste("edited"))); // doc 0 dirty
+        let id = shell.core.active_doc().id;
+
+        let _ = shell.update(Message::QuitRequested);
+        assert_eq!(shell.confirm_quit, Some(1));
+        let _ = shell.update(Message::QuitChoiceMade(QuitChoice::SaveAll));
+        assert!(shell.confirm_quit.is_none());
+
+        // The async write can't run headless; land its result as the runtime would.
+        let _ = shell.update(Message::Saved {
+            id,
+            path: PathBuf::from("/tmp/doc.txt"),
+            result: Ok(()),
+        });
+        assert!(
+            !shell.core.active_doc().dirty(),
+            "the save-all write landed and cleaned the doc"
+        );
+    }
+
+    #[test]
+    fn cancelling_a_save_picker_during_quit_keeps_the_app() {
+        // Save-all on an untitled doc opens the Save-As picker; cancelling it aborts
+        // the whole quit and leaves the app open with the tab intact (#69).
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::Edit(paste("scratch"))); // untitled, dirty
+        let id = shell.core.active_doc().id;
+        let _ = shell.update(Message::QuitRequested);
+        let _ = shell.update(Message::QuitChoiceMade(QuitChoice::SaveAll)); // → save picker
+        let _ = shell.update(Message::SavePicked { id, path: None }); // user cancels
+        assert_eq!(shell.core.docs.len(), 1, "still open");
+        assert!(shell.core.active_doc().dirty(), "the changes are kept");
+        // A later successful save of the same tab must NOT surprise-exit the app.
+        let _ = shell.update(Message::Saved {
+            id,
+            path: PathBuf::from("/tmp/x.txt"),
+            result: Ok(()),
+        });
+        assert_eq!(shell.core.docs.len(), 1);
+    }
+
+    #[test]
+    fn the_quit_effect_issues_an_exit_without_panicking() {
+        // The `Quit` effect maps to the window-close task; exercise it directly so
+        // the exit plumbing (`request_exit`) is covered even though the returned
+        // task can't be driven headlessly.
+        let (mut shell, _) = Shell::new();
+        let _ = shell.run_effect(Effect::Quit);
+    }
+
     // ---- Find / Replace / Go-to-line wiring (#33) ----
 
     #[test]
@@ -3155,8 +3438,9 @@ mod tests {
         assert!(on_key(ch("n"), Modifiers::empty()).is_none());
         assert!(on_key(ch("a"), Modifiers::empty()).is_none());
         // The editor's own Ctrl+C/V/X/A bindings and any other unbound accelerator
-        // map to nothing here, so the widget's default binding keeps them.
-        for c in ["c", "v", "x", "a", "q", "1"] {
+        // map to nothing here, so the widget's default binding keeps them. (Ctrl+Q
+        // is deliberately *not* in this set — it is the quit accelerator, #69.)
+        for c in ["c", "v", "x", "a", "1"] {
             assert!(
                 on_key(ch(c), cmd()).is_none(),
                 "Ctrl+{c} is not a shell accelerator"

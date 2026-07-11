@@ -181,6 +181,15 @@ pub struct State {
     /// if that save is cancelled or fails — so an abandoned save never leaves a
     /// tab primed to vanish on the next unrelated save.
     pending_close: Option<TabId>,
+    /// The documents (by stable id) whose in-flight "save before quitting" writes
+    /// must all land before the app exits (#69) — the whole-app analogue of
+    /// [`State::pending_close`]. `None` means no quit is in progress. Armed by
+    /// [`Message::QuitSaveAll`], drained one id at a time by [`Message::FileSaved`]
+    /// (the app quits once it empties), and cleared wholesale by
+    /// [`Message::SaveAbandoned`] if any of those saves is cancelled or fails — so
+    /// a single cancelled Save-As aborts the quit and the app stays open rather
+    /// than exiting with the remaining tabs' changes only half-written.
+    pending_quit: Option<Vec<TabId>>,
     next_id: TabId,
 }
 
@@ -198,6 +207,7 @@ impl Default for State {
             ui_font: State::DEFAULT_UI_FONT.to_string(),
             theme: ThemeMode::default(),
             pending_close: None,
+            pending_quit: None,
             next_id: 1,
         };
         let id = state.alloc_id();
@@ -423,6 +433,25 @@ pub enum Message {
     /// close it once the write lands (see `pending_close`).
     TabCloseSave(TabId),
 
+    // ---- Quit / window-close guard (#69) ----
+    /// The OS window-close / app-quit was requested (title-bar ✕, `Alt+F4`,
+    /// `Ctrl+Q` / `Cmd+Q`, …). If no document has unsaved changes this yields
+    /// [`Effect::Quit`] and the shell exits at once, exactly as before the guard.
+    /// If any document is dirty it instead yields [`Effect::ConfirmQuit`] — the
+    /// whole-app analogue of [`Effect::ConfirmClose`] — and nothing changes until
+    /// the user answers with one of the two messages below (or cancels, which the
+    /// shell handles by simply dropping the prompt).
+    QuitRequested,
+    /// The user chose to discard every unsaved change and quit (#69): yields
+    /// [`Effect::Quit`] immediately.
+    QuitDiscardAll,
+    /// The user chose to save every dirty document before quitting (#69). Kicks off
+    /// a save for each (a `WriteFile`, or a `PickSavePath` for an untitled one) and
+    /// arms `pending_quit`; [`Message::FileSaved`] finishes the quit once the last
+    /// of those writes lands. A cancelled / failed save ([`Message::SaveAbandoned`])
+    /// aborts the whole quit, leaving the app open.
+    QuitSaveAll,
+
     // ---- Find / Replace / Go-to-line (#33) ----
     /// Open the find / replace bar and refresh its readout. Opening leaves the
     /// caret where it is — a residual query is recounted but not re-selected
@@ -527,6 +556,18 @@ pub enum Effect {
     /// [`Message::TabCloseSave`], [`Message::TabCloseDiscard`], or nothing
     /// (cancel). `title` names the document for the prompt (#31).
     ConfirmClose { id: TabId, title: String },
+    /// A quit was requested while `dirty` documents have unsaved changes (#69).
+    /// The shell shows the quit-all prompt ("N unsaved document(s) — Save all /
+    /// Discard all / Cancel"), replying with [`Message::QuitSaveAll`],
+    /// [`Message::QuitDiscardAll`], or nothing (cancel). The whole-app analogue of
+    /// [`Effect::ConfirmClose`]; `dirty` is the count for the prompt's wording.
+    ConfirmQuit { dirty: usize },
+    /// It is safe to exit: no unsaved changes remain (or the user chose to discard
+    /// them, or every save-before-quit has landed). The shell performs the actual
+    /// window close / process exit (#69). The core never exits a process itself —
+    /// like every other side effect, the decision is made here and carried out by
+    /// the shell.
+    Quit,
     /// Persist the app-wide preferences to the config file (#38). Emitted when a
     /// persistable setting (zoom #35, word-wrap #34) changes; the shell writes
     /// the JSON and swallows any write error rather than interrupting editing.
@@ -673,12 +714,34 @@ pub fn update(state: &mut State, message: Message) -> Vec<Effect> {
                 }
                 resync_find_after_doc_change(state);
             }
+            // A "save before quitting" (#69) may also be waiting on this write:
+            // drop this id from the pending set and, once every dirty document has
+            // been saved, exit. Returning `Quit` supersedes the title update — the
+            // window is about to close, so there is nothing left to retitle.
+            if let Some(pending) = &mut state.pending_quit {
+                pending.retain(|&pid| pid != id);
+                if pending.is_empty() {
+                    state.pending_quit = None;
+                    return vec![Effect::Quit];
+                }
+            }
             title_effect(state)
         }
 
         Message::SaveAbandoned { id } => {
             if state.pending_close == Some(id) {
                 state.pending_close = None;
+            }
+            // A cancelled Save-As or a failed write for one of the documents in a
+            // "save all before quitting" (#69) aborts the whole quit: clearing
+            // `pending_quit` leaves the app open with every tab intact, rather than
+            // exiting with some tabs saved and this one's changes silently lost.
+            if state
+                .pending_quit
+                .as_ref()
+                .is_some_and(|pending| pending.contains(&id))
+            {
+                state.pending_quit = None;
             }
             vec![]
         }
@@ -738,6 +801,52 @@ pub fn update(state: &mut State, message: Message) -> Vec<Effect> {
                     vec![fx]
                 }
                 None => vec![], // unknown id: nothing to save or close
+            }
+        }
+
+        // ---- Quit / window-close guard (#69) ----
+        Message::QuitRequested => {
+            // Quit at once when nothing is unsaved; otherwise hand the shell a
+            // quit-all prompt and change nothing until the user answers. Mirrors
+            // `TabClosed`'s clean-vs-dirty split, but across every document.
+            let dirty = state.docs.iter().filter(|d| d.dirty()).count();
+            if dirty == 0 {
+                vec![Effect::Quit]
+            } else {
+                vec![Effect::ConfirmQuit { dirty }]
+            }
+        }
+
+        Message::QuitDiscardAll => vec![Effect::Quit],
+
+        Message::QuitSaveAll => {
+            // Kick off a save for every dirty document, then quit once the last
+            // write lands (see `pending_quit` + `FileSaved`). Each save mirrors
+            // `TabCloseSave`: an already-titled doc writes in place, an untitled
+            // one first needs a destination. Clean docs need no save and so never
+            // join the pending set. If nothing is dirty after all (the state moved
+            // between prompt and answer), just quit.
+            let mut effects = Vec::new();
+            let mut pending = Vec::new();
+            for doc in &state.docs {
+                if !doc.dirty() {
+                    continue;
+                }
+                pending.push(doc.id);
+                effects.push(match &doc.path {
+                    Some(path) => Effect::WriteFile {
+                        id: doc.id,
+                        path: path.clone(),
+                        content: doc.eol.join(&doc.content),
+                    },
+                    None => Effect::PickSavePath { id: doc.id },
+                });
+            }
+            if pending.is_empty() {
+                vec![Effect::Quit]
+            } else {
+                state.pending_quit = Some(pending);
+                effects
             }
         }
 
@@ -1723,6 +1832,242 @@ mod tests {
         let fx = update(&mut s, Message::TabCloseSave(9999));
         assert!(fx.is_empty());
         assert_eq!(s.pending_close, None);
+    }
+
+    // ---- Quit / window-close guard (#69) ----
+
+    /// Whether a set of effects asks the shell to exit.
+    fn has_quit(fx: &[Effect]) -> bool {
+        fx.iter().any(|e| matches!(e, Effect::Quit))
+    }
+
+    /// The dirty-doc count of a `ConfirmQuit` effect in a set, if present.
+    fn confirm_quit(fx: &[Effect]) -> Option<usize> {
+        fx.iter().find_map(|e| match e {
+            Effect::ConfirmQuit { dirty } => Some(*dirty),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn quitting_with_no_unsaved_changes_exits_at_once() {
+        let mut s = State::default();
+        load(&mut s, "/t/a.txt", "clean"); // one clean, titled doc
+        let fx = update(&mut s, Message::QuitRequested);
+        assert_eq!(fx, vec![Effect::Quit], "nothing dirty → quit immediately");
+        assert_eq!(s.pending_quit, None);
+    }
+
+    #[test]
+    fn quitting_with_a_dirty_doc_asks_first() {
+        let mut s = State::default();
+        update(&mut s, Message::Edited("unsaved".into()));
+        let fx = update(&mut s, Message::QuitRequested);
+        // The prompt is raised and nothing changes — same restraint as a dirty
+        // single-tab close: no docs vanish until the user answers.
+        assert_eq!(confirm_quit(&fx), Some(1));
+        assert!(!has_quit(&fx));
+        assert_eq!(s.docs.len(), 1);
+        assert!(s.active_doc().dirty());
+        assert_eq!(s.pending_quit, None);
+    }
+
+    #[test]
+    fn quit_confirm_counts_only_the_dirty_documents() {
+        let mut s = State::default();
+        load(&mut s, "/t/a.txt", "a"); // doc 0: clean
+        update(&mut s, Message::NewTab);
+        update(&mut s, Message::Edited("x".into())); // doc 1: dirty
+        update(&mut s, Message::NewTab);
+        update(&mut s, Message::Edited("y".into())); // doc 2: dirty
+        let fx = update(&mut s, Message::QuitRequested);
+        assert_eq!(confirm_quit(&fx), Some(2), "two of the three are dirty");
+    }
+
+    #[test]
+    fn discard_all_on_quit_exits() {
+        let mut s = State::default();
+        update(&mut s, Message::Edited("throwaway".into()));
+        let fx = update(&mut s, Message::QuitDiscardAll);
+        assert_eq!(fx, vec![Effect::Quit]);
+    }
+
+    #[test]
+    fn save_all_on_quit_writes_every_titled_doc_then_exits() {
+        let mut s = State::default();
+        load(&mut s, "/t/a.txt", "a"); // doc 0: titled (reused blank)
+        update(&mut s, Message::Edited("aa".into())); // doc 0 dirty
+        let id0 = s.active_doc().id;
+        load(&mut s, "/t/b.txt", "b"); // doc 1: titled, now active (doc 0 is dirty, not reused)
+        update(&mut s, Message::Edited("bb".into())); // doc 1 dirty
+        let id1 = s.active_doc().id;
+        assert_eq!(s.docs.len(), 2);
+
+        // Save-all fires one write per dirty doc (in document order) and arms the
+        // pending set; the app has not quit yet.
+        let fx = update(&mut s, Message::QuitSaveAll);
+        assert_eq!(
+            fx,
+            vec![
+                Effect::WriteFile {
+                    id: id0,
+                    path: PathBuf::from("/t/a.txt"),
+                    content: "aa".into(),
+                },
+                Effect::WriteFile {
+                    id: id1,
+                    path: PathBuf::from("/t/b.txt"),
+                    content: "bb".into(),
+                },
+            ]
+        );
+        assert_eq!(s.pending_quit, Some(vec![id0, id1]));
+        assert!(!has_quit(&fx));
+
+        // The first write landing is not enough — one dirty doc is still pending.
+        let fx0 = update(
+            &mut s,
+            Message::FileSaved {
+                id: id0,
+                path: PathBuf::from("/t/a.txt"),
+            },
+        );
+        assert!(!has_quit(&fx0), "one save still outstanding");
+        assert_eq!(s.pending_quit, Some(vec![id1]));
+
+        // The last write landing drains the set and exits exactly once.
+        let fx1 = update(
+            &mut s,
+            Message::FileSaved {
+                id: id1,
+                path: PathBuf::from("/t/b.txt"),
+            },
+        );
+        assert!(has_quit(&fx1), "every save landed → quit");
+        assert_eq!(s.pending_quit, None);
+    }
+
+    #[test]
+    fn save_all_on_quit_picks_a_path_for_an_untitled_doc_then_exits() {
+        let mut s = State::default();
+        update(&mut s, Message::Edited("scratch".into())); // doc 0: untitled, dirty
+        let id = s.active_doc().id;
+        let fx = update(&mut s, Message::QuitSaveAll);
+        assert_eq!(fx, vec![Effect::PickSavePath { id }]); // needs a destination
+        assert_eq!(s.pending_quit, Some(vec![id]));
+
+        // The picker resolves → write; the write lands → the app exits.
+        update(
+            &mut s,
+            Message::SavePathChosen {
+                id,
+                path: PathBuf::from("/t/s.txt"),
+            },
+        );
+        assert_eq!(
+            s.pending_quit,
+            Some(vec![id]),
+            "still pending until it lands"
+        );
+        let done = update(
+            &mut s,
+            Message::FileSaved {
+                id,
+                path: PathBuf::from("/t/s.txt"),
+            },
+        );
+        assert!(has_quit(&done));
+        assert_eq!(s.pending_quit, None);
+    }
+
+    #[test]
+    fn save_all_fires_only_for_dirty_docs() {
+        let mut s = State::default();
+        load(&mut s, "/t/clean.txt", "keep"); // doc 0: clean
+        update(&mut s, Message::NewTab);
+        update(&mut s, Message::Edited("dirty".into())); // doc 1: untitled dirty
+        let dirty_id = s.active_doc().id;
+        let fx = update(&mut s, Message::QuitSaveAll);
+        assert_eq!(
+            fx,
+            vec![Effect::PickSavePath { id: dirty_id }],
+            "the clean doc needs no save"
+        );
+        assert_eq!(s.pending_quit, Some(vec![dirty_id]));
+    }
+
+    #[test]
+    fn save_all_with_nothing_dirty_just_quits() {
+        // Defensive: if the state lost its dirt between prompt and answer, a
+        // save-all has nothing to write and simply exits rather than stranding an
+        // empty pending set that would never drain.
+        let mut s = State::default();
+        load(&mut s, "/t/a.txt", "clean");
+        let fx = update(&mut s, Message::QuitSaveAll);
+        assert_eq!(fx, vec![Effect::Quit]);
+        assert_eq!(s.pending_quit, None);
+    }
+
+    #[test]
+    fn abandoning_a_save_during_quit_aborts_the_whole_quit() {
+        // Cancelling the Save-As for one document (or a failed write) during
+        // "save all before quitting" keeps the app open with every tab intact —
+        // never a half-saved exit.
+        let mut s = State::default();
+        load(&mut s, "/t/a.txt", "a"); // doc 0: titled
+        update(&mut s, Message::Edited("aa".into())); // doc 0 dirty
+        let id0 = s.active_doc().id;
+        update(&mut s, Message::NewTab);
+        update(&mut s, Message::Edited("scratch".into())); // doc 1: untitled dirty
+        let id1 = s.active_doc().id;
+        update(&mut s, Message::QuitSaveAll); // writes doc 0, picks for doc 1
+        assert_eq!(s.pending_quit, Some(vec![id0, id1]));
+
+        // The user cancels doc 1's Save-As picker: the entire quit is called off.
+        let fx = update(&mut s, Message::SaveAbandoned { id: id1 });
+        assert!(fx.is_empty());
+        assert_eq!(s.pending_quit, None, "the quit is aborted");
+        assert_eq!(s.docs.len(), 2, "both tabs stay open");
+
+        // And doc 0's write landing afterwards must NOT resurrect the quit.
+        let after = update(
+            &mut s,
+            Message::FileSaved {
+                id: id0,
+                path: PathBuf::from("/t/a.txt"),
+            },
+        );
+        assert!(
+            !has_quit(&after),
+            "an aborted quit never exits on a later save"
+        );
+    }
+
+    proptest! {
+        /// A quit request exits immediately exactly when nothing is unsaved, and
+        /// otherwise asks with the precise dirty-doc count — no matter how the tabs
+        /// are arranged.
+        #[test]
+        fn quit_exits_iff_nothing_is_dirty(dirty_flags in prop::collection::vec(any::<bool>(), 1..8)) {
+            let mut s = State::default();
+            for (i, &is_dirty) in dirty_flags.iter().enumerate() {
+                if i > 0 {
+                    update(&mut s, Message::NewTab); // a fresh, clean blank tab
+                }
+                if is_dirty {
+                    update(&mut s, Message::Edited(format!("dirty-{i}")));
+                }
+            }
+            let expected = dirty_flags.iter().filter(|&&d| d).count();
+            let fx = update(&mut s, Message::QuitRequested);
+            if expected == 0 {
+                prop_assert!(has_quit(&fx));
+                prop_assert!(confirm_quit(&fx).is_none());
+            } else {
+                prop_assert_eq!(confirm_quit(&fx), Some(expected));
+                prop_assert!(!has_quit(&fx));
+            }
+        }
     }
 
     // ---- Find / Replace / Go-to-line (#33) ----

@@ -198,6 +198,82 @@ fn closing_thousands_of_dirty_tabs_via_discard_is_bounded() {
 }
 
 #[test]
+fn quitting_with_thousands_of_dirty_tabs_confirms_with_the_full_count() {
+    // A quit with a huge pile of unsaved tabs raises exactly one prompt that
+    // counts every dirty document (no per-tab walk), and discard-all then exits
+    // in a single step (#69).
+    let mut s = State::default();
+    for _ in 0..3000 {
+        update(&mut s, Message::NewTab);
+        update(&mut s, Message::Edited("dirty".into())); // dirties the new active tab
+    }
+    // 3000 new dirty tabs + the original (clean) blank.
+    assert_eq!(s.docs.len(), 3001);
+    let fx = update(&mut s, Message::QuitRequested);
+    assert!(
+        matches!(fx.as_slice(), [Effect::ConfirmQuit { dirty: 3000 }]),
+        "one prompt naming every dirty doc, and nothing else"
+    );
+    assert_eq!(s.docs.len(), 3001, "the prompt changes nothing");
+    // The user discards everything: a single Quit, no unbounded teardown.
+    assert_eq!(update(&mut s, Message::QuitDiscardAll), vec![Effect::Quit]);
+}
+
+#[test]
+fn save_all_quit_across_many_tabs_exits_exactly_once() {
+    // Save-all-then-quit fires one write per dirty tab and holds the exit until
+    // the very last write lands — never early, never twice (#69).
+    let n = 1000;
+    let mut s = State::default();
+    for i in 0..n {
+        update(
+            &mut s,
+            Message::FileLoaded {
+                path: PathBuf::from(format!("/tmp/q{i}.txt")),
+                content: format!("base {i}\n"),
+            },
+        );
+        update(&mut s, Message::Edited(format!("edit {i}"))); // dirties the active tab
+    }
+    assert_eq!(s.docs.len(), n);
+    let ids: Vec<_> = s.docs.iter().map(|d| d.id).collect();
+
+    // One write per dirty tab, and no premature quit.
+    let fx = update(&mut s, Message::QuitSaveAll);
+    assert_eq!(fx.len(), n);
+    assert!(fx.iter().all(|e| matches!(e, Effect::WriteFile { .. })));
+    assert!(!fx.iter().any(|e| matches!(e, Effect::Quit)));
+
+    // Every write but the last lands: the app must stay alive throughout.
+    for &id in &ids[..n - 1] {
+        let step = update(
+            &mut s,
+            Message::FileSaved {
+                id,
+                path: PathBuf::from("/tmp/q.txt"),
+            },
+        );
+        assert!(
+            !step.iter().any(|e| matches!(e, Effect::Quit)),
+            "must not exit while saves are still outstanding"
+        );
+    }
+    // The final write drains the pending set → exactly one Quit.
+    let last = update(
+        &mut s,
+        Message::FileSaved {
+            id: *ids.last().unwrap(),
+            path: PathBuf::from("/tmp/q.txt"),
+        },
+    );
+    assert_eq!(
+        last.iter().filter(|e| matches!(e, Effect::Quit)).count(),
+        1,
+        "the last save landing exits once and only once"
+    );
+}
+
+#[test]
 fn many_large_tabs_are_retained_then_freed() {
     // A proxy for the "memory footprint with many large tabs" concern: open a few
     // hundred tabs each holding a sizeable buffer, prove every buffer survives

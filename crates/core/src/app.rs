@@ -587,28 +587,38 @@ pub fn update(state: &mut State, message: Message) -> Vec<Effect> {
 
         Message::Undo => {
             let doc = &mut state.docs[state.active];
-            match doc.history.undo() {
-                Some(edit) => {
-                    edit.apply(&mut doc.content);
-                    let mut fx = title_effect(state); // content and the "•" may both change
-                    fx.extend(refresh_find_after_edit(state));
-                    fx
-                }
-                None => vec![],
-            }
+            let Some(edit) = doc.history.undo() else {
+                return vec![];
+            };
+            edit.apply(&mut doc.content);
+            // Land the caret on what the undo changed rather than at (0,0): the
+            // edit now occupies `at..at + inserted.len()`, so reveal its end so a
+            // shell resync doesn't leave the view scrolled to the top (#94).
+            let caret = edit.at + edit.inserted.len();
+            let mut fx = title_effect(state); // content and the "•" may both change
+            fx.extend(refresh_find_after_edit(state));
+            fx.push(Effect::RevealRange {
+                start: caret,
+                end: caret,
+            });
+            fx
         }
 
         Message::Redo => {
             let doc = &mut state.docs[state.active];
-            match doc.history.redo() {
-                Some(edit) => {
-                    edit.apply(&mut doc.content);
-                    let mut fx = title_effect(state);
-                    fx.extend(refresh_find_after_edit(state));
-                    fx
-                }
-                None => vec![],
-            }
+            let Some(edit) = doc.history.redo() else {
+                return vec![];
+            };
+            edit.apply(&mut doc.content);
+            // Reveal the redone edit's end, mirroring `Undo` above (#94).
+            let caret = edit.at + edit.inserted.len();
+            let mut fx = title_effect(state);
+            fx.extend(refresh_find_after_edit(state));
+            fx.push(Effect::RevealRange {
+                start: caret,
+                end: caret,
+            });
+            fx
         }
 
         Message::SaveRequested => {
@@ -1883,6 +1893,24 @@ mod tests {
         // A single undo restores the whole original buffer.
         update(&mut s, Message::Undo);
         assert_eq!(s.active_doc().content, "ab ab ab");
+    }
+
+    #[test]
+    fn undo_and_redo_reveal_the_edit_site() {
+        let mut s = State::default();
+        update(&mut s, Message::Edited("hello world".into()));
+        update(&mut s, Message::Edited("hello BIG world".into())); // insert "BIG " at 6
+
+        // Undo removes "BIG "; the caret reveals the edit site (byte 6), not the
+        // top of the document — the shell would otherwise resync to (0,0) (#94).
+        let undo_fx = update(&mut s, Message::Undo);
+        assert_eq!(s.active_doc().content, "hello world");
+        assert_eq!(reveal(&undo_fx), Some((6, 6)));
+
+        // Redo re-inserts it; the reveal lands at the end of the restored span.
+        let redo_fx = update(&mut s, Message::Redo);
+        assert_eq!(s.active_doc().content, "hello BIG world");
+        assert_eq!(reveal(&redo_fx), Some((10, 10)));
     }
 
     #[test]

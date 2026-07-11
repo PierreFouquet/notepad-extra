@@ -108,6 +108,7 @@ mod tests {
             detected_lang: language,
             manual_lang: None,
             history: History::new(),
+            saved_content: content.to_string(),
         }
     }
 

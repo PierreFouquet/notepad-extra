@@ -68,6 +68,11 @@ impl Document {
     }
 
     /// The tab / window title: the file name, or `Untitled` for a fresh buffer.
+    ///
+    /// Deliberately the basename, not the full path (#97 item 4). The WebView
+    /// build titled the window `Notepad Extra - {full path}`; the native build
+    /// keeps just the file name (the shell appends " — Notepad Extra"), so a deep
+    /// path can't crowd the app name out of the title bar.
     pub fn title(&self) -> &str {
         match &self.path {
             Some(p) => {
@@ -357,11 +362,20 @@ impl State {
 
 /// The zoom bounds (#35) must form a non-empty range with a default inside it.
 /// Checked at compile time so a bad edit to the constants never builds.
+///
+/// The exact 6–96 pt span is a deliberate parity decision (#97 item 5): the
+/// WebView build clamped to 8–40 px, and the wider native range is confirmed
+/// intended, not a regression. Pinning the values means a silent edit back toward
+/// the WebView bounds fails to compile — 40 pt would satisfy the range invariants
+/// above while quietly dropping the ceiling, so the invariants alone can't catch it.
 const _: () = {
     assert!(State::MIN_FONT_SIZE > 0);
     assert!(State::MIN_FONT_SIZE < State::MAX_FONT_SIZE);
     assert!(State::DEFAULT_FONT_SIZE >= State::MIN_FONT_SIZE);
     assert!(State::DEFAULT_FONT_SIZE <= State::MAX_FONT_SIZE);
+    // The decided parity values (#97 item 5), pinned so a silent change trips here.
+    assert!(State::MIN_FONT_SIZE == 6);
+    assert!(State::MAX_FONT_SIZE == 96);
 };
 
 /// Everything that can happen: user intent (`OpenRequested`), shell results
@@ -406,8 +420,14 @@ pub enum Message {
     TabCloseSave(TabId),
 
     // ---- Find / Replace / Go-to-line (#33) ----
-    /// Open the find / replace bar and refresh its readout.
+    /// Open the find / replace bar and refresh its readout. Opening leaves the
+    /// caret where it is — a residual query is recounted but not re-selected
+    /// (#97 item 2); the search waits for Enter / Find Next.
     FindOpened,
+    /// Open the find bar with `query` pre-seeded from the editor's single-line
+    /// selection (#97 item 1). Like [`Message::FindOpened`] it recounts without
+    /// moving the caret — the seed only fills the field.
+    FindOpenedWith(String),
     /// Close the find / replace bar and drop the highlight.
     FindClosed,
     /// The search pattern changed; incremental find selects the first match.
@@ -704,7 +724,18 @@ pub fn update(state: &mut State, message: Message) -> Vec<Effect> {
         // ---- Find / Replace / Go-to-line (#33) ----
         Message::FindOpened => {
             state.find.open = true;
-            refresh_find(state, true)
+            // Recount for the readout but leave the caret alone: opening the bar
+            // must not jump to the first match of a residual query (#97 item 2).
+            refresh_find(state, false)
+        }
+
+        Message::FindOpenedWith(query) => {
+            // Prefill from a single-line selection (#97 item 1). The shell only
+            // sends this from a closed bar, so there is no stale highlight to
+            // point at; seed the field and recount, but don't move the caret.
+            state.find.open = true;
+            state.find.query = query;
+            refresh_find(state, false)
         }
 
         Message::FindClosed => {
@@ -1249,6 +1280,22 @@ mod tests {
         );
         assert_eq!(fx, vec![Effect::SetTitle("Untitled".into())]);
         assert_eq!(s.active_doc().language(), "Plain Text"); // untouched
+    }
+
+    #[test]
+    fn title_is_the_basename_not_the_full_path() {
+        // #97 item 4: the window/tab title is deliberately the file's basename,
+        // never the full path the WebView build showed. A fresh buffer is Untitled.
+        let mut s = State::default();
+        assert_eq!(s.active_doc().title(), "Untitled");
+
+        load(&mut s, "/home/user/notes/todo.txt", "hi");
+        let title = s.active_doc().title();
+        assert_eq!(title, "todo.txt");
+        assert!(
+            !title.contains('/'),
+            "the title must not leak any directory component"
+        );
     }
 
     // ---- Language selection (#32) -----------------------------------------
@@ -1968,6 +2015,43 @@ mod tests {
         assert_eq!(s.find.current, Some(Match { start: 0, end: 5 }));
     }
 
+    #[test]
+    fn opening_the_bar_does_not_move_the_caret_on_a_residual_query() {
+        // #97 item 2: reopening the bar with a query left over from a previous
+        // search recounts for the readout but must not jump to (select) the
+        // first match — the WebView left the caret alone until Enter/Find Next.
+        let mut s = State::default();
+        update(&mut s, Message::Edited("foo bar foo".into()));
+        find_for(&mut s, "foo");
+        assert_eq!(s.find.current, Some(Match { start: 0, end: 3 }));
+        update(&mut s, Message::FindClosed);
+        assert_eq!(s.find.query, "foo", "the query survives a close");
+        assert!(s.find.current.is_none());
+        // Reopen: the count comes back, but nothing is revealed or selected.
+        let fx = update(&mut s, Message::FindOpened);
+        assert_eq!(s.find.count, 2);
+        assert!(s.find.current.is_none(), "opening must not select a match");
+        assert!(reveal(&fx).is_none(), "opening must not move the caret");
+    }
+
+    #[test]
+    fn seeding_the_query_from_a_selection_counts_without_revealing() {
+        // #97 item 1: a single-line selection seeds the find field. The seed
+        // recounts for the readout but — like a plain open (item 2) — leaves the
+        // caret where it is; the search waits for Enter / Find Next.
+        let mut s = State::default();
+        update(&mut s, Message::Edited("foo bar foo".into()));
+        let fx = update(&mut s, Message::FindOpenedWith("foo".into()));
+        assert!(s.find.open);
+        assert_eq!(s.find.query, "foo");
+        assert_eq!(s.find.count, 2);
+        assert!(s.find.current.is_none(), "seeding must not select a match");
+        assert!(reveal(&fx).is_none(), "seeding must not move the caret");
+        // Find Next then walks from the top, like a freshly typed query.
+        update(&mut s, Message::FindNext);
+        assert_eq!(s.find.current, Some(Match { start: 0, end: 3 }));
+    }
+
     // ---- Editor zoom / font size (#35) ----
 
     #[test]
@@ -2321,6 +2405,8 @@ mod tests {
             Just(Message::ReplaceNext),
             Just(Message::ReplaceAll),
             r"[a-c*+?.()\[\]\\^$|{}]{0,6}".prop_map(Message::FindQueryChanged),
+            // A single-line selection seed (#97 item 1): same alphabet, no newline.
+            r"[a-c*+?.()\[\]\\^$|{}]{0,6}".prop_map(Message::FindOpenedWith),
             any::<String>().prop_map(Message::ReplaceTextChanged),
             prop_oneof![
                 Just(FindOption::CaseSensitive),

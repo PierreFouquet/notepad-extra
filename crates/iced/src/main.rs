@@ -16,8 +16,10 @@
 #![forbid(unsafe_code)]
 
 use iced::widget::text::Wrapping;
-use iced::widget::{button, column, container, pick_list, row, stack, text, text_input};
-use iced::{Element, Fill, Length, Subscription, Task};
+use iced::widget::{
+    button, column, container, mouse_area, pick_list, row, stack, text, text_input,
+};
+use iced::{Element, Fill, Length, Point, Subscription, Task};
 use notepad_core as core;
 use notepad_core::{Effect, FindOption, TabId};
 use std::path::{Path, PathBuf};
@@ -286,6 +288,38 @@ enum Message {
         path: PathBuf,
         result: Result<(), String>,
     },
+    /// Dismiss the read/save error banner (#97 item 7), so the status row
+    /// (Ln/Col, …) it hid comes back without waiting for a later operation. The
+    /// next real edit clears it too; this is the `×` for when there's no edit.
+    DismissError,
+
+    // ---- Editor context menu (#97 item 3) ----
+    /// The pointer moved over the editor; remember where so the context menu can
+    /// open at the cursor. Published on every motion (the only way iced surfaces
+    /// the pointer position to the shell), so its handler is kept trivial and
+    /// [`Shell::update`] skips the repaint nudge for it — see there.
+    EditorCursorMoved(Point),
+    /// Right-click on the editor: show the minimal cut/copy/paste/select-all
+    /// menu the WebView gave for free (the vendored `text_editor` has none), at
+    /// the last tracked cursor position.
+    ContextMenuOpened,
+    /// Dismiss the context menu — an action was chosen, or the user clicked away.
+    ContextMenuDismissed,
+    /// Copy the current selection to the clipboard, then dismiss. A no-op (bar
+    /// the dismiss) when nothing is selected.
+    ContextCopy,
+    /// Copy the selection to the clipboard and delete it (cut), then dismiss.
+    /// The delete rides the normal edit path, so it joins the undo history.
+    ContextCut,
+    /// Read the clipboard for a paste, then dismiss. The read is async, so it
+    /// hands off to [`Message::ContextPasteReady`].
+    ContextPaste,
+    /// The clipboard read for a context-menu paste resolved (`None`/empty = do
+    /// nothing). Routes through the same `Edit(Paste …)` path Ctrl+V uses, so it
+    /// lands as one undoable edit.
+    ContextPasteReady(Option<String>),
+    /// Select the whole buffer from the menu, then dismiss.
+    ContextSelectAll,
 
     // ---- Find / Replace / Go-to-line (#33) ----
     /// Show or hide the find / replace bar.
@@ -415,6 +449,20 @@ struct Shell {
     /// Whether a file drag is currently hovering over the window (#42); drives the
     /// "drop to open" overlay in [`Shell::view`].
     drag_hover: bool,
+    /// Where the editor's right-click context menu is showing, if at all (#97
+    /// item 3) — `Some(anchor)` while up, `None` while hidden. The WebView gave
+    /// right-click cut/copy/paste/select-all for free; the vendored `text_editor`
+    /// offers none, so the shell draws a minimal menu at the cursor. The anchor
+    /// is editor-relative (the offset `on_move` reports), so [`Shell::view`] can
+    /// place the card without knowing the editor's on-screen origin.
+    context_menu: Option<Point>,
+    /// The last pointer position over the editor (editor-relative), tracked so a
+    /// right-click can open the menu where the cursor is. iced only surfaces the
+    /// pointer via `mouse_area::on_move`, which fires on every motion — so
+    /// updating this is deliberately the one message [`Shell::update`] does not
+    /// repaint for (it changes no pixels; nudging would repaint the whole window
+    /// on every mouse move, the churn the `repaint_nudge` workaround fights).
+    cursor_in_editor: Point,
     /// A one-bit flag flipped on *every* `update` call, read by [`Shell::app_style`]
     /// to force a full-window repaint on that frame. This works around an iced
     /// 0.14 software-renderer damage limitation: the `tiny-skia`/`softbuffer`
@@ -459,6 +507,8 @@ impl Shell {
                 goto_input: String::new(),
                 confirm_close: None,
                 drag_hover: false,
+                context_menu: None,
+                cursor_in_editor: Point::ORIGIN,
                 repaint_nudge: false,
             },
             Task::none(),
@@ -469,12 +519,22 @@ impl Shell {
         self.title.clone()
     }
 
-    /// The iced entry point. Dispatches the message, then unconditionally flips
+    /// The iced entry point. Dispatches the message, then flips
     /// [`Shell::repaint_nudge`] so the next frame forces a full repaint — see the
     /// field's docs for the underlying iced damage limitation this dodges (#32).
+    ///
+    /// The one exception is [`Message::EditorCursorMoved`], which only records
+    /// the pointer position for the context-menu anchor (#97 item 3) and paints
+    /// nothing. It arrives on *every* pointer motion over the editor, so nudging
+    /// it would force a full-window software repaint on each one — the very churn
+    /// the nudge exists to avoid. Skipping the flip lets those frames take iced's
+    /// cheap no-damage path; every message that can change a pixel still nudges.
     fn update(&mut self, message: Message) -> Task<Message> {
+        let repaints = !matches!(message, Message::EditorCursorMoved(_));
         let task = self.dispatch(message);
-        self.repaint_nudge = !self.repaint_nudge;
+        if repaints {
+            self.repaint_nudge = !self.repaint_nudge;
+        }
         task
     }
 
@@ -535,6 +595,10 @@ impl Shell {
                 let is_edit = action.is_edit();
                 self.editor.perform(action);
                 if is_edit {
+                    // A real edit means the user has moved on: clear any stale
+                    // read/save error so the status row (Ln/Col, …) returns
+                    // instead of staying hidden behind the banner (#97 item 7).
+                    self.error = None;
                     let text = self.editor.text();
                     // The editor owns the text now — don't clobber it by resyncing.
                     self.apply_core(core::Message::Edited(text), false)
@@ -602,14 +666,87 @@ impl Shell {
                 }
             },
 
+            // Clear the error banner on demand (#97 item 7). No core round-trip:
+            // the error slot is shell-only chrome, so dropping it just re-reveals
+            // the status row on the next frame.
+            Message::DismissError => {
+                self.error = None;
+                Task::none()
+            }
+
+            // ---- Editor context menu (#97 item 3) ----
+            // Track the pointer so a right-click can open the menu where the
+            // cursor is. Trivial by design — and the one message `update` does
+            // not repaint for (see there).
+            Message::EditorCursorMoved(pos) => {
+                self.cursor_in_editor = pos;
+                Task::none()
+            }
+            // Right-click raises the menu at the tracked cursor; a later action
+            // or an outside click (the dismiss backdrop) lowers it. Both are
+            // shell-only chrome.
+            Message::ContextMenuOpened => {
+                self.context_menu = Some(self.cursor_in_editor);
+                Task::none()
+            }
+            Message::ContextMenuDismissed => {
+                self.context_menu = None;
+                Task::none()
+            }
+            // Copy the selection to the clipboard (a runtime `Task`, no Cargo
+            // dep). Nothing selected → nothing to copy; just close the menu.
+            Message::ContextCopy => {
+                self.context_menu = None;
+                match self.editor.selection() {
+                    Some(sel) if !sel.is_empty() => iced::clipboard::write(sel),
+                    _ => Task::none(),
+                }
+            }
+            // Cut = copy, then delete the selection. The delete rides the normal
+            // `Edit` path (below), so it clears any error banner and joins the
+            // undo history exactly like a typed deletion. No selection → no-op.
+            Message::ContextCut => {
+                self.context_menu = None;
+                match self.editor.selection() {
+                    Some(sel) if !sel.is_empty() => {
+                        let copy = iced::clipboard::write(sel);
+                        let delete = self.dispatch(Message::Edit(text_editor::Action::Edit(
+                            text_editor::Edit::Delete,
+                        )));
+                        Task::batch([copy, delete])
+                    }
+                    _ => Task::none(),
+                }
+            }
+            // Paste reads the clipboard off-thread; the bytes come back as
+            // `ContextPasteReady`.
+            Message::ContextPaste => {
+                self.context_menu = None;
+                iced::clipboard::read().map(Message::ContextPasteReady)
+            }
+            // Route the pasted text through the same `Edit(Paste …)` an editor
+            // Ctrl+V produces, so it lands as one undoable edit via the core.
+            // An empty / unavailable clipboard is simply nothing to paste.
+            Message::ContextPasteReady(Some(text)) if !text.is_empty() => {
+                self.dispatch(Message::Edit(text_editor::Action::Edit(
+                    text_editor::Edit::Paste(std::sync::Arc::new(text)),
+                )))
+            }
+            Message::ContextPasteReady(_) => Task::none(),
+            // Select All is a pure selection move (not an edit), so it reuses the
+            // widget's own `SelectAll` through the shared `Edit` path.
+            Message::ContextSelectAll => {
+                self.context_menu = None;
+                self.dispatch(Message::Edit(text_editor::Action::SelectAll))
+            }
+
             // ---- Find / Replace / Go-to-line (#33) ----
             Message::ToggleFind => {
-                let msg = if self.core.find.open {
-                    core::Message::FindClosed
+                if self.core.find.open {
+                    self.apply_core(core::Message::FindClosed, false)
                 } else {
-                    core::Message::FindOpened
-                };
-                self.apply_core(msg, false)
+                    self.open_find()
+                }
             }
             // Idempotent open (#39): only ask the core to open if it isn't already,
             // so a repeated Ctrl+F never toggles the bar shut.
@@ -617,7 +754,7 @@ impl Shell {
                 if self.core.find.open {
                     Task::none()
                 } else {
-                    self.apply_core(core::Message::FindOpened, false)
+                    self.open_find()
                 }
             }
             Message::CloseFind => self.apply_core(core::Message::FindClosed, false),
@@ -748,6 +885,23 @@ impl Shell {
         }
         let tasks: Vec<Task<Message>> = effects.into_iter().map(|e| self.run_effect(e)).collect();
         Task::batch(tasks)
+    }
+
+    /// Open the find bar, seeding the query from a single-line selection the way
+    /// the WebView's `openFind` did (#97 item 1): a selection with no newline
+    /// prefills the field, while a multi-line or empty selection opens it as-is.
+    /// Either way opening never moves the caret (item 2) — the core recounts but
+    /// leaves the search until Enter / Find Next.
+    fn open_find(&mut self) -> Task<Message> {
+        let msg = match self
+            .editor
+            .selection()
+            .filter(|sel| !sel.is_empty() && !sel.contains('\n'))
+        {
+            Some(sel) => core::Message::FindOpenedWith(sel),
+            None => core::Message::FindOpened,
+        };
+        self.apply_core(msg, false)
     }
 
     /// Turn one core [`Effect`] into a real side effect.
@@ -1017,12 +1171,52 @@ impl Shell {
             )
             .height(Fill);
 
+        // Right-click the editor for a minimal cut/copy/paste/select-all menu
+        // (#97 item 3) — the mouse-only editing the WebView gave for free. The
+        // vendored editor ignores the right button, so wrapping it lets the shell
+        // catch the press and open the menu at the cursor.
+        let editor = mouse_area(editor).on_right_press(Message::ContextMenuOpened);
+        let editor: Element<'_, Message> = match self.context_menu {
+            // Menu up: float it at its anchor over a full-area transparent
+            // backdrop. Any click off the menu hits the backdrop and dismisses,
+            // and because that `mouse_area` captures the press, the editor caret
+            // stays put. No cursor tracking is needed while it's open, so drop
+            // `on_move` here.
+            Some(anchor) => stack![
+                editor,
+                mouse_area(container(text("")).width(Fill).height(Fill))
+                    .on_press(Message::ContextMenuDismissed)
+                    .on_right_press(Message::ContextMenuDismissed),
+                self.context_menu_card(ui, anchor),
+            ]
+            .into(),
+            // Menu down: track the pointer so the next right-click knows where
+            // the cursor is (`update` skips the repaint nudge for this).
+            None => editor.on_move(Message::EditorCursorMoved).into(),
+        };
+
         let status: Element<'_, Message> = match &self.error {
-            Some(e) => text(format!("Error: {e}")).font(ui).into(),
+            // A read/save error takes the status row, but with a `×` to dismiss it
+            // (#97 item 7) so Ln/Col etc. aren't hidden until some later operation
+            // happens to succeed. Editing clears it too (see the `Edit` handler).
+            Some(e) => row![
+                text(format!("Error: {e}")).font(ui),
+                button(text("\u{00d7}").font(ui)).on_press(Message::DismissError),
+            ]
+            .spacing(16)
+            .align_y(iced::Alignment::Center)
+            .into(),
             None => {
                 let s = self.status();
                 // Caret position first, then a selection count only when there
                 // is one, then document size, language, EOL and encoding.
+                //
+                // The "Sel n" readout is deliberately a single selection shown
+                // only when non-zero (#97 item 8): the WebView build summed every
+                // selection and always showed "Sel n", even at 0; iced's editor has
+                // one selection, and hiding the cell at 0 keeps the row quiet when
+                // nothing is picked. `core::status` guarantees `selection == 0` for
+                // an empty selection, which is exactly what this `> 0` gate relies on.
                 let mut cells =
                     row![text(format!("Ln {}, Col {}", s.line, s.column)).font(ui)].spacing(16);
                 if s.selection > 0 {
@@ -1170,6 +1364,56 @@ impl Shell {
             .style(|_theme| container::Style {
                 background: Some(iced::Color::from_rgba(0.0, 0.0, 0.0, 0.45).into()),
                 ..container::Style::default()
+            })
+            .into()
+    }
+
+    /// The editor's right-click context menu (#97 item 3): a minimal
+    /// cut/copy/paste/select-all card floated at `anchor` (the editor-relative
+    /// cursor position where the right-click landed). Each button performs its
+    /// action and dismisses the menu. The card is offset from the stack's
+    /// top-left with padding rather than absolute coordinates, since a `stack`
+    /// simply lays each layer at its own origin.
+    fn context_menu_card(&self, ui: iced::Font, anchor: Point) -> Element<'_, Message> {
+        let item = |label: &'static str, msg: Message| {
+            button(text(label).font(ui))
+                .style(button::secondary)
+                .width(Fill)
+                .on_press(msg)
+        };
+        let card = container(
+            column![
+                item("Cut", Message::ContextCut),
+                item("Copy", Message::ContextCopy),
+                item("Paste", Message::ContextPaste),
+                item("Select All", Message::ContextSelectAll),
+            ]
+            .spacing(2),
+        )
+        .padding(4)
+        .width(Length::Fixed(160.0))
+        .style(|theme: &iced::Theme| {
+            let palette = theme.extended_palette();
+            container::Style {
+                background: Some(palette.background.weak.color.into()),
+                border: iced::Border {
+                    color: palette.background.strong.color,
+                    width: 1.0,
+                    radius: 6.0.into(),
+                },
+                ..container::Style::default()
+            }
+        });
+        // Push the card to the cursor with left/top padding. `on_move` reports a
+        // position within the editor bounds, so the offset is non-negative; a
+        // right-click very near an edge can run the card past it, which is fine
+        // for a minimal menu.
+        container(card)
+            .padding(iced::Padding {
+                top: anchor.y,
+                left: anchor.x,
+                right: 0.0,
+                bottom: 0.0,
             })
             .into()
     }
@@ -1521,6 +1765,162 @@ mod tests {
     }
 
     #[test]
+    fn a_real_edit_clears_the_error_banner_but_a_cursor_move_does_not() {
+        // The error banner hides the status row; the next *real* edit clears it
+        // so Ln/Col etc. come back, while a mere cursor move leaves it up
+        // (#97 item 7).
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::FileRead {
+            path: PathBuf::from("/tmp/nope"),
+            result: Err("boom".to_string()),
+        });
+        assert_eq!(shell.error.as_deref(), Some("boom"));
+
+        // A cursor move is not an edit: the banner must stay put.
+        let _ = shell.update(Message::Edit(text_editor::Action::Move(
+            text_editor::Motion::Right,
+        )));
+        assert_eq!(
+            shell.error.as_deref(),
+            Some("boom"),
+            "a non-edit action must not clear the banner"
+        );
+
+        // A real edit means the user has moved on: the banner clears.
+        let _ = shell.update(Message::Edit(paste("typed")));
+        assert!(shell.error.is_none(), "an edit clears the banner");
+    }
+
+    #[test]
+    fn dismissing_the_error_restores_the_status_row_without_touching_the_doc() {
+        // The `×` clears the banner on demand (#97 item 7) — no later operation
+        // needed — and leaves the buffer untouched.
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::Edit(paste("keep me")));
+        let _ = shell.update(Message::FileRead {
+            path: PathBuf::from("/tmp/nope"),
+            result: Err("boom".to_string()),
+        });
+        assert_eq!(shell.error.as_deref(), Some("boom"));
+
+        let _ = shell.update(Message::DismissError);
+        assert!(shell.error.is_none(), "dismiss clears the banner");
+        assert_eq!(shell.editor.text().trim_end(), "keep me");
+    }
+
+    // ---- Editor context menu (#97 item 3) ----
+    // The menu overlay itself is mouse-driven and exempt from the #25 headless
+    // standard, but its message handlers — the buffer edits and the shown/hidden
+    // flag — are plain state transitions, so they get assertions here. The
+    // clipboard reads/writes are runtime `Task`s (built, never run in these
+    // tests), so nothing touches a real clipboard.
+
+    #[test]
+    fn right_click_opens_the_menu_and_every_action_closes_it() {
+        // Right-click raises the menu; each action — and the dismiss backdrop —
+        // lowers it again. Both are shell-only chrome (no core round-trip).
+        let (mut shell, _) = Shell::new();
+        assert!(shell.context_menu.is_none(), "the menu starts hidden");
+        for action in [
+            Message::ContextMenuDismissed,
+            Message::ContextCopy,
+            Message::ContextCut,
+            Message::ContextPaste,
+            Message::ContextSelectAll,
+        ] {
+            let _ = shell.update(Message::ContextMenuOpened);
+            assert!(shell.context_menu.is_some(), "right-click shows the menu");
+            let _ = shell.update(action);
+            assert!(shell.context_menu.is_none(), "the action closes the menu");
+        }
+    }
+
+    #[test]
+    fn right_click_opens_the_menu_at_the_tracked_cursor() {
+        // The menu anchors where the pointer is: the last `EditorCursorMoved`
+        // position becomes the open anchor, so the card floats at the cursor
+        // rather than a fixed corner (#97 item 3).
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::EditorCursorMoved(Point::new(42.0, 17.0)));
+        let _ = shell.update(Message::ContextMenuOpened);
+        assert_eq!(shell.context_menu, Some(Point::new(42.0, 17.0)));
+
+        // Tracking while the menu is hidden keeps moving the future anchor; once
+        // reopened it follows the newer position.
+        let _ = shell.update(Message::ContextMenuDismissed);
+        let _ = shell.update(Message::EditorCursorMoved(Point::new(5.0, 90.0)));
+        let _ = shell.update(Message::ContextMenuOpened);
+        assert_eq!(shell.context_menu, Some(Point::new(5.0, 90.0)));
+    }
+
+    #[test]
+    fn context_select_all_selects_the_whole_buffer() {
+        // The menu's Select All reuses the widget's own `SelectAll`, so the
+        // whole buffer ends up selected.
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::Edit(paste("pick me")));
+        let _ = shell.update(Message::ContextMenuOpened);
+        let _ = shell.update(Message::ContextSelectAll);
+        assert_eq!(shell.editor.selection().as_deref(), Some("pick me"));
+    }
+
+    #[test]
+    fn context_paste_inserts_the_clipboard_through_the_core_edit_path() {
+        // A resolved paste lands as one ordinary edit: it inserts at the caret
+        // *and* reaches the core buffer (the `Edited` path), so it joins the undo
+        // history like any typed text. An empty / unavailable clipboard is a
+        // no-op.
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::Edit(paste("start ")));
+        let _ = shell.update(Message::ContextPasteReady(Some("END".to_string())));
+        assert_eq!(shell.editor.text().trim_end(), "start END");
+        // It went *through the core*, not just the widget, so the core's buffer
+        // matches — which is what keeps paste undoable.
+        assert_eq!(shell.core.active_doc().content.trim_end(), "start END");
+
+        let before = shell.editor.text();
+        let _ = shell.update(Message::ContextPasteReady(None));
+        let _ = shell.update(Message::ContextPasteReady(Some(String::new())));
+        assert_eq!(shell.editor.text(), before, "an empty paste is a no-op");
+    }
+
+    #[test]
+    fn context_cut_deletes_the_selection_while_copy_leaves_it() {
+        // Cut deletes the selected text (the copy half is a clipboard `Task` we
+        // can't observe here); Copy leaves the buffer untouched. Crucially, with
+        // nothing selected Cut is a no-op — it must never delete the character at
+        // the caret.
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::Edit(paste("keepcut")));
+
+        // No selection: Cut must not touch the buffer.
+        let _ = shell.update(Message::ContextCut);
+        assert_eq!(
+            shell.editor.text().trim_end(),
+            "keepcut",
+            "cut with no selection is a no-op"
+        );
+
+        // A selection + Copy leaves the buffer as-is.
+        let _ = shell.update(Message::Edit(text_editor::Action::SelectAll));
+        let _ = shell.update(Message::ContextCopy);
+        assert_eq!(
+            shell.editor.text().trim_end(),
+            "keepcut",
+            "copy leaves the buffer"
+        );
+
+        // A selection + Cut removes it.
+        let _ = shell.update(Message::Edit(text_editor::Action::SelectAll));
+        let _ = shell.update(Message::ContextCut);
+        assert_eq!(
+            shell.editor.text().trim_end(),
+            "",
+            "cut deletes the selection"
+        );
+    }
+
+    #[test]
     fn switching_tabs_swaps_the_editor_buffer() {
         let (mut shell, _) = Shell::new();
         let _ = shell.update(Message::FileRead {
@@ -1773,6 +2173,51 @@ mod tests {
         assert_eq!(shell.core.find.count, 1);
     }
 
+    #[test]
+    fn opening_find_prefills_from_a_single_line_selection() {
+        // #97 item 1: opening the bar seeds the field from a single-line
+        // selection — and searches the whole buffer, not just the selected
+        // occurrence. Build a partial "foo" selection with *no* prior query, so
+        // the seeded field can only have come from the selection (not a residual
+        // query left over from an earlier search).
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::Edit(paste("foo bar foo")));
+        let _ = shell.update(Message::Edit(text_editor::Action::Move(
+            text_editor::Motion::Home,
+        )));
+        for _ in 0..3 {
+            let _ = shell.update(Message::Edit(text_editor::Action::Select(
+                text_editor::Motion::Right,
+            )));
+        }
+        assert_eq!(shell.editor.selection().as_deref(), Some("foo"));
+        assert!(shell.core.find.query.is_empty(), "no query before opening");
+        let _ = shell.update(Message::ToggleFind);
+        assert!(shell.core.find.open);
+        // The field was seeded purely from the selection...
+        assert_eq!(shell.core.find.query, "foo");
+        // ...and it counts every occurrence, not just the selected one.
+        assert_eq!(shell.core.find.count, 2);
+        // The seed filled the field but selected no new match (item 2).
+        assert!(shell.core.find.current.is_none());
+    }
+
+    #[test]
+    fn opening_find_ignores_a_multiline_selection() {
+        // #97 item 1 prefills only from a *single-line* selection; a multi-line
+        // selection opens the bar with an empty field, matching the WebView.
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::Edit(paste("one\ntwo")));
+        let _ = shell.update(Message::Edit(text_editor::Action::SelectAll));
+        assert_eq!(shell.editor.selection().as_deref(), Some("one\ntwo"));
+        let _ = shell.update(Message::ToggleFind);
+        assert!(shell.core.find.open);
+        assert!(
+            shell.core.find.query.is_empty(),
+            "a multi-line selection must not prefill"
+        );
+    }
+
     // ---- Status bar wiring (#37) ----
 
     #[test]
@@ -1800,6 +2245,9 @@ mod tests {
     fn status_reports_the_selection_length() {
         let (mut shell, _) = Shell::new();
         let _ = shell.update(Message::Edit(paste("hello")));
+        // #97 item 8: with nothing selected the count is 0, so the view hides the
+        // "Sel" cell (its `if s.selection > 0` gate). Only a real selection shows it.
+        assert_eq!(shell.status().selection, 0);
         let _ = shell.update(Message::Edit(text_editor::Action::SelectAll));
         let s = shell.status();
         assert_eq!(s.selection, 5);
@@ -1882,7 +2330,7 @@ mod tests {
     }
 
     #[test]
-    fn every_update_flips_the_repaint_nudge_to_force_a_full_redraw() {
+    fn updates_flip_the_repaint_nudge_except_cursor_tracking() {
         // iced's software compositor diffs each frame's layers against a
         // buffer-age-indexed history to compute a minimal damage rectangle; under
         // fast continuous updates (e.g. every keystroke) that history goes stale
@@ -1904,15 +2352,25 @@ mod tests {
         let after_open = shell.repaint_nudge;
 
         // Even a message that doesn't change the language flips it — every
-        // `update` forces a full redraw now, not just language changes.
+        // painting update forces a full redraw now, not just language changes.
         let _ = shell.update(Message::ToggleWordWrap);
         assert_ne!(
             shell.repaint_nudge, after_open,
-            "every update must flip the nudge, not just language changes"
+            "every painting update must flip the nudge, not just language changes"
         );
         let after_toggle = shell.repaint_nudge;
 
-        // A manual pick changes it again → flips.
+        // The exception: cursor tracking for the context-menu anchor (#97 item 3)
+        // paints nothing and arrives on every pointer motion, so it must NOT flip
+        // the nudge — otherwise moving the mouse would repaint the whole window
+        // continuously.
+        let _ = shell.update(Message::EditorCursorMoved(Point::new(3.0, 4.0)));
+        assert_eq!(
+            shell.repaint_nudge, after_toggle,
+            "cursor tracking must not flip the nudge"
+        );
+
+        // A manual pick changes it again → flips (from the unchanged state).
         let _ = shell.update(Message::SetLanguage("Python".to_string()));
         assert_ne!(shell.repaint_nudge, after_toggle);
 

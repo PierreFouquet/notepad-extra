@@ -1210,6 +1210,13 @@ impl Shell {
                 let s = self.status();
                 // Caret position first, then a selection count only when there
                 // is one, then document size, language, EOL and encoding.
+                //
+                // The "Sel n" readout is deliberately a single selection shown
+                // only when non-zero (#97 item 8): the WebView build summed every
+                // selection and always showed "Sel n", even at 0; iced's editor has
+                // one selection, and hiding the cell at 0 keeps the row quiet when
+                // nothing is picked. `core::status` guarantees `selection == 0` for
+                // an empty selection, which is exactly what this `> 0` gate relies on.
                 let mut cells =
                     row![text(format!("Ln {}, Col {}", s.line, s.column)).font(ui)].spacing(16);
                 if s.selection > 0 {
@@ -2238,6 +2245,9 @@ mod tests {
     fn status_reports_the_selection_length() {
         let (mut shell, _) = Shell::new();
         let _ = shell.update(Message::Edit(paste("hello")));
+        // #97 item 8: with nothing selected the count is 0, so the view hides the
+        // "Sel" cell (its `if s.selection > 0` gate). Only a real selection shows it.
+        assert_eq!(shell.status().selection, 0);
         let _ = shell.update(Message::Edit(text_editor::Action::SelectAll));
         let s = shell.status();
         assert_eq!(s.selection, 5);

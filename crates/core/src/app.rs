@@ -68,6 +68,11 @@ impl Document {
     }
 
     /// The tab / window title: the file name, or `Untitled` for a fresh buffer.
+    ///
+    /// Deliberately the basename, not the full path (#97 item 4). The WebView
+    /// build titled the window `Notepad Extra - {full path}`; the native build
+    /// keeps just the file name (the shell appends " — Notepad Extra"), so a deep
+    /// path can't crowd the app name out of the title bar.
     pub fn title(&self) -> &str {
         match &self.path {
             Some(p) => {
@@ -357,11 +362,20 @@ impl State {
 
 /// The zoom bounds (#35) must form a non-empty range with a default inside it.
 /// Checked at compile time so a bad edit to the constants never builds.
+///
+/// The exact 6–96 pt span is a deliberate parity decision (#97 item 5): the
+/// WebView build clamped to 8–40 px, and the wider native range is confirmed
+/// intended, not a regression. Pinning the values means a silent edit back toward
+/// the WebView bounds fails to compile — 40 pt would satisfy the range invariants
+/// above while quietly dropping the ceiling, so the invariants alone can't catch it.
 const _: () = {
     assert!(State::MIN_FONT_SIZE > 0);
     assert!(State::MIN_FONT_SIZE < State::MAX_FONT_SIZE);
     assert!(State::DEFAULT_FONT_SIZE >= State::MIN_FONT_SIZE);
     assert!(State::DEFAULT_FONT_SIZE <= State::MAX_FONT_SIZE);
+    // The decided parity values (#97 item 5), pinned so a silent change trips here.
+    assert!(State::MIN_FONT_SIZE == 6);
+    assert!(State::MAX_FONT_SIZE == 96);
 };
 
 /// Everything that can happen: user intent (`OpenRequested`), shell results
@@ -1266,6 +1280,22 @@ mod tests {
         );
         assert_eq!(fx, vec![Effect::SetTitle("Untitled".into())]);
         assert_eq!(s.active_doc().language(), "Plain Text"); // untouched
+    }
+
+    #[test]
+    fn title_is_the_basename_not_the_full_path() {
+        // #97 item 4: the window/tab title is deliberately the file's basename,
+        // never the full path the WebView build showed. A fresh buffer is Untitled.
+        let mut s = State::default();
+        assert_eq!(s.active_doc().title(), "Untitled");
+
+        load(&mut s, "/home/user/notes/todo.txt", "hi");
+        let title = s.active_doc().title();
+        assert_eq!(title, "todo.txt");
+        assert!(
+            !title.contains('/'),
+            "the title must not leak any directory component"
+        );
     }
 
     // ---- Language selection (#32) -----------------------------------------

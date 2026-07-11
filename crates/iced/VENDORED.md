@@ -15,7 +15,9 @@ diverges, how each divergence is marked, and how to re-sync it with a newer iced
   in `Cargo.toml`, so the vendored widget compiles against exactly the types iced
   itself uses.
 - **Upstream licence:** MIT (the iced project). The fork keeps that licence;
-  per-file attribution for packaging is tracked in **#77**.
+  per-file attribution for packaging (#77): the MIT copyright + permission
+  notice is preserved as `src/text_editor.rs`'s header comment, and the
+  repo-level record for licensing review is the top-level `THIRD-PARTY.md`.
 
 ## Why it is vendored
 

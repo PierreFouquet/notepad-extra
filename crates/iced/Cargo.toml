@@ -8,6 +8,19 @@ license = "GPL-3.0-or-later"
 homepage = "https://github.com/PierreFouquet/notepad-extra"
 repository = "https://github.com/PierreFouquet/notepad-extra"
 
+# The shipped binary is `notepad-extra`, not the crate name (#95): the desktop
+# entry (`Exec=notepad-extra %F`), the man page `notepad-extra(1)` and the
+# packaged install all point at that name, so the built binary must match.
+# Until the #46 cutover the legacy Tauri root package produces a binary of the
+# same name, so a *workspace-root* build emits cargo's "output filename
+# collision" warning and last-built wins in `target/debug` — harmless for
+# tests (they run from hashed per-package binaries) and every native CI job
+# builds `--package notepad-iced` alone; the warning dies with the root
+# package at cutover.
+[[bin]]
+name = "notepad-extra"
+path = "src/main.rs"
+
 # The shell is deliberately *thin*: all behaviour lives in `notepad-core`'s pure
 # `update(State, Message) -> Vec<Effect>`. This crate only renders `view`s and
 # executes the returned `Effect`s (dialogs via `rfd`, file I/O via

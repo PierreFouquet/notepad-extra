@@ -46,13 +46,24 @@ mod fonts;
 mod highlight;
 use highlight::SyntectHighlighter;
 
+/// The Linux Wayland app-id / X11 `WM_CLASS`, matching the basename of
+/// `packaging/linux/io.github.PierreFouquet.NotepadExtra.desktop` and its
+/// `StartupWMClass` (#95). Wayland compositors resolve the dock/taskbar icon
+/// and window grouping by matching this against the `.desktop` file name (they
+/// ignore runtime window icons entirely, so the embedded `icons/icon.png`
+/// can't help there), and Flatpak (#91) requires it to equal the Flatpak app
+/// id. Without it, winit defaults the app-id to the binary name.
+#[cfg(target_os = "linux")]
+const APPLICATION_ID: &str = "io.github.PierreFouquet.NotepadExtra";
+
 /// The window settings for the app. Kept a named helper rather than an inline
 /// literal so the close-guard invariant (`exit_on_close_request: false`, #69) is
 /// unit-testable — `main`'s builder chain itself can't be driven headlessly, and
 /// this is exactly the setting that, if lost, makes the OS ✕ silently discard
 /// unsaved tabs.
 fn window_settings() -> iced::window::Settings {
-    iced::window::Settings {
+    #[allow(unused_mut)] // mutated only in the Linux-gated block below
+    let mut settings = iced::window::Settings {
         icon: window_icon(),
         // Hold the OS window-close / quit so a dirty tab isn't discarded silently
         // (#69): with this off, a close request arrives as `window::Event::CloseRequested`
@@ -63,7 +74,15 @@ fn window_settings() -> iced::window::Settings {
         // call before it would be clobbered back to the default.
         exit_on_close_request: false,
         ..iced::window::Settings::default()
+    };
+    // `platform_specific` is a different struct per target OS, so the app-id
+    // assignment only exists on Linux — macOS and Windows resolve the app
+    // identity from the bundle / executable instead (#95).
+    #[cfg(target_os = "linux")]
+    {
+        settings.platform_specific.application_id = APPLICATION_ID.to_string();
     }
+    settings
 }
 
 pub fn main() -> iced::Result {
@@ -2695,6 +2714,18 @@ mod tests {
         assert!(
             !window_settings().exit_on_close_request,
             "the window must hold its close request for the unsaved-changes guard"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn window_settings_carry_the_desktop_entry_app_id() {
+        // #95: the Wayland app_id / X11 WM_CLASS must equal the `.desktop` file's
+        // basename (and its StartupWMClass) or compositors can't resolve the
+        // launcher icon / grouping — and Flatpak (#91) requires the exact match.
+        assert_eq!(
+            window_settings().platform_specific.application_id,
+            "io.github.PierreFouquet.NotepadExtra"
         );
     }
 

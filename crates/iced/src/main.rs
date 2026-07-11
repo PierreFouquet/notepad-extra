@@ -8,8 +8,12 @@
 //!    effects (native dialogs via `rfd`, file I/O via [`core::io`], the window
 //!    title), feeding results back in as fresh core messages.
 //!
-//! The editor's own text lives in a single [`text_editor::Content`] mirroring
-//! the *active* document; it is rebuilt from `core` whenever the focus moves.
+//! The editor's own text lives in a per-tab cache of [`text_editor::Content`]
+//! buffers, one per document, keyed by [`TabId`] (#94). The active tab's buffer
+//! is the one on screen; switching tabs simply shows a different cached buffer,
+//! so each tab's caret and scroll position survive the switch. A buffer is
+//! rebuilt from `core` only when the core rewrites that document's text
+//! (undo/redo, replace, load) — see [`Shell::sync_editor_cache`].
 //! Because the shell never decides *what* happens (only *how* the effects run),
 //! it stays untestable-window-free: [`Shell::apply_core`] and friends are
 //! exercised headlessly (see the tests below), matching the epic's DoD.
@@ -22,6 +26,7 @@ use iced::widget::{
 use iced::{Element, Fill, Length, Point, Subscription, Task};
 use notepad_core as core;
 use notepad_core::{Effect, FindOption, TabId};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 // Vendored copy of iced 0.14's `text_editor`, extended with a visible vertical
@@ -433,11 +438,18 @@ struct PendingClose {
     title: String,
 }
 
-/// The whole shell: the pure core plus the live editor buffer, window title, the
-/// last error surfaced in the status bar, and the go-to-line input's text.
+/// The whole shell: the pure core plus the per-tab editor buffers, window title,
+/// the last error surfaced in the status bar, and the go-to-line input's text.
 struct Shell {
     core: core::State,
-    editor: text_editor::Content,
+    /// Per-tab editor buffers, keyed by [`TabId`] (#94). Each tab keeps its own
+    /// [`text_editor::Content`], so switching tabs restores that tab's caret
+    /// *and* scroll offset instead of resetting to the top: the scroll lives
+    /// inside `Content`'s cosmic-text buffer, so only a preserved `Content`
+    /// brings it back. [`Shell::sync_editor_cache`] keeps the map's keys in
+    /// lockstep with `core.docs`, so the active tab's buffer is always present —
+    /// which is what lets [`Shell::active_editor`] unwrap the lookup.
+    editors: HashMap<TabId, text_editor::Content>,
     title: String,
     error: Option<String>,
     /// Go-to-line field text; parsed to a line number only on submit. The rest
@@ -496,12 +508,18 @@ impl Shell {
 
     fn new() -> (Self, Task<Message>) {
         let core = core::State::default();
-        let editor = text_editor::Content::with_text(&core.active_doc().content);
+        // Seed the cache with the initial document's buffer so `active_editor`
+        // has a value to return before the first `apply_core` runs (#94).
+        let mut editors = HashMap::new();
+        editors.insert(
+            core.active_doc().id,
+            text_editor::Content::with_text(&core.active_doc().content),
+        );
         let title = window_title(&core);
         (
             Shell {
                 core,
-                editor,
+                editors,
                 title,
                 error: None,
                 goto_input: String::new(),
@@ -561,6 +579,26 @@ impl Shell {
         }
     }
 
+    /// The active tab's editor buffer. Its key is present by invariant:
+    /// [`Shell::sync_editor_cache`] inserts a buffer for every document in
+    /// `core.docs` on every `apply_core`, and the active document is always one
+    /// of them — so the lookup can't miss (#94).
+    fn active_editor(&self) -> &text_editor::Content {
+        self.editors
+            .get(&self.core.active_doc().id)
+            .expect("active tab has an editor buffer")
+    }
+
+    /// The active tab's editor buffer, mutably. Present by the same invariant as
+    /// [`Shell::active_editor`]. `id` is copied out first so the immutable read
+    /// of `core` doesn't overlap the mutable borrow of `editors`.
+    fn active_editor_mut(&mut self) -> &mut text_editor::Content {
+        let id = self.core.active_doc().id;
+        self.editors
+            .get_mut(&id)
+            .expect("active tab has an editor buffer")
+    }
+
     fn dispatch(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::NewTab => self.apply_core(core::Message::NewTab, true),
@@ -572,7 +610,12 @@ impl Shell {
             // accelerators (#39).
             Message::Undo => self.apply_core(core::Message::Undo, true),
             Message::Redo => self.apply_core(core::Message::Redo, true),
-            Message::TabSelected(i) => self.apply_core(core::Message::TabSelected(i), true),
+            // resync=false: the per-tab cache already holds this tab's buffer, so
+            // selecting it shows that tab's own caret and scroll instead of
+            // rebuilding at the top — the crux of #94. (A first-ever selection of
+            // a tab that has no cached buffer is covered by `sync_editor_cache`'s
+            // lazy create.)
+            Message::TabSelected(i) => self.apply_core(core::Message::TabSelected(i), false),
             // resync=false: closing a clean tab (or a save-then-close) changes the
             // active document, which `apply_core` detects and resyncs on its own;
             // a *dirty* tab only yields a `ConfirmClose`, so the editor must be
@@ -593,13 +636,13 @@ impl Shell {
                 // Cursor moves / selection must not touch the core; only real
                 // edits change the buffer and (maybe) the dirty flag.
                 let is_edit = action.is_edit();
-                self.editor.perform(action);
+                self.active_editor_mut().perform(action);
                 if is_edit {
                     // A real edit means the user has moved on: clear any stale
                     // read/save error so the status row (Ln/Col, …) returns
                     // instead of staying hidden behind the banner (#97 item 7).
                     self.error = None;
-                    let text = self.editor.text();
+                    let text = self.active_editor().text();
                     // The editor owns the text now — don't clobber it by resyncing.
                     self.apply_core(core::Message::Edited(text), false)
                 } else {
@@ -697,7 +740,7 @@ impl Shell {
             // dep). Nothing selected → nothing to copy; just close the menu.
             Message::ContextCopy => {
                 self.context_menu = None;
-                match self.editor.selection() {
+                match self.active_editor().selection() {
                     Some(sel) if !sel.is_empty() => iced::clipboard::write(sel),
                     _ => Task::none(),
                 }
@@ -707,7 +750,7 @@ impl Shell {
             // undo history exactly like a typed deletion. No selection → no-op.
             Message::ContextCut => {
                 self.context_menu = None;
-                match self.editor.selection() {
+                match self.active_editor().selection() {
                     Some(sel) if !sel.is_empty() => {
                         let copy = iced::clipboard::write(sel);
                         let delete = self.dispatch(Message::Edit(text_editor::Action::Edit(
@@ -878,13 +921,50 @@ impl Shell {
     /// save-before-close that lands asynchronously (#31) moves the editor onto
     /// the surviving tab.
     fn apply_core(&mut self, msg: core::Message, resync: bool) -> Task<Message> {
-        let active_before = self.core.active_doc().id;
         let effects = core::update(&mut self.core, msg);
-        if resync || self.core.active_doc().id != active_before {
-            self.editor = text_editor::Content::with_text(&self.core.active_doc().content);
-        }
+        self.sync_editor_cache(resync);
         let tasks: Vec<Task<Message>> = effects.into_iter().map(|e| self.run_effect(e)).collect();
         Task::batch(tasks)
+    }
+
+    /// Reconcile the per-tab editor cache with the core's documents after an
+    /// update (#94), in three passes:
+    ///
+    /// 1. **Prune** buffers whose tab has closed, so the map can't grow without
+    ///    bound as tabs open and close.
+    /// 2. **Create** a buffer for any tab that lacks one — a `NewTab`, an opened
+    ///    file, the initial document — seeded from that document's text. A tab
+    ///    that already owns a buffer keeps it, caret and scroll intact: that is
+    ///    the whole point of the cache, and why a plain tab switch passes
+    ///    `resync = false`.
+    /// 3. **Rebuild** *only the active* buffer when `resync` is set, i.e. when
+    ///    the core rewrote that document's text out from under the editor
+    ///    (undo/redo, replace, load). `resync` is `false` for `Edited`, whose
+    ///    text *came from* the editor and must not be clobbered.
+    ///
+    /// Note there is no longer an "active document changed → rebuild" branch: a
+    /// changed active document that already owns a buffer is deliberately left
+    /// untouched, so a save-before-close (#31) that moves onto the surviving tab
+    /// — like any tab switch — restores that tab's remembered caret rather than
+    /// jumping to the top.
+    fn sync_editor_cache(&mut self, resync: bool) {
+        // 1. Prune buffers for tabs that no longer exist.
+        let live: HashSet<TabId> = self.core.docs.iter().map(|d| d.id).collect();
+        self.editors.retain(|id, _| live.contains(id));
+
+        // 2. Lazily create a buffer for any tab that lacks one.
+        for doc in &self.core.docs {
+            self.editors
+                .entry(doc.id)
+                .or_insert_with(|| text_editor::Content::with_text(&doc.content));
+        }
+
+        // 3. Rebuild only the active buffer when the core rewrote its text.
+        if resync {
+            let doc = self.core.active_doc();
+            self.editors
+                .insert(doc.id, text_editor::Content::with_text(&doc.content));
+        }
     }
 
     /// Open the find bar, seeding the query from a single-line selection the way
@@ -894,7 +974,7 @@ impl Shell {
     /// leaves the search until Enter / Find Next.
     fn open_find(&mut self) -> Task<Message> {
         let msg = match self
-            .editor
+            .active_editor()
             .selection()
             .filter(|sel| !sel.is_empty() && !sel.contains('\n'))
         {
@@ -955,7 +1035,7 @@ impl Shell {
                         }),
                     }
                 };
-                self.editor.move_to(cursor);
+                self.active_editor_mut().move_to(cursor);
                 Task::none()
             }
             // Surface the close-with-unsaved prompt as an in-app bar (see
@@ -996,7 +1076,7 @@ impl Shell {
     /// core's [`core::status`] expects.
     fn status(&self) -> core::StatusBar {
         let doc = self.core.active_doc();
-        let cursor = self.editor.cursor();
+        let cursor = self.active_editor().cursor();
         let caret =
             core::find::offset_at(&doc.content, cursor.position.line, cursor.position.column);
         let anchor = cursor
@@ -1013,7 +1093,7 @@ impl Shell {
     /// positions with `find::line_col_of` — the same conversion `RevealRange` uses.
     fn active_bracket(&self) -> Option<BracketHighlight> {
         let content = &self.core.active_doc().content;
-        let cursor = self.editor.cursor();
+        let cursor = self.active_editor().cursor();
         let caret = core::find::offset_at(content, cursor.position.line, cursor.position.column);
         let m = core::brackets::match_at(content, caret)?;
         let to_pos = |off: usize| {
@@ -1138,7 +1218,7 @@ impl Shell {
             tabs = tabs.push(button(text("\u{00d7}").font(ui)).on_press(Message::TabClosed(i)));
         }
 
-        let editor = text_editor(&self.editor)
+        let editor = text_editor(self.active_editor())
             .on_action(Message::Edit)
             // Keyboard shortcuts (#39): the character accelerators (Ctrl+S, Ctrl+=,
             // …) are handled here so the widget consumes the key rather than typing
@@ -1711,7 +1791,7 @@ mod tests {
         assert_eq!(shell.core.docs.len(), 1);
         assert_eq!(shell.core.active_doc().title(), "Untitled");
         assert!(shell.title.contains("Untitled"));
-        assert_eq!(shell.editor.text().trim_end(), "");
+        assert_eq!(shell.active_editor().text().trim_end(), "");
     }
 
     #[test]
@@ -1720,7 +1800,7 @@ mod tests {
         let _ = shell.update(Message::NewTab);
         assert_eq!(shell.core.docs.len(), 2);
         assert_eq!(shell.core.active, 1);
-        assert_eq!(shell.editor.text().trim_end(), "");
+        assert_eq!(shell.active_editor().text().trim_end(), "");
     }
 
     #[test]
@@ -1749,7 +1829,7 @@ mod tests {
         });
         assert_eq!(shell.core.active_doc().title(), "hello.rs");
         assert_eq!(shell.core.active_doc().language(), "Rust");
-        assert_eq!(shell.editor.text().trim_end(), "fn main() {}");
+        assert_eq!(shell.active_editor().text().trim_end(), "fn main() {}");
         assert!(shell.error.is_none());
     }
 
@@ -1805,7 +1885,7 @@ mod tests {
 
         let _ = shell.update(Message::DismissError);
         assert!(shell.error.is_none(), "dismiss clears the banner");
-        assert_eq!(shell.editor.text().trim_end(), "keep me");
+        assert_eq!(shell.active_editor().text().trim_end(), "keep me");
     }
 
     // ---- Editor context menu (#97 item 3) ----
@@ -1861,7 +1941,10 @@ mod tests {
         let _ = shell.update(Message::Edit(paste("pick me")));
         let _ = shell.update(Message::ContextMenuOpened);
         let _ = shell.update(Message::ContextSelectAll);
-        assert_eq!(shell.editor.selection().as_deref(), Some("pick me"));
+        assert_eq!(
+            shell.active_editor().selection().as_deref(),
+            Some("pick me")
+        );
     }
 
     #[test]
@@ -1873,15 +1956,19 @@ mod tests {
         let (mut shell, _) = Shell::new();
         let _ = shell.update(Message::Edit(paste("start ")));
         let _ = shell.update(Message::ContextPasteReady(Some("END".to_string())));
-        assert_eq!(shell.editor.text().trim_end(), "start END");
+        assert_eq!(shell.active_editor().text().trim_end(), "start END");
         // It went *through the core*, not just the widget, so the core's buffer
         // matches — which is what keeps paste undoable.
         assert_eq!(shell.core.active_doc().content.trim_end(), "start END");
 
-        let before = shell.editor.text();
+        let before = shell.active_editor().text();
         let _ = shell.update(Message::ContextPasteReady(None));
         let _ = shell.update(Message::ContextPasteReady(Some(String::new())));
-        assert_eq!(shell.editor.text(), before, "an empty paste is a no-op");
+        assert_eq!(
+            shell.active_editor().text(),
+            before,
+            "an empty paste is a no-op"
+        );
     }
 
     #[test]
@@ -1896,7 +1983,7 @@ mod tests {
         // No selection: Cut must not touch the buffer.
         let _ = shell.update(Message::ContextCut);
         assert_eq!(
-            shell.editor.text().trim_end(),
+            shell.active_editor().text().trim_end(),
             "keepcut",
             "cut with no selection is a no-op"
         );
@@ -1905,7 +1992,7 @@ mod tests {
         let _ = shell.update(Message::Edit(text_editor::Action::SelectAll));
         let _ = shell.update(Message::ContextCopy);
         assert_eq!(
-            shell.editor.text().trim_end(),
+            shell.active_editor().text().trim_end(),
             "keepcut",
             "copy leaves the buffer"
         );
@@ -1914,7 +2001,7 @@ mod tests {
         let _ = shell.update(Message::Edit(text_editor::Action::SelectAll));
         let _ = shell.update(Message::ContextCut);
         assert_eq!(
-            shell.editor.text().trim_end(),
+            shell.active_editor().text().trim_end(),
             "",
             "cut deletes the selection"
         );
@@ -1929,10 +2016,35 @@ mod tests {
         });
         let _ = shell.update(Message::NewTab);
         let _ = shell.update(Message::Edit(paste("bbb")));
-        assert_eq!(shell.editor.text().trim_end(), "bbb");
+        assert_eq!(shell.active_editor().text().trim_end(), "bbb");
         // Back to the first tab: the editor must show its content, not "bbb".
         let _ = shell.update(Message::TabSelected(0));
-        assert_eq!(shell.editor.text().trim_end(), "aaa");
+        assert_eq!(shell.active_editor().text().trim_end(), "aaa");
+    }
+
+    #[test]
+    fn switching_tabs_restores_the_caret() {
+        // #94's headline: a tab switch restores that tab's own caret — and, held in
+        // the same buffer, its scroll offset — rather than resetting to the top.
+        let (mut shell, _) = Shell::new();
+        // Park tab 0's caret at an interior spot: the end of a 3-line paste.
+        let _ = shell.update(Message::Edit(paste("one\ntwo\nthree")));
+        let parked = shell.active_editor().cursor();
+        assert_eq!((parked.position.line, parked.position.column), (2, 5));
+
+        // Detour through a second tab, typing there so its caret differs.
+        let _ = shell.update(Message::NewTab);
+        let _ = shell.update(Message::Edit(paste("elsewhere")));
+
+        // Back to tab 0: its caret is exactly where we left it, not (0, 0).
+        let _ = shell.update(Message::TabSelected(0));
+        let restored = shell.active_editor().cursor();
+        assert_eq!(
+            (restored.position.line, restored.position.column),
+            (2, 5),
+            "returning to a tab restores its caret (#94)"
+        );
+        assert_eq!(shell.active_editor().text().trim_end(), "one\ntwo\nthree");
     }
 
     #[test]
@@ -1953,15 +2065,49 @@ mod tests {
     fn undo_then_redo_resyncs_the_editor_buffer() {
         let (mut shell, _) = Shell::new();
         let _ = shell.update(Message::Edit(paste("hello")));
-        assert_eq!(shell.editor.text().trim_end(), "hello");
+        assert_eq!(shell.active_editor().text().trim_end(), "hello");
 
         let _ = shell.update(Message::Undo);
-        assert_eq!(shell.editor.text().trim_end(), "");
+        assert_eq!(shell.active_editor().text().trim_end(), "");
         assert!(!shell.core.active_doc().dirty());
 
         let _ = shell.update(Message::Redo);
-        assert_eq!(shell.editor.text().trim_end(), "hello");
+        assert_eq!(shell.active_editor().text().trim_end(), "hello");
         assert!(shell.core.active_doc().dirty());
+    }
+
+    #[test]
+    fn undo_then_redo_reveals_the_edit_site_not_the_top() {
+        // #94: undo/redo rewrite the buffer, so the shell rebuilds the active
+        // editor from the core's text (`resync = true`) — which on its own would
+        // drop the caret at (0, 0) and scroll to the top. Step 1's `RevealRange`
+        // lands the caret on the edit instead; verified here end-to-end.
+        let (mut shell, _) = Shell::new();
+        // Two separate steps: the first insert carries a newline, which closes the
+        // typing run, so "edit" is its own undo step rather than coalesced in.
+        let _ = shell.update(Message::Edit(paste("top\n")));
+        let _ = shell.update(Message::Edit(paste("edit")));
+
+        // Undo drops "edit"; the caret reveals where it happened (start of line 2),
+        // never the document top.
+        let _ = shell.update(Message::Undo);
+        assert_eq!(shell.active_editor().text().trim_end(), "top");
+        let undo = shell.active_editor().cursor();
+        assert_eq!(
+            (undo.position.line, undo.position.column),
+            (1, 0),
+            "undo reveals the edit site, not (0, 0)"
+        );
+
+        // Redo restores it; the caret lands at the end of the restored span.
+        let _ = shell.update(Message::Redo);
+        assert_eq!(shell.active_editor().text().trim_end(), "top\nedit");
+        let redo = shell.active_editor().cursor();
+        assert_eq!(
+            (redo.position.line, redo.position.column),
+            (1, 4),
+            "redo reveals the end of the restored edit"
+        );
     }
 
     #[test]
@@ -1969,7 +2115,7 @@ mod tests {
         let (mut shell, _) = Shell::new();
         let _ = shell.update(Message::Undo);
         let _ = shell.update(Message::Redo);
-        assert_eq!(shell.editor.text().trim_end(), "");
+        assert_eq!(shell.active_editor().text().trim_end(), "");
         assert!(!shell.core.active_doc().dirty());
         assert_eq!(shell.core.docs.len(), 1);
     }
@@ -2001,6 +2147,28 @@ mod tests {
     }
 
     #[test]
+    fn closing_the_active_tab_keeps_the_survivor_caret() {
+        // Closing the focused tab falls back to a surviving tab; that tab's editor
+        // buffer must be exactly as it was left — caret and scroll intact — not
+        // rebuilt at the top (#94).
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::Edit(paste("keep\nthis\ncaret")));
+        let parked = shell.active_editor().cursor();
+        assert_eq!((parked.position.line, parked.position.column), (2, 5));
+
+        // A fresh blank tab takes focus, then we close it — pristine, so no prompt.
+        let _ = shell.update(Message::NewTab);
+        let _ = shell.update(Message::TabClosed(1));
+        assert_eq!(shell.core.active, 0, "focus falls back to the survivor");
+        assert!(shell.confirm_close.is_none());
+
+        // The survivor's caret is untouched.
+        let restored = shell.active_editor().cursor();
+        assert_eq!((restored.position.line, restored.position.column), (2, 5));
+        assert_eq!(shell.active_editor().text().trim_end(), "keep\nthis\ncaret");
+    }
+
+    #[test]
     fn cancelling_the_close_keeps_the_tab_and_clears_the_prompt() {
         let (mut shell, _) = Shell::new();
         let _ = shell.update(Message::Edit(paste("stay")));
@@ -2014,7 +2182,7 @@ mod tests {
         assert!(shell.confirm_close.is_none());
         assert_eq!(shell.core.docs.len(), 1);
         assert!(shell.core.active_doc().dirty());
-        assert_eq!(shell.editor.text().trim_end(), "stay");
+        assert_eq!(shell.active_editor().text().trim_end(), "stay");
     }
 
     #[test]
@@ -2036,7 +2204,7 @@ mod tests {
         assert_eq!(shell.core.docs.len(), 1);
         assert!(shell.confirm_close.is_none());
         // The editor resynced onto the surviving document.
-        assert_eq!(shell.editor.text().trim_end(), "keep");
+        assert_eq!(shell.active_editor().text().trim_end(), "keep");
     }
 
     #[test]
@@ -2065,7 +2233,7 @@ mod tests {
         });
         assert_eq!(shell.core.docs.len(), 1);
         // The editor resynced onto the surviving second tab.
-        assert_eq!(shell.editor.text().trim_end(), "second");
+        assert_eq!(shell.active_editor().text().trim_end(), "second");
     }
 
     #[test]
@@ -2109,10 +2277,10 @@ mod tests {
         let _ = shell.update(Message::FindQueryChanged("foo".into()));
         assert_eq!(shell.core.find.count, 2);
         // The RevealRange effect actually selected the first match in the widget.
-        assert_eq!(shell.editor.selection().as_deref(), Some("foo"));
+        assert_eq!(shell.active_editor().selection().as_deref(), Some("foo"));
         // Find Next moves the selection to the second occurrence.
         let _ = shell.update(Message::FindNext);
-        assert_eq!(shell.editor.selection().as_deref(), Some("foo"));
+        assert_eq!(shell.active_editor().selection().as_deref(), Some("foo"));
         assert_eq!(shell.core.find.current.map(|m| m.start), Some(8));
     }
 
@@ -2122,7 +2290,7 @@ mod tests {
         let _ = shell.update(Message::Edit(paste("one\ntwo\nthree")));
         let _ = shell.update(Message::GoToInputChanged("2".into()));
         let _ = shell.update(Message::GoToSubmit);
-        let cursor = shell.editor.cursor();
+        let cursor = shell.active_editor().cursor();
         assert_eq!(cursor.position.line, 1); // 0-based → line 2
         assert_eq!(cursor.position.column, 0);
     }
@@ -2145,9 +2313,9 @@ mod tests {
         let _ = shell.update(Message::ReplaceQueryChanged("X".into()));
         let _ = shell.update(Message::ReplaceOne);
         assert_eq!(shell.core.active_doc().content, "X ab ab");
-        assert_eq!(shell.editor.text().trim_end(), "X ab ab");
+        assert_eq!(shell.active_editor().text().trim_end(), "X ab ab");
         // The editor resynced and the selection landed on the next match.
-        assert_eq!(shell.editor.selection().as_deref(), Some("ab"));
+        assert_eq!(shell.active_editor().selection().as_deref(), Some("ab"));
     }
 
     #[test]
@@ -2158,7 +2326,7 @@ mod tests {
         let _ = shell.update(Message::FindQueryChanged("ab".into()));
         let _ = shell.update(Message::ReplaceQueryChanged("X".into()));
         let _ = shell.update(Message::ReplaceAll);
-        assert_eq!(shell.editor.text().trim_end(), "X X X");
+        assert_eq!(shell.active_editor().text().trim_end(), "X X X");
         assert_eq!(shell.core.find.count, 0);
     }
 
@@ -2190,7 +2358,7 @@ mod tests {
                 text_editor::Motion::Right,
             )));
         }
-        assert_eq!(shell.editor.selection().as_deref(), Some("foo"));
+        assert_eq!(shell.active_editor().selection().as_deref(), Some("foo"));
         assert!(shell.core.find.query.is_empty(), "no query before opening");
         let _ = shell.update(Message::ToggleFind);
         assert!(shell.core.find.open);
@@ -2209,7 +2377,10 @@ mod tests {
         let (mut shell, _) = Shell::new();
         let _ = shell.update(Message::Edit(paste("one\ntwo")));
         let _ = shell.update(Message::Edit(text_editor::Action::SelectAll));
-        assert_eq!(shell.editor.selection().as_deref(), Some("one\ntwo"));
+        assert_eq!(
+            shell.active_editor().selection().as_deref(),
+            Some("one\ntwo")
+        );
         let _ = shell.update(Message::ToggleFind);
         assert!(shell.core.find.open);
         assert!(
@@ -2254,7 +2425,7 @@ mod tests {
         // Cross-check against the widget's own selected text.
         assert_eq!(
             shell
-                .editor
+                .active_editor()
                 .selection()
                 .as_deref()
                 .map(|t| t.chars().count()),
@@ -2443,7 +2614,7 @@ mod tests {
         assert_eq!(shell.core.font_size(), core::State::DEFAULT_FONT_SIZE);
 
         // Zooming left the live buffer and its dirty flag alone.
-        assert_eq!(shell.editor.text().trim_end(), "keep me");
+        assert_eq!(shell.active_editor().text().trim_end(), "keep me");
         assert!(shell.core.active_doc().dirty());
     }
 
@@ -2462,7 +2633,7 @@ mod tests {
 
         // Toggling left the live buffer and its dirty flag alone, and the view
         // still renders in either wrap state.
-        assert_eq!(shell.editor.text().trim_end(), "keep me");
+        assert_eq!(shell.active_editor().text().trim_end(), "keep me");
         assert!(shell.core.active_doc().dirty());
         let _ = shell.view();
         let _ = shell.update(Message::ToggleWordWrap);
@@ -2486,7 +2657,7 @@ mod tests {
         assert!(shell.core.show_line_numbers());
         let _ = shell.view(); // the gutter-on view builds
 
-        assert_eq!(shell.editor.text().trim_end(), "keep me");
+        assert_eq!(shell.active_editor().text().trim_end(), "keep me");
         assert!(shell.core.active_doc().dirty());
     }
 
@@ -2513,7 +2684,7 @@ mod tests {
         assert_eq!(shell.theme(), iced::Theme::Light);
 
         // The toggle left the live buffer and its dirty flag untouched.
-        assert_eq!(shell.editor.text().trim_end(), "keep me");
+        assert_eq!(shell.active_editor().text().trim_end(), "keep me");
         assert!(shell.core.active_doc().dirty());
     }
 
@@ -2652,7 +2823,7 @@ mod tests {
         let _ = shell.update(Message::OpenPicked(None)); // user cancels
         assert_eq!(shell.core.docs.len(), 1);
         assert!(shell.error.is_none());
-        assert_eq!(shell.editor.text().trim_end(), "in progress");
+        assert_eq!(shell.active_editor().text().trim_end(), "in progress");
         assert!(shell.core.active_doc().dirty());
     }
 
@@ -2991,7 +3162,7 @@ mod tests {
         assert_eq!(shell.core.docs.len(), files.len());
         assert!(shell.error.is_none());
         assert_eq!(shell.core.active_doc().title(), "c.md");
-        assert_eq!(shell.editor.text().trim_end_matches('\n'), "# cee");
+        assert_eq!(shell.active_editor().text().trim_end_matches('\n'), "# cee");
     }
 
     #[test]

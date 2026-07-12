@@ -39,13 +39,13 @@ jobs:
       - uses: swatinem/rust-cache@v2
         with:
           key: ${{ matrix.platform }}
-      - name: install cargo-deb
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-deb
-      # cargo-generate-rpm isn't in taiki-e/install-action's catalogue.
-      - name: install cargo-generate-rpm
-        run: cargo install cargo-generate-rpm --locked
+      # Build both from source rather than a prebuilt binary: on ubuntu-22.04
+      # (kept low so the .deb's auto-derived libc6 floor installs on older
+      # distros) taiki-e/install-action's cargo-deb is linked against a newer
+      # glibc than the runner has and won't run; compiling links against the
+      # runner's own glibc. cargo-generate-rpm isn't in that catalogue anyway.
+      - name: install cargo-deb + cargo-generate-rpm
+        run: cargo install cargo-deb cargo-generate-rpm --locked
       - name: build .deb + .rpm
         run: |
           bash packaging/build-linux.sh deb

@@ -47,9 +47,13 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-deb
+      # Build cargo-deb from source rather than taiki-e/install-action's prebuilt
+      # binary: that binary is linked against a newer glibc (2.39+) than
+      # ubuntu-22.04 ships (2.35), so it won't run here — and this job must stay
+      # on 22.04 to keep the .deb's auto-derived libc6 floor low enough for
+      # debian:stable-slim. Compiling links cargo-deb against the runner's glibc.
+      - name: install cargo-deb
+        run: cargo install cargo-deb --locked
       - name: build the .deb
         run: bash packaging/build-linux.sh deb
       - name: install into a clean debian:stable-slim + launch under xvfb

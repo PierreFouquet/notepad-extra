@@ -1,6 +1,0 @@
-{
-  "identifier": "default",
-  "description": "Default capability granting the main window core API access.",
-  "windows": ["main"],
-  "permissions": ["core:default"]
-}

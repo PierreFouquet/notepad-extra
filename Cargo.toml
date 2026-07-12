@@ -1,38 +1,21 @@
-[package]
-name = "notepad-extra"
-version.workspace = true
-edition = "2024"
-description = "Small, fast, fully offline text and code editor. Inspired by Notepad++."
-authors = ["Pierre Fouquet"]
-license = "GPL-3.0-or-later"
-homepage = "https://github.com/PierreFouquet/notepad-extra"
-repository = "https://github.com/PierreFouquet/notepad-extra"
-readme = "README.md"
-
-[dependencies]
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-tauri = { version = "2.0", features = [] }
-tauri-plugin-dialog = "2.0"
-
-[build-dependencies]
-tauri-build = { version = "2.0", features = [] }
-
-[dev-dependencies]
-tempfile = "3.6"
-
 # --- Native-rewrite workspace (issue #25) -------------------------------------
-# The root package stays the existing Tauri app and keeps building until the
-# Phase 4 cutover (#46). New native-GUI crates live under `crates/`:
-#   * notepad-core — pure, UI-free `update(State, Message) -> Effect` core (#28)
-#   * notepad-iced — thin iced render shell that executes the core's Effects (#28)
+# The root is now a *virtual* manifest: it defines only the workspace and its
+# shared profiles, no package of its own. The former root package was the legacy
+# Tauri/WebView app; #43 removed its bundling config (`tauri.conf.json`,
+# `capabilities/`) and, since a Tauri package can't build without them, retired
+# the root package here too. The native app lives entirely under `crates/`:
+#   * notepad-syntax — shared syntect-backed language catalogue (#32)
+#   * notepad-core   — pure, UI-free `update(State, Message) -> Effect` core (#28)
+#   * notepad-iced   — thin iced render shell; builds the `notepad-extra` binary
+# The orphaned Tauri *source* (`src/`, `src-tauri/`, `gen/`, `tests/frontend/`)
+# is deleted in the #46 cutover; it no longer belongs to any package.
 [workspace]
 members = ["crates/syntax", "crates/core", "crates/iced"]
 resolver = "2"
 
-# One product version for the whole workspace: the app and every native crate
-# share it, inherited via `version.workspace = true`. Bumping the release bumps
-# everything from a single source of truth (no per-crate drift).
+# One product version for the whole workspace: every native crate inherits it via
+# `version.workspace = true`, so a release bump has a single source of truth and
+# the packagers (deb/rpm/msi/dmg, #43) all read the same number.
 [workspace.package]
 version = "0.4.0"
 

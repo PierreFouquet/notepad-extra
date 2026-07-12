@@ -277,6 +277,13 @@ fn on_event(
         iced::Event::Keyboard(iced::keyboard::Event::KeyPressed { key, modifiers, .. }) => {
             on_key(key.clone(), *modifiers)
         }
+        // A wheel scroll — over the editor or inside an open `pick_list` menu —
+        // produces no widget message, so without this the repaint nudge never
+        // fires for it and the frame takes iced's stale partial-damage path,
+        // leaving duplicated rows behind while scrolling a font / language
+        // dropdown on the software renderer. Turn every scroll into a message so
+        // `update` forces a full redraw (see [`Message::ScrollNudge`]).
+        iced::Event::Mouse(iced::mouse::Event::WheelScrolled { .. }) => Some(Message::ScrollNudge),
         _ => on_window_event(event, status, id),
     }
 }
@@ -368,6 +375,15 @@ enum Message {
     /// (Ln/Col, …) it hid comes back without waiting for a later operation. The
     /// next real edit clears it too; this is the `×` for when there's no edit.
     DismissError,
+
+    /// A mouse-wheel scroll happened somewhere — the editor, or an open
+    /// `pick_list` menu. Carries no data and changes no state: its only job is to
+    /// *be* a message, so [`Shell::update`] flips the repaint nudge and the frame
+    /// takes the full-surface redraw path. A scrolling overlay emits no message
+    /// of its own, so on the software renderer its partial-damage frames leave
+    /// stale, "bunched" duplicate rows behind — the font / language dropdown
+    /// symptom. See [`Shell::repaint_nudge`] for the underlying iced limitation.
+    ScrollNudge,
 
     // ---- Editor context menu (#97 item 3) ----
     /// The pointer moved over the editor; remember where so the context menu can
@@ -862,6 +878,11 @@ impl Shell {
                 self.error = None;
                 Task::none()
             }
+
+            // Rendering-only: exists so `update` flips the repaint nudge for a
+            // scroll and forces a full redraw (see the variant + `repaint_nudge`
+            // docs). No state to touch.
+            Message::ScrollNudge => Task::none(),
 
             // ---- Editor context menu (#97 item 3) ----
             // Track the pointer so a right-click can open the menu where the
@@ -3796,6 +3817,29 @@ mod tests {
         // An unrelated window event maps to nothing.
         let other = iced::Event::Window(iced::window::Event::Unfocused);
         assert!(on_window_event(other, status, id).is_none());
+    }
+
+    #[test]
+    fn a_wheel_scroll_forces_a_full_repaint() {
+        // A scroll carries no widget message, so the subscription turns it into a
+        // ScrollNudge purely so `update` flips the repaint nudge — otherwise the
+        // software renderer's partial-damage path leaves duplicated, "bunched"
+        // rows behind when scrolling a font / language dropdown.
+        let id = iced::window::Id::unique();
+        let status = iced::event::Status::Ignored;
+        let scroll = iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+            delta: iced::mouse::ScrollDelta::Lines { x: 0.0, y: -3.0 },
+        });
+        assert!(matches!(
+            on_event(scroll, status, id),
+            Some(Message::ScrollNudge)
+        ));
+
+        // Handling it flips the nudge, so the next frame takes the full redraw.
+        let (mut shell, _) = Shell::new();
+        let before = shell.repaint_nudge;
+        let _ = shell.update(Message::ScrollNudge);
+        assert_ne!(shell.repaint_nudge, before);
     }
 
     #[test]

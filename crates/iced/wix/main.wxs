@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="windows-1252"?>
+<!--
+  WiX v3 installer for Notepad Extra (issue #43), built with cargo-wix.
+
+  Location: cargo-wix looks for `wix/main.wxs` alongside the *package* manifest,
+  so this lives under `crates/iced/` (the `notepad-iced` crate), not the
+  workspace root. cargo-wix passes light.exe `-b <package manifest dir>` as the
+  base for resolving relative `Source`/`SourceFile` paths, so repo-root assets
+  are reached with `..\..\` — the same convention cargo-deb uses (#43).
+
+  cargo-wix supplies `$(var.Version)` from the crate version and
+  `$(var.CargoTargetBinDir)` = the workspace `target\<profile>` bin dir. The
+  UpgradeCode GUID below is STABLE across releases so MajorUpgrade can replace
+  older installs in place — do not regenerate it.
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+    <Product
+        Id="*"
+        Name="Notepad Extra"
+        UpgradeCode="5BAB0A61-A039-4A3E-90D6-B75E6D8E9737"
+        Manufacturer="Pierre Fouquet"
+        Language="1033"
+        Codepage="1252"
+        Version="$(var.Version)">
+
+        <Package Id="*"
+            Keywords="Installer"
+            Description="Notepad Extra — small, fast, fully offline text and code editor"
+            Manufacturer="Pierre Fouquet"
+            InstallerVersion="450"
+            Languages="1033"
+            Compressed="yes"
+            InstallScope="perMachine"
+            SummaryCodepage="1252"/>
+
+        <MajorUpgrade
+            Schedule="afterInstallInitialize"
+            DowngradeErrorMessage="A newer version of Notepad Extra is already installed. Setup will now exit."/>
+
+        <Media Id="1" Cabinet="media1.cab" EmbedCab="yes" DiskPrompt="CD-ROM #1"/>
+        <Property Id="DiskPrompt" Value="Notepad Extra Installation"/>
+
+        <Directory Id="TARGETDIR" Name="SourceDir">
+            <Directory Id="ProgramFiles64Folder" Name="PFiles">
+                <Directory Id="APPLICATIONFOLDER" Name="Notepad Extra">
+                    <Component Id="Binary" Guid="*">
+                        <File Id="exe0" Name="notepad-extra.exe" DiskId="1" KeyPath="yes"
+                              Source="$(var.CargoTargetBinDir)\notepad-extra.exe"/>
+                    </Component>
+                    <Component Id="License" Guid="*">
+                        <File Id="LicenseFile" Name="License.txt" DiskId="1" KeyPath="yes"
+                              Source="..\..\LICENSE"/>
+                    </Component>
+                </Directory>
+            </Directory>
+
+            <Directory Id="ProgramMenuFolder">
+                <Component Id="ApplicationShortcut" Guid="*">
+                    <Shortcut Id="AppStartMenuShortcut"
+                              Name="Notepad Extra"
+                              Description="Small, fast, fully offline text and code editor"
+                              Target="[#exe0]"
+                              WorkingDirectory="APPLICATIONFOLDER"
+                              Icon="ProductIcon"/>
+                    <RemoveFolder Id="CleanUpShortCut" Directory="ProgramMenuFolder" On="uninstall"/>
+                    <RegistryValue Root="HKCU" Key="Software\PierreFouquet\NotepadExtra"
+                                   Name="installed" Type="integer" Value="1" KeyPath="yes"/>
+                </Component>
+            </Directory>
+        </Directory>
+
+        <Feature Id="Complete" Title="Notepad Extra" Level="1">
+            <ComponentRef Id="Binary"/>
+            <ComponentRef Id="License"/>
+            <ComponentRef Id="ApplicationShortcut"/>
+        </Feature>
+
+        <Icon Id="ProductIcon" SourceFile="..\..\icons\icon.ico"/>
+        <Property Id="ARPPRODUCTICON" Value="ProductIcon"/>
+        <Property Id="ARPHELPLINK" Value="https://github.com/PierreFouquet/notepad-extra"/>
+    </Product>
+</Wix>

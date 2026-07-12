@@ -10,13 +10,10 @@ repository = "https://github.com/PierreFouquet/notepad-extra"
 
 # The shipped binary is `notepad-extra`, not the crate name (#95): the desktop
 # entry (`Exec=notepad-extra %F`), the man page `notepad-extra(1)` and the
-# packaged install all point at that name, so the built binary must match.
-# Until the #46 cutover the legacy Tauri root package produces a binary of the
-# same name, so a *workspace-root* build emits cargo's "output filename
-# collision" warning and last-built wins in `target/debug` — harmless for
-# tests (they run from hashed per-package binaries) and every native CI job
-# builds `--package notepad-iced` alone; the warning dies with the root
-# package at cutover.
+# packaged install all point at that name, so the built binary must match. The
+# legacy Tauri root package (which also produced a `notepad-extra` binary) was
+# retired in #43 — the workspace root is now a virtual manifest — so the former
+# "output filename collision" warning from a workspace-root build is gone.
 [[bin]]
 name = "notepad-extra"
 path = "src/main.rs"
@@ -86,3 +83,85 @@ advanced = []
 # Real temp files for the preferences save→reload round-trip test (#38). Already
 # in `Cargo.lock` via the workspace, so it adds nothing to vendor for #17.
 tempfile = "3.6"
+
+# --- Native packaging (#43) ---------------------------------------------------
+# The shipped binary is packaged natively — no Tauri bundler. cargo-deb and
+# cargo-generate-rpm build the Linux packages, cargo-bundle the macOS .app/.dmg,
+# and cargo-wix the Windows .msi (via wix/main.wxs). All read this crate's
+# package fields (version 0.4.0, description, license, homepage) plus the
+# per-format metadata below. The `notepad-extra` binary carries no webkit/gtk
+# runtime (software-rendered iced + xdg-portal dialogs), so the old
+# libwebkit2gtk / appindicator deps are gone — only the X11/Wayland/xkb/font
+# libraries it dlopens remain (see `depends`/`requires`; #44 proves them).
+
+# cargo-deb: asset *source* paths are relative to this manifest (`crates/iced/`),
+# so repo-root files use `../../`; the built binary is taken from the workspace
+# `target/` dir (cargo-deb special-cases `target/`).
+[package.metadata.deb]
+# The Debian package, binary and #15 assets are all `notepad-extra`, not the
+# crate name `notepad-iced`.
+name = "notepad-extra"
+maintainer = "Pierre Fouquet <pierrefouquet93@gmail.com>"
+section = "editors"
+priority = "optional"
+license-file = ["../../LICENSE", "0"]
+extended-description = """\
+Notepad Extra is a small, fast, fully offline text and code editor for Windows, \
+macOS and Linux, inspired by Notepad++. It offers tabbed editing, syntax \
+highlighting for 80+ languages, find/replace/go-to-line, word wrap, editor zoom \
+and light/dark themes, and preserves each file's original line endings on save.\
+"""
+# `$auto` derives the ELF-linked libs (libc6, libgcc-s1); the rest are dlopened
+# by winit/softbuffer (X11/Wayland/xkb) and cosmic-text (fontconfig) and so are
+# invisible to shlibdeps — they must be named. #44 (install into a clean
+# container + launch under xvfb) is the check that this list is complete.
+depends = "$auto, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libx11-6, libxcb1, libxcursor1, libxrandr2, libxi6, libfontconfig1"
+assets = [
+    ["target/release/notepad-extra", "usr/bin/notepad-extra", "755"],
+    ["../../packaging/linux/io.github.PierreFouquet.NotepadExtra.desktop", "usr/share/applications/io.github.PierreFouquet.NotepadExtra.desktop", "644"],
+    ["../../packaging/linux/io.github.PierreFouquet.NotepadExtra.metainfo.xml", "usr/share/metainfo/io.github.PierreFouquet.NotepadExtra.metainfo.xml", "644"],
+    ["../../packaging/linux/notepad-extra.1", "usr/share/man/man1/notepad-extra.1", "644"],
+    ["../../icons/32x32.png", "usr/share/icons/hicolor/32x32/apps/io.github.PierreFouquet.NotepadExtra.png", "644"],
+    ["../../icons/64x64.png", "usr/share/icons/hicolor/64x64/apps/io.github.PierreFouquet.NotepadExtra.png", "644"],
+    ["../../icons/128x128.png", "usr/share/icons/hicolor/128x128/apps/io.github.PierreFouquet.NotepadExtra.png", "644"],
+    ["../../icons/128x128@2x.png", "usr/share/icons/hicolor/256x256/apps/io.github.PierreFouquet.NotepadExtra.png", "644"],
+]
+
+# cargo-generate-rpm reads its own asset list; source paths are relative to the
+# workspace root, where the release/CI scripts invoke `cargo generate-rpm`.
+# auto-req (find-requires on the ELF) covers the linked libs; `requires` names
+# the dlopened ones by their Fedora package names.
+[package.metadata.generate-rpm]
+name = "notepad-extra"
+assets = [
+    { source = "target/release/notepad-extra", dest = "/usr/bin/notepad-extra", mode = "755" },
+    { source = "packaging/linux/io.github.PierreFouquet.NotepadExtra.desktop", dest = "/usr/share/applications/io.github.PierreFouquet.NotepadExtra.desktop", mode = "644" },
+    { source = "packaging/linux/io.github.PierreFouquet.NotepadExtra.metainfo.xml", dest = "/usr/share/metainfo/io.github.PierreFouquet.NotepadExtra.metainfo.xml", mode = "644" },
+    { source = "packaging/linux/notepad-extra.1", dest = "/usr/share/man/man1/notepad-extra.1", mode = "644" },
+    { source = "icons/32x32.png", dest = "/usr/share/icons/hicolor/32x32/apps/io.github.PierreFouquet.NotepadExtra.png", mode = "644" },
+    { source = "icons/64x64.png", dest = "/usr/share/icons/hicolor/64x64/apps/io.github.PierreFouquet.NotepadExtra.png", mode = "644" },
+    { source = "icons/128x128.png", dest = "/usr/share/icons/hicolor/128x128/apps/io.github.PierreFouquet.NotepadExtra.png", mode = "644" },
+    { source = "icons/128x128@2x.png", dest = "/usr/share/icons/hicolor/256x256/apps/io.github.PierreFouquet.NotepadExtra.png", mode = "644" },
+]
+
+[package.metadata.generate-rpm.requires]
+libxkbcommon = "*"
+"libxkbcommon-x11" = "*"
+libwayland-client = "*"
+libX11 = "*"
+libxcb = "*"
+libXcursor = "*"
+libXrandr = "*"
+libXi = "*"
+fontconfig = "*"
+
+# macOS .app / .dmg via cargo-bundle. It assembles an .icns from these PNG
+# sources at build time. Icon paths are relative to this manifest.
+[package.metadata.bundle]
+name = "Notepad Extra"
+identifier = "io.github.PierreFouquet.NotepadExtra"
+icon = ["../../icons/32x32.png", "../../icons/128x128.png", "../../icons/128x128@2x.png", "../../icons/icon.png"]
+category = "public.app-category.utilities"
+short_description = "Small, fast, fully offline text and code editor"
+long_description = "Notepad Extra is a small, fast, fully offline text and code editor for Windows, macOS and Linux, inspired by Notepad++."
+copyright = "Copyright © Pierre Fouquet. GNU GPL v3 or later."

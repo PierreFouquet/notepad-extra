@@ -1,0 +1,198 @@
+name: "packaging"
+
+# Issue #44 — build each native package and prove it installs and launches.
+#
+# The Linux packages carry hand-written runtime deps (the X11/Wayland/xkb/font
+# libraries winit/softbuffer/cosmic-text dlopen, which the automatic ELF scanners
+# can't see — see crates/iced/Cargo.toml). To prove that list is complete, the
+# .deb and .rpm are installed into a *clean* debian:stable-slim / fedora:latest
+# container — where only their declared deps are available — and then launched
+# headlessly under xvfb. A clean startup that survives until `timeout` kills it
+# (exit 124) is success; a missing runtime dep surfaces as an early exit. The
+# xvfb/xauth test harness is installed *after* the package so it can never mask a
+# missing dep. The AppImage bundles its own libs, so it is launched on the runner.
+#
+# These are the same commands release.yml (#45) ships with — both drive the
+# shared packaging/ scripts — so CI and release can't drift.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  metadata:
+    name: "metainfo + desktop validate"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: install validators
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends appstream desktop-file-utils
+      - name: validate AppStream metainfo
+        run: appstreamcli validate --no-net packaging/linux/io.github.PierreFouquet.NotepadExtra.metainfo.xml
+      - name: validate desktop entry
+        run: desktop-file-validate packaging/linux/io.github.PierreFouquet.NotepadExtra.desktop
+
+  deb-smoke:
+    name: "deb — build · clean-install · launch"
+    # Build on the oldest supported Ubuntu so the auto-derived `libc6 (>= …)`
+    # floor stays low enough to install on debian:stable-slim. Mirrors release.yml.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+      # Build cargo-deb from source rather than taiki-e/install-action's prebuilt
+      # binary: that binary is linked against a newer glibc (2.39+) than
+      # ubuntu-22.04 ships (2.35), so it won't run here — and this job must stay
+      # on 22.04 to keep the .deb's auto-derived libc6 floor low enough for
+      # debian:stable-slim. Compiling links cargo-deb against the runner's glibc.
+      - name: install cargo-deb
+        run: cargo install cargo-deb --locked
+      - name: build the .deb
+        run: bash packaging/build-linux.sh deb
+      - name: install into a clean debian:stable-slim + launch under xvfb
+        run: |
+          docker run --rm -v "$PWD:/w" -w /w debian:stable-slim bash -euo pipefail -c '
+            apt-get update
+            # Install the package first, letting apt resolve ONLY its declared
+            # Depends from the archive — that is the check that the list is
+            # complete. The test harness (xvfb/xauth) goes in afterwards.
+            apt-get install -y --no-install-recommends ./target/debian/*.deb
+            apt-get install -y --no-install-recommends xvfb xauth
+            set +e
+            xvfb-run -a timeout 10 notepad-extra
+            code=$?
+            set -e
+            if [ "$code" != "124" ]; then
+              echo "notepad-extra exited early (code $code) — a declared runtime dep is likely missing"
+              exit 1
+            fi
+            echo "deb installed with only its declared deps and launched under xvfb"
+          '
+
+  rpm-smoke:
+    name: "rpm — build · clean-install · launch"
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+      # cargo-generate-rpm isn't in taiki-e/install-action's catalogue, so build it.
+      - name: install cargo-generate-rpm
+        run: cargo install cargo-generate-rpm --locked
+      - name: build the .rpm
+        run: bash packaging/build-linux.sh rpm
+      - name: install into a clean fedora:latest + launch under xvfb
+        run: |
+          docker run --rm -v "$PWD:/w" -w /w fedora:latest bash -euo pipefail -c '
+            # --nogpgcheck: the locally built rpm is unsigned. Its own Requires are
+            # still fully resolved from the Fedora repos — the point of the test.
+            dnf install -y --nogpgcheck ./target/generate-rpm/*.rpm
+            dnf install -y xorg-x11-server-Xvfb xorg-x11-xauth
+            set +e
+            xvfb-run -a timeout 10 notepad-extra
+            code=$?
+            set -e
+            if [ "$code" != "124" ]; then
+              echo "notepad-extra exited early (code $code) — a declared runtime dep is likely missing"
+              exit 1
+            fi
+            echo "rpm installed with only its declared deps and launched under xvfb"
+          '
+
+  appimage-smoke:
+    name: "AppImage — build · launch"
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+      # linuxdeploy bundles the app's NEEDED libs but not the ones winit/softbuffer
+      # dlopen, so the runner needs those (the same set a real desktop provides)
+      # plus a virtual display.
+      - name: install the runtime libs + virtual display
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            xvfb xauth \
+            libxkbcommon0 libxkbcommon-x11-0 libwayland-client0 \
+            libx11-6 libxcb1 libxcursor1 libxrandr2 libxi6 libfontconfig1
+      - name: build the AppImage
+        run: bash packaging/build-linux.sh appimage
+      - name: launch under xvfb
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1" # self-extract instead of FUSE-mount (no FUSE on the runner)
+        run: |
+          set +e
+          xvfb-run -a timeout 10 ./target/appimage/*.AppImage
+          code=$?
+          set -e
+          if [ "$code" != "124" ]; then
+            echo "AppImage exited early (code $code)"
+            exit 1
+          fi
+          echo "AppImage launched under xvfb"
+
+  msi-smoke:
+    name: "msi — build · install · launch"
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+      # cargo-wix isn't in taiki-e/install-action's catalogue; WiX Toolset 3.x
+      # itself ships on the windows runner image (cargo-wix finds it via %WIX%).
+      - name: install cargo-wix
+        run: cargo install cargo-wix --locked
+      - name: build the release binary
+        run: cargo build --release --package notepad-iced
+      # The wxs lives at crates/iced/wix/main.wxs (cargo-wix's default
+      # package-relative location); --no-build reuses the binary just built.
+      - name: build the .msi
+        run: cargo wix --package notepad-iced --no-build --nocapture
+      - name: install the .msi + launch
+        shell: pwsh
+        run: |
+          $msi = Get-ChildItem target\wix\*.msi | Select-Object -First 1
+          if (-not $msi) { throw "no .msi produced under target\wix" }
+          Write-Host "installing $($msi.FullName)"
+          $m = Start-Process msiexec -ArgumentList "/i", "`"$($msi.FullName)`"", "/qn", "/norestart" -Wait -PassThru
+          if ($m.ExitCode -ne 0 -and $m.ExitCode -ne 3010) { throw "msiexec failed (exit $($m.ExitCode))" }
+          $exe = "C:\Program Files\Notepad Extra\notepad-extra.exe"
+          if (-not (Test-Path $exe)) { throw "installed exe not found at $exe" }
+          $app = Start-Process $exe -PassThru
+          Start-Sleep -Seconds 8
+          if ($app.HasExited) { throw "app exited early (exit $($app.ExitCode))" }
+          Stop-Process -Id $app.Id -Force
+          Write-Host "msi installed and app launched"
+
+  dmg-smoke:
+    name: "dmg — build · launch"
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+      - name: build the .app and .dmg
+        run: bash packaging/build-macos.sh
+      - name: launch the bundled app
+        run: |
+          APP="target/release/bundle/osx/Notepad Extra.app"
+          BIN="$APP/Contents/MacOS/notepad-extra"
+          [ -x "$BIN" ] || { echo "app binary not found at $BIN"; exit 1; }
+          # macOS runners ship no `timeout`; launch in the background, confirm the
+          # window process is still alive after a few seconds, then stop it.
+          "$BIN" &
+          pid=$!
+          sleep 8
+          if ! kill -0 "$pid" 2>/dev/null; then
+            wait "$pid"; echo "app exited early (code $?)"; exit 1
+          fi
+          kill "$pid"
+          echo "dmg built and app launched"

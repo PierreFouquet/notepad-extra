@@ -1,81 +1,30 @@
 name: "release"
 
-# Builds installers for every platform when a GitHub Release is *published*,
-# and uploads them straight onto that release. `workflow_dispatch` is kept as a
-# manual fallback (it creates a draft release instead).
+# Builds the native packages for every platform when a GitHub Release is
+# *published*, and uploads them straight onto that release. `workflow_dispatch`
+# is kept as a manual fallback that saves the packages as run artifacts instead
+# of touching a release.
+#
+# This replaces the old tauri-action matrix (#45). The native binary carries no
+# webkit/gtk, so there are no build-time system deps on any platform beyond the
+# Rust toolchain and the packaging tools. Every job drives the same packaging/
+# scripts the #44 smoke workflow install-tests, so what ships here is exactly
+# what CI proved installs and launches.
 on:
   release:
     types: [published]
   workflow_dispatch:
 
-# Opt JS actions that still ship on Node.js 20 (rust-cache, tauri-action) onto
-# Node.js 24 now, ahead of the June 2026 forced cutover.
 env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  CARGO_TERM_COLOR: always
 
 jobs:
-  publish-tauri:
-    permissions:
-      contents: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # macOS — Intel
-          - platform: "macos-15-intel"
-            rust-target: "x86_64-apple-darwin"
-            args: "--target x86_64-apple-darwin"
-          # macOS — Apple Silicon
-          - platform: "macos-latest"
-            rust-target: "aarch64-apple-darwin"
-            args: "--target aarch64-apple-darwin"
-          # Windows — x64 (msi + nsis). Pinned to avoid the windows-latest image redirect.
-          - platform: "windows-2025"
-            rust-target: ""
-            args: ""
-          # Windows — ARM64 (nsis)
-          - platform: "windows-11-arm"
-            rust-target: "aarch64-pc-windows-msvc"
-            args: "--bundles nsis"
-
-    runs-on: ${{ matrix.platform }}
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.rust-target }}
-
-      - name: Rust cache
-        uses: swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.platform }}
-
-      - uses: tauri-apps/tauri-action@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          # On a published release, upload the bundles straight onto it.
-          releaseId: ${{ github.event.release.id }}
-          # Fallback for manual workflow_dispatch runs (no release event):
-          tagName: ${{ github.event.release.tag_name || 'v__VERSION__' }}
-          releaseName: "Notepad Extra ${{ github.event.release.tag_name || 'v__VERSION__' }}"
-          releaseBody: "See the assets below to download and install Notepad Extra."
-          # tauri-action v1 fails if releaseDraft is true but the release isn't a
-          # draft, so only draft on the manual (workflow_dispatch) path — the
-          # published-release path uploads onto the existing non-draft release.
-          releaseDraft: ${{ github.event_name == 'workflow_dispatch' }}
-          prerelease: false
-          args: ${{ matrix.args }}
-
-  # Linux is split out so each bundle is produced by its own step. A single
-  # `tauri build --bundles deb,rpm,appimage` is all-or-nothing: if AppImage fails,
-  # tauri-action exits non-zero and uploads *nothing*, discarding the deb/rpm that
-  # already built. Splitting keeps deb/rpm shipping even when AppImage breaks
-  # (AppImage leans on linuxdeploy + plugins fetched from upstream master/continuous,
-  # which can regress independently of this repo). One compile is shared across the
-  # three steps via the cargo target dir.
+  # ---- Linux: .deb + .rpm + .AppImage, per arch --------------------------
+  # Built on the oldest supported Ubuntu so the auto-derived `libc6 (>= …)`
+  # glibc floor stays low enough to install on older distros (mirrors #44).
+  # deb + rpm must succeed; the AppImage step is isolated (continue-on-error)
+  # because linuxdeploy is fetched from upstream and can regress independently
+  # of this repo — a linuxdeploy failure must never discard the deb/rpm.
   publish-linux:
     permissions:
       contents: write
@@ -83,72 +32,143 @@ jobs:
       fail-fast: false
       matrix:
         platform: ["ubuntu-22.04", "ubuntu-22.04-arm"]
-
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v7
-
-      - name: install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Rust cache
-        uses: swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
         with:
           key: ${{ matrix.platform }}
-
-      - name: install dependencies
+      # Build both from source rather than a prebuilt binary: on ubuntu-22.04
+      # (kept low so the .deb's auto-derived libc6 floor installs on older
+      # distros) taiki-e/install-action's cargo-deb is linked against a newer
+      # glibc than the runner has and won't run; compiling links against the
+      # runner's own glibc. cargo-generate-rpm isn't in that catalogue anyway.
+      - name: install cargo-deb + cargo-generate-rpm
+        run: cargo install cargo-deb cargo-generate-rpm --locked
+      - name: build .deb + .rpm
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev \
-            build-essential curl wget file \
-            libssl-dev \
-            libayatana-appindicator3-dev \
-            librsvg2-dev \
-            patchelf \
-            libfuse2
-
-      - name: Bundle .deb
-        uses: tauri-apps/tauri-action@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          releaseId: ${{ github.event.release.id }}
-          tagName: ${{ github.event.release.tag_name || 'v__VERSION__' }}
-          releaseName: "Notepad Extra ${{ github.event.release.tag_name || 'v__VERSION__' }}"
-          releaseBody: "See the assets below to download and install Notepad Extra."
-          releaseDraft: ${{ github.event_name == 'workflow_dispatch' }}
-          prerelease: false
-          args: --bundles deb
-
-      - name: Bundle .rpm
-        uses: tauri-apps/tauri-action@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          releaseId: ${{ github.event.release.id }}
-          tagName: ${{ github.event.release.tag_name || 'v__VERSION__' }}
-          releaseName: "Notepad Extra ${{ github.event.release.tag_name || 'v__VERSION__' }}"
-          releaseBody: "See the assets below to download and install Notepad Extra."
-          releaseDraft: ${{ github.event_name == 'workflow_dispatch' }}
-          prerelease: false
-          args: --bundles rpm
-
-      # Isolated: a linuxdeploy failure here must not fail the job or discard the
-      # deb/rpm uploaded above. Still visible as a failed step in the Actions UI.
-      - name: Bundle AppImage
+          bash packaging/build-linux.sh deb
+          bash packaging/build-linux.sh rpm
+      - name: build .AppImage (isolated)
         continue-on-error: true
-        uses: tauri-apps/tauri-action@v1
+        run: bash packaging/build-linux.sh appimage
+      - name: collect packages
+        run: |
+          mkdir -p dist
+          cp target/debian/*.deb dist/
+          cp target/generate-rpm/*.rpm dist/
+          cp target/appimage/*.AppImage dist/ 2>/dev/null || echo "no AppImage (isolated step may have failed)"
+          ls -1 dist/
+      - name: upload onto the release
+        if: github.event_name == 'release'
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ github.event.release.tag_name }}" dist/* --clobber
+      - name: save as run artifacts (manual runs)
+        if: github.event_name != 'release'
+        uses: actions/upload-artifact@v4
         with:
-          releaseId: ${{ github.event.release.id }}
-          tagName: ${{ github.event.release.tag_name || 'v__VERSION__' }}
-          releaseName: "Notepad Extra ${{ github.event.release.tag_name || 'v__VERSION__' }}"
-          releaseBody: "See the assets below to download and install Notepad Extra."
-          releaseDraft: ${{ github.event_name == 'workflow_dispatch' }}
-          prerelease: false
-          args: --bundles appimage
+          name: linux-${{ matrix.platform }}
+          path: dist/*
+
+  # ---- macOS: .dmg (Intel + Apple silicon) -------------------------------
+  # Each runner builds for its own arch; build-macos.sh names the .dmg with
+  # `uname -m`, so the two legs never collide.
+  publish-macos:
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: ["macos-15-intel", "macos-latest"]
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.platform }}
+      - name: build .app + .dmg
+        run: bash packaging/build-macos.sh
+      - name: collect packages
+        run: |
+          mkdir -p dist
+          cp target/release/bundle/osx/*.dmg dist/
+          ls -1 dist/
+      - name: upload onto the release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ github.event.release.tag_name }}" dist/* --clobber
+      - name: save as run artifacts (manual runs)
+        if: github.event_name != 'release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.platform }}
+          path: dist/*
+
+  # ---- Windows: .msi installer + portable .exe (x64 + arm64) --------------
+  # cargo-wix builds the .msi; we also ship the raw release binary as a
+  # portable .exe (download-and-run, no install). Both are renamed with the
+  # version + matrix arch so the two legs' assets never collide. The arm64 .msi
+  # is best-effort (WiX 3.x arm64 support is limited); the portable .exe always
+  # ships, so arm64 users are covered even if cargo-wix can't build their .msi.
+  publish-windows:
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Pinned (not windows-latest) to avoid the image-redirect surprise.
+          - platform: "windows-2025"
+            arch: "x86_64"
+          - platform: "windows-11-arm"
+            arch: "arm64"
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.platform }}
+      - name: install cargo-wix
+        run: cargo install cargo-wix --locked
+      - name: build the release binary
+        run: cargo build --release --package notepad-iced
+      - name: build the .msi
+        continue-on-error: ${{ matrix.arch == 'arm64' }}
+        run: cargo wix --package notepad-iced --no-build --nocapture
+      - name: collect packages
+        shell: pwsh
+        run: |
+          $version = [regex]::Match((Get-Content Cargo.toml -Raw), '(?m)^version = "([0-9]+\.[0-9]+\.[0-9]+)"').Groups[1].Value
+          New-Item -ItemType Directory -Force dist | Out-Null
+          # Portable binary — always ships.
+          Copy-Item target\release\notepad-extra.exe "dist\notepad-extra-$version-${{ matrix.arch }}.exe"
+          # Installer — present unless the (best-effort) arm64 build was skipped.
+          $msi = Get-ChildItem target\wix\*.msi -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($msi) {
+            Copy-Item $msi.FullName "dist\notepad-extra-$version-${{ matrix.arch }}.msi"
+          } else {
+            Write-Host "no .msi produced (arch ${{ matrix.arch }}) — shipping the portable .exe only"
+          }
+          Get-ChildItem dist
+      - name: upload onto the release
+        if: github.event_name == 'release'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $files = (Get-ChildItem dist\*).FullName
+          gh release upload "${{ github.event.release.tag_name }}" $files --clobber
+      - name: save as run artifacts (manual runs)
+        if: github.event_name != 'release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ matrix.arch }}
+          path: dist/*
 
   # Adds a "which file do I download?" table to the published release notes so
   # users can pick the right bundle. Runs once, independent of the build jobs.

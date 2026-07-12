@@ -1,10 +1,17 @@
 <?xml version="1.0" encoding="windows-1252"?>
 <!--
   WiX v3 installer for Notepad Extra (issue #43), built with cargo-wix.
-  cargo-wix supplies $(var.Version) from the crate version and
-  $(var.CargoTargetBinDir) = target\<profile>. The UpgradeCode GUID below is
-  STABLE across releases so MajorUpgrade can replace older installs in place —
-  do not regenerate it.
+
+  Location: cargo-wix looks for `wix/main.wxs` alongside the *package* manifest,
+  so this lives under `crates/iced/` (the `notepad-iced` crate), not the
+  workspace root. cargo-wix passes light.exe `-b <package manifest dir>` as the
+  base for resolving relative `Source`/`SourceFile` paths, so repo-root assets
+  are reached with `..\..\` — the same convention cargo-deb uses (#43).
+
+  cargo-wix supplies `$(var.Version)` from the crate version and
+  `$(var.CargoTargetBinDir)` = the workspace `target\<profile>` bin dir. The
+  UpgradeCode GUID below is STABLE across releases so MajorUpgrade can replace
+  older installs in place — do not regenerate it.
 -->
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
     <Product
@@ -42,7 +49,7 @@
                     </Component>
                     <Component Id="License" Guid="*">
                         <File Id="LicenseFile" Name="License.txt" DiskId="1" KeyPath="yes"
-                              Source="LICENSE"/>
+                              Source="..\..\LICENSE"/>
                     </Component>
                 </Directory>
             </Directory>
@@ -68,7 +75,7 @@
             <ComponentRef Id="ApplicationShortcut"/>
         </Feature>
 
-        <Icon Id="ProductIcon" SourceFile="icons\icon.ico"/>
+        <Icon Id="ProductIcon" SourceFile="..\..\icons\icon.ico"/>
         <Property Id="ARPPRODUCTICON" Value="ProductIcon"/>
         <Property Id="ARPHELPLINK" Value="https://github.com/PierreFouquet/notepad-extra"/>
     </Product>

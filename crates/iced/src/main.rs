@@ -612,6 +612,10 @@ impl Shell {
     /// Each path lands through the same [`Message::FileRead`] arm a dropped file
     /// uses (#42), so an unreadable path (missing, directory, non-UTF-8) is
     /// skipped without opening a tab, with the error surfaced in the status bar.
+    /// A launcher-injected token — an empty argument, or a `-…` switch such as
+    /// the `-psn_0_NNNNN` macOS hands a Finder-launched `.app` — is filtered out
+    /// first ([`arg_names_a_file`]) so it never reads as a bogus missing file and
+    /// raises a spurious "file not found" error on an ordinary first launch.
     /// The reads are deliberately *synchronous*: the window is not up yet, and
     /// dispatching the results in argv order is what guarantees the tabs appear
     /// in argument order with the **last** file focused — a `Task` per file
@@ -621,6 +625,9 @@ impl Shell {
     fn open_startup_files(&mut self, paths: Vec<PathBuf>) -> Task<Message> {
         let tasks: Vec<Task<Message>> = paths
             .into_iter()
+            // Drop launcher-injected non-file tokens before reading, so an
+            // ordinary launch never raises a spurious error (see the fn's docs).
+            .filter(|path| arg_names_a_file(path))
             .map(|path| {
                 let result = core::io::read_file(&path);
                 self.dispatch(Message::FileRead { path, result })
@@ -1928,6 +1935,22 @@ fn prefs_write_task(prefs: core::Preferences) -> Task<Message> {
 /// Load the persisted preferences (#38), recovering to defaults on *any* failure
 /// — no config dir, a missing / unreadable file, or corrupt JSON. Never errors,
 /// so a bad config can never stop the app from starting.
+/// Whether a command-line argument names a file the app should try to open, as
+/// opposed to a token the launcher injected that must be ignored.
+///
+/// The app defines **no** command-line options, so a `-…` argument is never a
+/// file — it is an artifact of how the process was started (macOS hands a
+/// Finder-launched `.app` a `-psn_0_NNNNN` process-serial argument, for
+/// example). An empty argument is likewise never a path. Filtering both keeps a
+/// plain first launch from reading a non-file token and raising a spurious
+/// "Failed to read file … (os error 2)" banner, while a genuinely missing file
+/// the user named on the command line still surfaces its error. A real file
+/// whose name begins with `-` stays openable via a `./-name` path.
+fn arg_names_a_file(arg: &Path) -> bool {
+    let arg = arg.as_os_str().to_string_lossy();
+    !arg.is_empty() && !arg.starts_with('-')
+}
+
 fn load_preferences() -> core::Preferences {
     match config_path() {
         Some(path) => load_preferences_from(&path),
@@ -2096,6 +2119,40 @@ mod tests {
         assert_eq!(shell.core.docs.len(), 1);
         assert_eq!(shell.core.active_doc().title(), "Untitled");
         assert!(shell.error.is_some());
+    }
+
+    #[test]
+    fn arg_names_a_file_skips_launcher_tokens() {
+        // Real paths are openable — including a `-`-named file passed explicitly
+        // as `./-name`, and a Windows path.
+        assert!(arg_names_a_file(Path::new("/home/u/notes.txt")));
+        assert!(arg_names_a_file(Path::new("relative.md")));
+        assert!(arg_names_a_file(Path::new("./-dash-but-explicit.txt")));
+        assert!(arg_names_a_file(Path::new(r"C:\Users\u\notes.txt")));
+        // Launcher artifacts are not: the macOS Finder process-serial argument,
+        // a bare switch, and an empty token.
+        assert!(!arg_names_a_file(Path::new("-psn_0_123456")));
+        assert!(!arg_names_a_file(Path::new("-x")));
+        assert!(!arg_names_a_file(Path::new("")));
+    }
+
+    #[test]
+    fn boot_ignores_launcher_injected_args() {
+        // Regression for the "Failed to read file … (os error 2)" banner on a
+        // first launch: a Finder-style `-psn_…` (or any switch / empty) token
+        // must not read as a missing file. The app starts as the plain untitled
+        // editor with no error banner, exactly like a no-argument launch.
+        let (shell, _) = Shell::boot_with(
+            core::Preferences::default(),
+            vec![PathBuf::from("-psn_0_98765"), PathBuf::from("")],
+        );
+        assert_eq!(shell.core.docs.len(), 1);
+        assert_eq!(shell.core.active_doc().title(), "Untitled");
+        assert!(
+            shell.error.is_none(),
+            "launcher tokens must not raise an error banner, got: {:?}",
+            shell.error
+        );
     }
 
     #[test]

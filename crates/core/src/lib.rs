@@ -17,6 +17,7 @@
 
 pub mod app;
 pub mod brackets;
+pub mod encoding;
 pub mod find;
 pub mod geometry;
 pub mod history;
@@ -30,6 +31,7 @@ pub use app::{Document, Effect, FindOption, FindState, Message, State, TabId, up
 // it originates in `notepad-syntax`, which also owns the light/dark → syntect
 // highlight-theme pairing.
 pub use brackets::BracketMatch;
+pub use encoding::FileEncoding;
 pub use find::{Match, Matcher, Replacement, SearchError, SearchOptions};
 pub use history::{Edit, History, diff};
 pub use notepad_syntax::ThemeMode;

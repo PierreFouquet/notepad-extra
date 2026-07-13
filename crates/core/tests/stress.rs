@@ -5,7 +5,9 @@
 //! catastrophic regexes, huge-document replace-all, and thousands of Find Next.
 
 use notepad_core::find::{self, goto_line_offset};
-use notepad_core::{Effect, Matcher, Message, SearchOptions, State, brackets, status, update};
+use notepad_core::{
+    Effect, FileEncoding, Matcher, Message, SearchOptions, State, brackets, status, update,
+};
 use std::path::PathBuf;
 
 /// A regex-mode [`SearchOptions`].
@@ -25,6 +27,7 @@ fn hundreds_of_open_operations_stay_bounded() {
             Message::FileLoaded {
                 path: PathBuf::from(format!("/tmp/file{i}.txt")),
                 content: format!("contents of file {i}\n"),
+                encoding: FileEncoding::default(),
             },
         );
         assert!(!s.docs.is_empty());
@@ -152,6 +155,7 @@ fn rapid_tab_switch_storm_stays_consistent() {
             Message::FileLoaded {
                 path: PathBuf::from(format!("/tmp/tab{i}.txt")),
                 content: format!("content {i}\n"),
+                encoding: FileEncoding::default(),
             },
         );
     }
@@ -231,6 +235,7 @@ fn save_all_quit_across_many_tabs_exits_exactly_once() {
             Message::FileLoaded {
                 path: PathBuf::from(format!("/tmp/q{i}.txt")),
                 content: format!("base {i}\n"),
+                encoding: FileEncoding::default(),
             },
         );
         update(&mut s, Message::Edited(format!("edit {i}"))); // dirties the active tab
@@ -287,6 +292,7 @@ fn many_large_tabs_are_retained_then_freed() {
             Message::FileLoaded {
                 path: PathBuf::from(format!("/tmp/big{i}.txt")),
                 content: big.clone(),
+                encoding: FileEncoding::default(),
             },
         );
     }
@@ -402,6 +408,7 @@ fn status_on_a_huge_single_line_stays_correct() {
         Message::FileLoaded {
             path: PathBuf::from("/tmp/big.txt"),
             content: huge.clone(),
+            encoding: FileEncoding::default(),
         },
     );
     let doc = s.active_doc();
@@ -427,6 +434,7 @@ fn status_on_a_million_line_document_stays_correct() {
         Message::FileLoaded {
             path: PathBuf::from("/tmp/lines.txt"),
             content,
+            encoding: FileEncoding::default(),
         },
     );
     let doc = s.active_doc();

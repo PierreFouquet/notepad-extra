@@ -18,9 +18,36 @@ pub fn is_safe_external_url(url: &str) -> bool {
 }
 
 /// Read `path` as UTF-8 text. Non-UTF-8 input surfaces an error rather than
-/// panicking (multi-encoding support is tracked separately, #50/#59).
+/// panicking. Kept for the preferences file, which is always UTF-8 JSON;
+/// documents open through [`read_file_bytes`] + `encoding::decode` instead so
+/// any encoding — including binary — loads (#50/#59).
 pub fn read_file(path: &Path) -> Result<String, String> {
     fs::read_to_string(path).map_err(|e| format!("Failed to read file: {e}"))
+}
+
+/// Read `path` as raw bytes for the multi-encoding document loader (#50/#59).
+/// Unlike [`read_file`], this **never** errors on the file's *content*: any byte
+/// sequence — a legacy code page, UTF-16, or an outright binary — reads back and
+/// is handed to `encoding::decode`. Only genuine I/O failures (missing file, a
+/// directory, permission denied) surface an error, so a binary file *opens*
+/// (lossily) rather than being rejected.
+pub fn read_file_bytes(path: &Path) -> Result<Vec<u8>, String> {
+    fs::read(path).map_err(|e| format!("Failed to read file: {e}"))
+}
+
+/// Write raw `bytes` to `path`, creating parent directories as needed — the
+/// byte-level counterpart to [`write_file`] for documents saved in a chosen
+/// encoding (#50). Callers encode the EOL-joined text with
+/// `encoding::encode_for_save` first (which also blocks a lossy save), so line
+/// endings and the encoding's BOM round-trip exactly.
+pub fn write_file_bytes(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && !parent.exists()
+    {
+        fs::create_dir_all(parent).map_err(|e| format!("Failed to create dir: {e}"))?;
+    }
+    fs::write(path, bytes).map_err(|e| format!("Failed to save file: {e}"))
 }
 
 /// Write `content` to `path` verbatim, creating parent directories as needed.
@@ -269,11 +296,61 @@ mod tests {
     }
 
     #[test]
-    fn read_non_utf8_errors_not_panics() {
+    fn read_file_as_utf8_still_errors_on_non_utf8() {
+        // The UTF-8 text reader stays strict — it backs the preferences file,
+        // which must be valid UTF-8 JSON. Documents take the byte path instead.
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("binary.bin");
         fs::write(&path, [0xFF, 0xFE, 0x00, 0x01]).expect("write bytes");
         assert!(read_file(&path).is_err());
+    }
+
+    #[test]
+    fn read_file_bytes_reads_arbitrary_bytes_back_never_errors_on_content() {
+        // #59: a non-UTF-8 / binary file must *open*. The byte reader returns the
+        // exact bytes (for `encoding::decode` to interpret) rather than erroring
+        // the way the UTF-8 text reader does.
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("binary.bin");
+        let bytes = [0xFF, 0xFE, 0x00, 0x01, 0x80, 0x9F];
+        fs::write(&path, bytes).expect("write bytes");
+        assert_eq!(read_file_bytes(&path).expect("read bytes"), bytes);
+    }
+
+    #[test]
+    fn read_file_bytes_still_errors_on_io_failure() {
+        // Only genuine I/O — a missing file or a directory — surfaces an error;
+        // never the file's content.
+        let dir = tempdir().expect("tempdir");
+        assert!(read_file_bytes(&dir.path().join("nope.bin")).is_err());
+        assert!(read_file_bytes(dir.path()).is_err());
+    }
+
+    #[test]
+    fn write_file_bytes_roundtrips_and_creates_dirs() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("nested").join("doc.txt");
+        let bytes = [0xEF, 0xBB, 0xBF, b'h', b'i']; // UTF-8 BOM + "hi"
+        write_file_bytes(&path, &bytes).expect("write");
+        assert_eq!(fs::read(&path).expect("raw"), bytes);
+    }
+
+    #[test]
+    fn write_file_bytes_reports_an_error_when_a_parent_cannot_be_created() {
+        let dir = tempdir().expect("tempdir");
+        let blocked = dir.path().join("blocked");
+        fs::write(&blocked, "x").expect("seed a file");
+        let path = blocked.join("nested").join("child.bin");
+        assert!(write_file_bytes(&path, b"data").is_err());
+    }
+
+    #[test]
+    fn write_file_bytes_reports_an_error_when_the_write_itself_fails() {
+        // The target's parent already exists (so `create_dir_all` is skipped), but
+        // the path names an existing directory, so the write can't succeed — the
+        // `fs::write` error surfaces rather than panicking.
+        let dir = tempdir().expect("tempdir");
+        assert!(write_file_bytes(dir.path(), b"data").is_err());
     }
 
     #[test]

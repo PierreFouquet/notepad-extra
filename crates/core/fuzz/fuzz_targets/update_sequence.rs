@@ -5,7 +5,7 @@
 
 use arbitrary::{Arbitrary, Unstructured};
 use libfuzzer_sys::fuzz_target;
-use notepad_core::{FindOption, Message, State, TabId, update};
+use notepad_core::{FileEncoding, FindOption, Message, State, TabId, update};
 use std::path::PathBuf;
 
 // Built here rather than deriving `Arbitrary` on the core types, so the core
@@ -24,6 +24,7 @@ fn arb_message(u: &mut Unstructured) -> arbitrary::Result<Message> {
         9 => Message::FileLoaded {
             path: PathBuf::from(String::arbitrary(u)?),
             content: String::arbitrary(u)?,
+            encoding: FileEncoding::default(),
         },
         10 => Message::SavePathChosen {
             id: TabId::arbitrary(u)?,

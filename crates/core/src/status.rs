@@ -15,12 +15,6 @@
 use crate::app::Document;
 use crate::find;
 
-/// The text encoding shown in the status bar. Fixed to UTF-8 for now — the core
-/// reads and writes UTF-8 only (see [`crate::io::read_file`]). Per-document
-/// encoding detection/selection is tracked separately in #50, which will thread
-/// a real encoding through [`status`] in place of this constant.
-pub const ENCODING: &str = "UTF-8";
-
 /// A snapshot of everything the status bar displays, derived purely from a
 /// document's text and the caret / selection.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,8 +32,10 @@ pub struct StatusBar {
     pub lines: usize,
     /// Line-ending style label: `"LF"` or `"CRLF"`.
     pub eol: &'static str,
-    /// Encoding label (currently always [`ENCODING`]).
-    pub encoding: &'static str,
+    /// Encoding label for the active document (e.g. `"UTF-8"`, `"Windows-1252"`),
+    /// from [`crate::FileEncoding::label`]. Owned because a rare auto-detected
+    /// encoding outside the picker table borrows its canonical name (#50).
+    pub encoding: String,
     /// Language label (e.g. `"Rust"`, `"Plain Text"`).
     pub language: &'static str,
 }
@@ -60,7 +56,7 @@ pub fn status(doc: &Document, caret: usize, anchor: Option<usize>) -> StatusBar 
         chars: text.chars().count(),
         lines: find::line_count(text),
         eol: doc.eol.label(),
-        encoding: ENCODING,
+        encoding: doc.encoding.label().to_string(),
         language: doc.language(),
     }
 }
@@ -89,6 +85,7 @@ fn char_span(text: &str, a: usize, b: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::FileEncoding;
     use crate::history::History;
     use crate::text::EndOfLine;
     use proptest::prelude::*;
@@ -107,8 +104,10 @@ mod tests {
             eol,
             detected_lang: language,
             manual_lang: None,
+            encoding: FileEncoding::default(),
             history: History::new(),
             saved_content: content.to_string(),
+            saved_encoding: FileEncoding::default(),
         }
     }
 
@@ -180,6 +179,7 @@ mod tests {
         assert_eq!(s.eol, "CRLF");
         assert_eq!(s.language, "Rust");
         assert_eq!(s.encoding, "UTF-8");
+        // The default (no-BOM) UTF-8 document round-trips to the plain label.
     }
 
     #[test]
@@ -214,7 +214,7 @@ mod tests {
             prop_assert!(s.line <= s.lines);
             prop_assert!(s.selection <= s.chars);
             prop_assert_eq!(s.eol, "LF");
-            prop_assert_eq!(s.encoding, ENCODING);
+            prop_assert_eq!(s.encoding, "UTF-8");
         }
     }
 }

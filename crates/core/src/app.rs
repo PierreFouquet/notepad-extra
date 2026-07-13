@@ -5,6 +5,7 @@
 //! as new [`Message`]s. Everything here is deterministic and window-free, so it
 //! can be driven entirely from tests.
 
+use crate::encoding::FileEncoding;
 use crate::find::{self, Match, Matcher, SearchError, SearchOptions};
 use crate::history::History;
 use crate::prefs::Preferences;
@@ -36,12 +37,23 @@ pub struct Document {
     /// touched by load/save, so opening or re-saving a file never clobbers a
     /// language the user chose by hand; it lasts the tab's lifetime.
     pub manual_lang: Option<&'static str>,
+    /// The text encoding this document reads and writes on disk (#50/#59/#103).
+    /// Detected on open, changed via the status-bar picker
+    /// ([`Message::SetEncoding`]), and used to encode the bytes on save. The
+    /// internal [`Document::content`] is always UTF-8 regardless; this only names
+    /// the on-disk representation, orthogonally to [`Document::eol`].
+    pub encoding: FileEncoding,
     /// Undo/redo history; also the source of truth for the unsaved-changes
     /// ("•") marker (see [`Document::dirty`]).
     pub history: History,
     /// The last content that was saved to disk. Used to decide whether the
     /// current buffer still matches the saved baseline.
     pub(crate) saved_content: String,
+    /// The encoding the on-disk baseline was written with. Mirrors
+    /// [`Document::saved_content`]: choosing a different save encoding on a
+    /// buffer that is otherwise unchanged still marks it dirty (a *convert*), so
+    /// the next Save re-encodes it.
+    pub(crate) saved_encoding: FileEncoding,
 }
 
 impl Document {
@@ -53,8 +65,10 @@ impl Document {
             eol: EndOfLine::default(),
             detected_lang: notepad_syntax::PLAIN_TEXT,
             manual_lang: None,
+            encoding: FileEncoding::default(),
             history: History::new(),
             saved_content: String::new(),
+            saved_encoding: FileEncoding::default(),
         }
     }
 
@@ -68,7 +82,7 @@ impl Document {
     /// Whether the buffer has unsaved changes (the tab's "•" marker), based on
     /// whether the current content still matches the last saved baseline.
     pub fn dirty(&self) -> bool {
-        self.content != self.saved_content
+        self.content != self.saved_content || self.encoding != self.saved_encoding
     }
 
     /// The tab / window title: the file name, or `Untitled` for a fresh buffer.
@@ -400,8 +414,22 @@ pub enum Message {
     NewTab,
     /// User asked to open a file (shell will show a picker).
     OpenRequested,
-    /// The shell finished reading a file the user chose or dropped.
-    FileLoaded { path: PathBuf, content: String },
+    /// The shell finished reading a file the user chose or dropped. `encoding` is
+    /// what the shell auto-detected from the bytes ([`crate::encoding::decode`]).
+    FileLoaded {
+        path: PathBuf,
+        content: String,
+        encoding: FileEncoding,
+    },
+    /// The shell re-read an already-open document `id` under a user-chosen
+    /// encoding (a *reopen*, see [`Message::SetEncoding`]). Replaces that tab's
+    /// buffer like a fresh load — re-detects EOL, resets history and the saved
+    /// baseline — but keeps its path and language.
+    FileReloaded {
+        id: TabId,
+        content: String,
+        encoding: FileEncoding,
+    },
     /// The editor's text for the active document changed.
     Edited(String),
     /// Undo the most recent edit to the active document.
@@ -515,6 +543,27 @@ pub enum Message {
     /// ignored, leaving the current choice in place. Per-tab and not persisted.
     SetLanguage(Option<String>),
 
+    // ---- Character encoding selection (#50/#59/#103) ----
+    /// Set the active tab's save encoding from the status-bar picker — always a
+    /// *convert*. The label is parsed via
+    /// [`crate::encoding::FileEncoding::from_label`]; an unknown one is ignored
+    /// (like [`Message::SetLanguage`]). The chosen encoding is recorded and the
+    /// tab goes dirty (via `saved_encoding`), so the next Save re-encodes the
+    /// buffer's current text — and blocks if that text is not representable there
+    /// ([`Effect::WriteFile`]). It never re-reads the file; to recover from a
+    /// wrong auto-detect, re-decode the on-disk bytes with [`Message::ReopenAs`].
+    SetEncoding(String),
+
+    /// Re-open the active tab's file under a chosen encoding — re-read its bytes
+    /// and strictly re-decode them, recovering from a wrong auto-detect. The
+    /// label is parsed via [`crate::encoding::FileEncoding::from_label`]; an
+    /// unknown label, or a tab with no path (nothing on disk to re-read), is
+    /// ignored. A titled tab emits [`Effect::ReadFileAs`], which decodes
+    /// *strictly* ([`crate::encoding::decode_strict`]): if the bytes are not
+    /// valid in that encoding the reopen is refused and the buffer left untouched,
+    /// mirroring how a lossy save is blocked.
+    ReopenAs(String),
+
     // ---- About dialog + external links (#40) ----
     /// Show the About panel.
     AboutOpened,
@@ -532,15 +581,31 @@ pub enum Message {
 pub enum Effect {
     /// Show the native "open file" picker.
     PickOpenPath,
-    /// Read this path and report back with [`Message::FileLoaded`].
+    /// Read this path and report back with [`Message::FileLoaded`]. The shell
+    /// auto-detects the encoding ([`crate::encoding::decode`]) from the bytes.
     ReadFile(PathBuf),
+    /// Re-read document `id`'s `path` and strictly decode it as `encoding`
+    /// ([`crate::encoding::decode_strict`]), reporting [`Message::FileReloaded`].
+    /// A *reopen*, emitted by [`Message::ReopenAs`] on a titled tab. The strict
+    /// decode refuses bytes not valid in `encoding`; the shell then surfaces the
+    /// error and leaves the buffer untouched, mirroring a blocked lossy save.
+    ReadFileAs {
+        id: TabId,
+        path: PathBuf,
+        encoding: FileEncoding,
+    },
     /// Show the native "save as" picker for document `id`.
     PickSavePath { id: TabId },
-    /// Write `content` to `path`, then report [`Message::FileSaved`].
+    /// Encode `content` as `encoding` ([`crate::encoding::encode_for_save`]) and
+    /// write the bytes to `path`, then report [`Message::FileSaved`]. If the
+    /// buffer holds a character the encoding cannot represent the encode fails and
+    /// the shell surfaces it via the [`Message::SaveAbandoned`] path, leaving the
+    /// file untouched — a lossy save is blocked, never silently corrupting.
     WriteFile {
         id: TabId,
         path: PathBuf,
         content: String,
+        encoding: FileEncoding,
     },
     /// Update the window title. Carries the active document's `title` (basename
     /// or `Untitled`) and its `dirty` flag, both ingredients the shell needs to
@@ -592,7 +657,11 @@ pub fn update(state: &mut State, message: Message) -> Vec<Effect> {
 
         Message::OpenRequested => vec![Effect::PickOpenPath],
 
-        Message::FileLoaded { path, content } => {
+        Message::FileLoaded {
+            path,
+            content,
+            encoding,
+        } => {
             let eol = EndOfLine::detect(&content);
             let normalized = EndOfLine::to_lf(&content);
             let language = notepad_syntax::detect(path.to_str().unwrap_or(""));
@@ -608,8 +677,10 @@ pub fn update(state: &mut State, message: Message) -> Vec<Effect> {
                 doc.eol = eol;
                 doc.detected_lang = language;
                 doc.manual_lang = None;
+                doc.encoding = encoding;
                 doc.history = History::new(); // loaded content is the clean baseline
                 doc.saved_content = normalized.clone();
+                doc.saved_encoding = encoding;
                 state.active = 0;
             } else {
                 let id = state.alloc_id();
@@ -620,10 +691,34 @@ pub fn update(state: &mut State, message: Message) -> Vec<Effect> {
                     eol,
                     detected_lang: language,
                     manual_lang: None,
+                    encoding,
                     history: History::new(),
                     saved_content: normalized.clone(),
+                    saved_encoding: encoding,
                 });
                 state.active = state.docs.len() - 1;
+            }
+            resync_find_after_doc_change(state);
+            title_effect(state)
+        }
+
+        Message::FileReloaded {
+            id,
+            content,
+            encoding,
+        } => {
+            // A reopen re-decodes the same file under a new encoding: replace the
+            // buffer like a fresh load (re-detect EOL, reset history + baseline),
+            // but keep the path and language — only the encoding changed.
+            let eol = EndOfLine::detect(&content);
+            let normalized = EndOfLine::to_lf(&content);
+            if let Some(doc) = state.doc_mut(id) {
+                doc.content = normalized.clone();
+                doc.eol = eol;
+                doc.encoding = encoding;
+                doc.history = History::new();
+                doc.saved_content = normalized;
+                doc.saved_encoding = encoding;
             }
             resync_find_after_doc_change(state);
             title_effect(state)
@@ -678,6 +773,7 @@ pub fn update(state: &mut State, message: Message) -> Vec<Effect> {
                     id: doc.id,
                     path: path.clone(),
                     content: doc.eol.join(&doc.content),
+                    encoding: doc.encoding,
                 }],
                 None => vec![Effect::PickSavePath { id: doc.id }],
             }
@@ -692,6 +788,7 @@ pub fn update(state: &mut State, message: Message) -> Vec<Effect> {
                 id,
                 path,
                 content: doc.eol.join(&doc.content),
+                encoding: doc.encoding,
             }],
             None => vec![],
         },
@@ -703,6 +800,10 @@ pub fn update(state: &mut State, message: Message) -> Vec<Effect> {
                 doc.detected_lang = notepad_syntax::detect(path.to_str().unwrap_or(""));
                 doc.path = Some(path);
                 doc.saved_content = doc.content.clone();
+                // The write used the document's current encoding, so that is now
+                // the on-disk baseline — this clears the dirty marker a *convert*
+                // set (mirrors `saved_content`).
+                doc.saved_encoding = doc.encoding;
                 doc.history.mark_saved();
             }
             // A "save before closing" was waiting on this write (#31): now that it
@@ -792,6 +893,7 @@ pub fn update(state: &mut State, message: Message) -> Vec<Effect> {
                         id,
                         path: path.clone(),
                         content: doc.eol.join(&doc.content),
+                        encoding: doc.encoding,
                     },
                     None => Effect::PickSavePath { id },
                 });
@@ -838,6 +940,7 @@ pub fn update(state: &mut State, message: Message) -> Vec<Effect> {
                         id: doc.id,
                         path: path.clone(),
                         content: doc.eol.join(&doc.content),
+                        encoding: doc.encoding,
                     },
                     None => Effect::PickSavePath { id: doc.id },
                 });
@@ -985,6 +1088,39 @@ pub fn update(state: &mut State, message: Message) -> Vec<Effect> {
                 Some(name) => notepad_syntax::canonical(&name).or(doc.manual_lang),
             };
             vec![]
+        }
+
+        // ---- Character encoding selection (#50/#59/#103) ----
+        // The status-bar picker always *converts*: record the chosen save
+        // encoding, which marks the tab dirty (via `saved_encoding`) so the next
+        // Save re-encodes the buffer's current text — blocking there if it isn't
+        // representable. It never touches the file. An unknown label is ignored,
+        // like `SetLanguage`.
+        Message::SetEncoding(label) => {
+            let Some(encoding) = FileEncoding::from_label(&label) else {
+                return vec![];
+            };
+            state.docs[state.active].encoding = encoding;
+            title_effect(state)
+        }
+
+        // "Reopen as…": re-read the active file's bytes and strictly re-decode
+        // them under the chosen encoding, recovering from a wrong auto-detect. A
+        // titled tab emits `ReadFileAs`; an untitled one (nothing on disk) and an
+        // unknown label are ignored. The strict decode blocks non-decodable bytes.
+        Message::ReopenAs(label) => {
+            let Some(encoding) = FileEncoding::from_label(&label) else {
+                return vec![];
+            };
+            let doc = &state.docs[state.active];
+            match &doc.path {
+                Some(path) => vec![Effect::ReadFileAs {
+                    id: doc.id,
+                    path: path.clone(),
+                    encoding,
+                }],
+                None => vec![],
+            }
         }
 
         // ---- About dialog + external links (#40) ----
@@ -1230,6 +1366,7 @@ mod tests {
             Message::FileLoaded {
                 path: PathBuf::from(path),
                 content: content.to_string(),
+                encoding: FileEncoding::default(),
             },
         )
     }
@@ -1364,6 +1501,7 @@ mod tests {
                 id,
                 path: PathBuf::from("/tmp/out.txt"),
                 content: "hi".into(),
+                encoding: FileEncoding::default(),
             }]
         );
     }
@@ -1381,6 +1519,7 @@ mod tests {
                 id: s.active_doc().id,
                 path: PathBuf::from("/tmp/win.txt"),
                 content: "a\r\nb\r\n".into(), // restored on save
+                encoding: FileEncoding::default(),
             }]
         );
     }
@@ -1575,6 +1714,204 @@ mod tests {
         );
     }
 
+    // ---- Character encoding selection (#50/#59/#103) ----------------------
+
+    /// A `FileEncoding` for a known picker label.
+    fn enc(label: &str) -> FileEncoding {
+        FileEncoding::from_label(label).expect("known encoding label")
+    }
+
+    /// The first `WriteFile` effect in a set, if present.
+    fn write_file(fx: &[Effect]) -> Option<&Effect> {
+        fx.iter().find(|e| matches!(e, Effect::WriteFile { .. }))
+    }
+
+    #[test]
+    fn file_loaded_stores_the_detected_encoding_as_the_clean_baseline() {
+        let mut s = State::default();
+        update(
+            &mut s,
+            Message::FileLoaded {
+                path: PathBuf::from("/t/legacy.txt"),
+                content: "café".to_string(),
+                encoding: enc("Windows-1252"),
+            },
+        );
+        assert_eq!(s.active_doc().encoding, enc("Windows-1252"));
+        assert!(!s.active_doc().dirty(), "a freshly loaded file is clean");
+    }
+
+    #[test]
+    fn set_encoding_on_a_clean_titled_tab_converts_and_dirties() {
+        // The picker always converts — even a clean, titled tab: it records the
+        // save encoding and goes dirty, never re-reading the file. (Recovering a
+        // wrong auto-detect is `ReopenAs`, tested below.)
+        let mut s = State::default();
+        load(&mut s, "/t/mojibake.txt", "text"); // clean, has a path
+        let fx = update(&mut s, Message::SetEncoding("Windows-1252".into()));
+        assert!(
+            matches!(fx.as_slice(), [Effect::SetTitle { .. }]),
+            "a convert only retitles, never reads the file: {fx:?}"
+        );
+        assert_eq!(s.active_doc().encoding, enc("Windows-1252"));
+        assert!(
+            s.active_doc().dirty(),
+            "changing the save encoding marks the tab dirty"
+        );
+    }
+
+    #[test]
+    fn set_encoding_on_a_dirty_tab_converts_and_threads_into_the_next_save() {
+        let mut s = State::default();
+        load(&mut s, "/t/doc.txt", "héllo");
+        update(&mut s, Message::Edited("héllo!".into())); // now dirty
+        let fx = update(&mut s, Message::SetEncoding("Windows-1252".into()));
+        // A convert sets the encoding in place (no reopen) and keeps it dirty.
+        assert_eq!(s.active_doc().encoding, enc("Windows-1252"));
+        assert!(s.active_doc().dirty());
+        assert!(
+            matches!(fx.as_slice(), [Effect::SetTitle { .. }]),
+            "a convert only retitles, never reopens: {fx:?}"
+        );
+        // The next save carries the converted encoding.
+        let save = update(&mut s, Message::SaveRequested);
+        match write_file(&save) {
+            Some(Effect::WriteFile { encoding, .. }) => assert_eq!(*encoding, enc("Windows-1252")),
+            other => panic!("expected WriteFile with the new encoding, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_encoding_on_an_untitled_buffer_converts() {
+        let mut s = State::default();
+        update(&mut s, Message::Edited("scratch".into())); // untitled, dirty
+        update(&mut s, Message::SetEncoding("UTF-16 LE".into()));
+        // No path to reopen from, so it converts in place.
+        assert_eq!(s.active_doc().encoding, enc("UTF-16 LE"));
+        assert!(s.active_doc().dirty());
+    }
+
+    #[test]
+    fn reopen_as_on_a_titled_tab_re_reads_the_bytes() {
+        // "Reopen as…" re-reads the file to strictly re-decode it, recovering a
+        // wrong auto-detect. It does not mutate the buffer yet — that waits for
+        // FileReloaded — so the tab stays clean at its current encoding.
+        let mut s = State::default();
+        load(&mut s, "/t/mojibake.txt", "text"); // clean, has a path
+        let id = s.active_doc().id;
+        let fx = update(&mut s, Message::ReopenAs("Windows-1252".into()));
+        assert_eq!(
+            fx,
+            vec![Effect::ReadFileAs {
+                id,
+                path: PathBuf::from("/t/mojibake.txt"),
+                encoding: enc("Windows-1252"),
+            }],
+            "a titled tab re-reads its bytes to re-decode"
+        );
+        assert_eq!(s.active_doc().encoding, FileEncoding::default());
+        assert!(!s.active_doc().dirty(), "the buffer is untouched until FileReloaded");
+    }
+
+    #[test]
+    fn reopen_as_on_an_untitled_buffer_is_a_no_op() {
+        // Nothing on disk to re-read, so a reopen is dropped (the buffer and its
+        // encoding are left exactly as they were).
+        let mut s = State::default();
+        update(&mut s, Message::Edited("scratch".into())); // untitled
+        let fx = update(&mut s, Message::ReopenAs("Windows-1252".into()));
+        assert!(fx.is_empty(), "no path means no reopen");
+        assert_eq!(s.active_doc().encoding, FileEncoding::default());
+    }
+
+    #[test]
+    fn reopen_as_ignores_an_unknown_label() {
+        let mut s = State::default();
+        load(&mut s, "/t/a.txt", "plain");
+        let fx = update(&mut s, Message::ReopenAs("Not An Encoding".into()));
+        assert!(fx.is_empty(), "an unknown label is a no-op");
+    }
+
+    #[test]
+    fn file_reloaded_replaces_the_buffer_and_redetects_eol() {
+        let mut s = State::default();
+        load(&mut s, "/t/win.txt", "a\nb"); // starts LF
+        let id = s.active_doc().id;
+        update(
+            &mut s,
+            Message::FileReloaded {
+                id,
+                content: "x\r\ny\r\nz".to_string(), // now CRLF
+                encoding: enc("Windows-1252"),
+            },
+        );
+        assert_eq!(s.active_doc().content, "x\ny\nz"); // stored canonical LF
+        assert_eq!(s.active_doc().eol, EndOfLine::Crlf); // re-detected
+        assert_eq!(s.active_doc().encoding, enc("Windows-1252"));
+        assert!(
+            !s.active_doc().dirty(),
+            "a reload is a fresh clean baseline"
+        );
+        assert_eq!(
+            s.active_doc().title(),
+            "win.txt",
+            "the path (and so the title) survives a reload"
+        );
+    }
+
+    #[test]
+    fn convert_then_save_clears_the_dirty_marker() {
+        let mut s = State::default();
+        load(&mut s, "/t/doc.txt", "content");
+        update(&mut s, Message::Edited("content!".into())); // dirty
+        update(&mut s, Message::SetEncoding("Windows-1252".into())); // convert
+        let id = s.active_doc().id;
+        assert!(s.active_doc().dirty());
+        update(
+            &mut s,
+            Message::FileSaved {
+                id,
+                path: PathBuf::from("/t/doc.txt"),
+            },
+        );
+        assert!(
+            !s.active_doc().dirty(),
+            "saving records the converted encoding as the new baseline"
+        );
+        assert_eq!(s.active_doc().encoding, enc("Windows-1252"));
+    }
+
+    #[test]
+    fn a_convert_leaves_the_eol_untouched() {
+        // Encoding and EOL are orthogonal: converting the save encoding must not
+        // disturb the line-ending the file will be written back with (#29).
+        let mut s = State::default();
+        load(&mut s, "/t/crlf.txt", "a\r\nb\r\n");
+        assert_eq!(s.active_doc().eol, EndOfLine::Crlf);
+        update(&mut s, Message::Edited("a\r\nb\r\nc".into())); // dirty, still CRLF source
+        update(&mut s, Message::SetEncoding("Windows-1252".into()));
+        assert_eq!(s.active_doc().eol, EndOfLine::Crlf, "EOL is unchanged");
+        let save = update(&mut s, Message::SaveRequested);
+        match write_file(&save) {
+            Some(Effect::WriteFile {
+                content, encoding, ..
+            }) => {
+                assert!(content.contains("\r\n"), "CRLF is restored on save");
+                assert_eq!(*encoding, enc("Windows-1252"));
+            }
+            other => panic!("expected WriteFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_encoding_label_is_ignored() {
+        let mut s = State::default();
+        load(&mut s, "/t/a.txt", "x");
+        let fx = update(&mut s, Message::SetEncoding("Not An Encoding".into()));
+        assert!(fx.is_empty(), "an unknown label is a no-op");
+        assert_eq!(s.active_doc().encoding, FileEncoding::default());
+    }
+
     // ---- Light / Dark theme (#36) -----------------------------------------
 
     #[test]
@@ -1729,6 +2066,7 @@ mod tests {
                 id,
                 path: PathBuf::from("/t/close.txt"),
                 content: "edited".into(),
+                encoding: FileEncoding::default(),
             }]
         );
         assert_eq!(s.docs.len(), 2);
@@ -1769,6 +2107,7 @@ mod tests {
                 id,
                 path: PathBuf::from("/t/s.txt"),
                 content: "scratch".into(),
+                encoding: FileEncoding::default(),
             }]
         );
         update(
@@ -1913,11 +2252,13 @@ mod tests {
                     id: id0,
                     path: PathBuf::from("/t/a.txt"),
                     content: "aa".into(),
+                    encoding: FileEncoding::default(),
                 },
                 Effect::WriteFile {
                     id: id1,
                     path: PathBuf::from("/t/b.txt"),
                     content: "bb".into(),
+                    encoding: FileEncoding::default(),
                 },
             ]
         );
@@ -2830,7 +3171,8 @@ mod tests {
             }),
             ("[a-z]{1,6}", any::<String>()).prop_map(|(n, c)| Message::FileLoaded {
                 path: PathBuf::from(format!("/t/{n}.txt")),
-                content: c
+                content: c,
+                encoding: FileEncoding::default(),
             }),
             // Find / Replace / Go-to (#33): include regex metacharacters so
             // invalid patterns and catastrophic-looking ones exercise the guard.
@@ -2884,6 +3226,23 @@ mod tests {
                 Just(Message::SetLanguage(Some("Plain Text".to_string()))),
                 any::<String>().prop_map(|s| Message::SetLanguage(Some(s))),
             ],
+            // Character encoding (#50/#59/#103): mix known labels (converting the
+            // active tab, or reopening it) with junk that must be ignored, plus
+            // reloads onto small ids so the FileReloaded path is exercised too.
+            prop_oneof![
+                Just(Message::SetEncoding("UTF-8".to_string())),
+                Just(Message::SetEncoding("Windows-1252".to_string())),
+                Just(Message::SetEncoding("UTF-16 LE".to_string())),
+                any::<String>().prop_map(Message::SetEncoding),
+                Just(Message::ReopenAs("Windows-1252".to_string())),
+                Just(Message::ReopenAs("UTF-16 LE".to_string())),
+                any::<String>().prop_map(Message::ReopenAs),
+            ],
+            ("[a-z]{1,6}", 0u64..8).prop_map(|(c, id)| Message::FileReloaded {
+                id,
+                content: c,
+                encoding: FileEncoding::default(),
+            }),
         ]
     }
 

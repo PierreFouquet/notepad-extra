@@ -355,10 +355,23 @@ enum Message {
     FilesHovered,
     /// The drag left the window without dropping (#42): lower the overlay.
     FilesHoveredLeft,
-    /// A chosen file finished loading from disk.
+    /// A chosen file finished loading from disk. The result is the raw bytes so
+    /// the encoding is auto-detected here ([`core::encoding::decode`], #50); a
+    /// read error still carries only the I/O failure (missing / directory /
+    /// permission) — a binary or non-UTF-8 file reads back fine and opens lossily.
     FileRead {
         path: PathBuf,
-        result: Result<String, String>,
+        result: Result<Vec<u8>, String>,
+    },
+    /// Document `id` was re-read for a *reopen* under a user-chosen encoding
+    /// ([`Message::ReopenAs`]). The raw bytes are *strictly* re-decoded here with
+    /// [`core::encoding::decode_strict`]: if they are not valid in that encoding
+    /// the reopen is refused (banner set, buffer untouched), mirroring how a lossy
+    /// save is blocked. A read error is likewise surfaced in the banner.
+    FileReloaded {
+        id: TabId,
+        encoding: core::FileEncoding,
+        result: Result<Vec<u8>, String>,
     },
     /// The "save as" dialog resolved for document `id` (`None` = cancelled).
     SavePicked {
@@ -475,6 +488,18 @@ enum Message {
     /// to the core's "clear override" (`None`); a group-header separator is inert
     /// (mapped to no change); anything else pins that syntax on the active tab.
     SetLanguage(String),
+
+    // ---- Character encoding selection (#50/#59/#103) ----
+    /// The status-bar encoding picker chose a label — always a *convert*
+    /// ([`core::Message::SetEncoding`]): set the tab's save encoding, mark it
+    /// dirty, and re-encode on the next Save (a lossy save is blocked). It never
+    /// re-reads the file. An unknown label is ignored by the core.
+    SetEncoding(String),
+    /// The "Reopen as…" picker chose a label — re-read the active tab's file and
+    /// *strictly* re-decode it under that encoding ([`core::Message::ReopenAs`]),
+    /// recovering from a wrong auto-detect. Emits [`Effect::ReadFileAs`] for a
+    /// titled tab; an untitled buffer or unknown label is ignored by the core.
+    ReopenAs(String),
 
     // ---- Preferences persistence (#38) ----
     /// A preferences write finished. The result is intentionally ignored: a
@@ -626,7 +651,7 @@ impl Shell {
     /// Open the files passed on the command line, one tab each (#92) — the
     /// `Exec=notepad-extra %F` desktop entry and the man page's `FILE…` promise.
     /// Each path lands through the same [`Message::FileRead`] arm a dropped file
-    /// uses (#42), so an unreadable path (missing, directory, non-UTF-8) is
+    /// uses (#42), so an unreadable path (missing, directory, permission) is
     /// skipped without opening a tab, with the error surfaced in the status bar.
     /// A launcher-injected token — an empty argument, or a `-…` switch such as
     /// the `-psn_0_NNNNN` macOS hands a Finder-launched `.app` — is filtered out
@@ -645,7 +670,7 @@ impl Shell {
             // ordinary launch never raises a spurious error (see the fn's docs).
             .filter(|path| arg_names_a_file(path))
             .map(|path| {
-                let result = core::io::read_file(&path);
+                let result = core::io::read_file_bytes(&path);
                 self.dispatch(Message::FileRead { path, result })
             })
             .collect();
@@ -839,9 +864,45 @@ impl Shell {
             }
 
             Message::FileRead { path, result } => match result {
-                Ok(content) => {
+                Ok(bytes) => {
                     self.error = None;
-                    self.apply_core(core::Message::FileLoaded { path, content }, true)
+                    // Auto-detect the encoding from the raw bytes (#50); a binary
+                    // or non-UTF-8 file decodes lossily rather than erroring (#59).
+                    let (content, encoding) = core::encoding::decode(&bytes);
+                    self.apply_core(
+                        core::Message::FileLoaded {
+                            path,
+                            content,
+                            encoding,
+                        },
+                        true,
+                    )
+                }
+                Err(e) => {
+                    self.error = Some(e);
+                    Task::none()
+                }
+            },
+
+            // A reopen (#50): the tab's bytes were re-read; *strictly* re-decode
+            // them under the picked encoding. If the bytes aren't valid in it the
+            // reopen is refused (banner set, buffer untouched), the same way a
+            // lossy save is blocked; otherwise replace that tab's buffer.
+            Message::FileReloaded {
+                id,
+                encoding,
+                result,
+            } => match result.and_then(|bytes| core::encoding::decode_strict(&bytes, encoding)) {
+                Ok((content, encoding)) => {
+                    self.error = None;
+                    self.apply_core(
+                        core::Message::FileReloaded {
+                            id,
+                            content,
+                            encoding,
+                        },
+                        true,
+                    )
                 }
                 Err(e) => {
                     self.error = Some(e);
@@ -1022,6 +1083,17 @@ impl Shell {
                 }
             }
 
+            // Encoding selection (#50/#59/#103): always a *convert* — set the tab's
+            // save encoding, mark it dirty, and re-encode on the next Save (a lossy
+            // save is blocked). The core ignores an unknown label.
+            Message::SetEncoding(label) => {
+                self.apply_core(core::Message::SetEncoding(label), false)
+            }
+            // "Reopen as…" (#50): re-read the file's bytes and strictly re-decode
+            // them under the chosen encoding, recovering from a wrong auto-detect.
+            // The core emits `ReadFileAs` for a titled tab and ignores an untitled one.
+            Message::ReopenAs(label) => self.apply_core(core::Message::ReopenAs(label), false),
+
             // The preferences write landed (#38). Its result is deliberately
             // swallowed so a failed save never disrupts editing. Clear the
             // in-flight flag and, if changes arrived while it ran, write the
@@ -1070,15 +1142,17 @@ impl Shell {
     /// single reader shared by the open picker (`Effect::ReadFile`) and drag-and-
     /// drop (`Message::FileDropped`, #42): both a chosen and a dropped file open
     /// the very same way, and `FileRead`'s error arm skips a failed read (missing
-    /// / directory / non-UTF-8) without opening a tab.
+    /// / directory / permission) without opening a tab. Reads raw bytes so the
+    /// encoding is detected on arrival (#50); content is never a read error.
     fn read_into_tab(path: PathBuf) -> Task<Message> {
         let for_msg = path.clone();
-        Task::perform(async move { core::io::read_file(&path) }, move |result| {
-            Message::FileRead {
+        Task::perform(
+            async move { core::io::read_file_bytes(&path) },
+            move |result| Message::FileRead {
                 path: for_msg.clone(),
                 result,
-            }
-        })
+            },
+        )
     }
 
     /// Passive subscriptions: global keyboard shortcuts (#39) and drag-and-drop
@@ -1185,13 +1259,40 @@ impl Shell {
             }
             Effect::PickOpenPath => Task::perform(pick_open(), Message::OpenPicked),
             Effect::ReadFile(path) => Self::read_into_tab(path),
+            // A reopen (#50): re-read the tab's bytes off-thread and strictly
+            // re-decode them under the chosen encoding on arrival
+            // (`Message::FileReloaded`).
+            Effect::ReadFileAs { id, path, encoding } => {
+                Task::perform(
+                    async move { core::io::read_file_bytes(&path) },
+                    move |result| Message::FileReloaded {
+                        id,
+                        encoding,
+                        result,
+                    },
+                )
+            }
             Effect::PickSavePath { id } => {
                 Task::perform(pick_save(), move |path| Message::SavePicked { id, path })
             }
-            Effect::WriteFile { id, path, content } => {
+            Effect::WriteFile {
+                id,
+                path,
+                content,
+                encoding,
+            } => {
                 let for_msg = path.clone();
                 Task::perform(
-                    async move { core::io::write_file(&path, &content) },
+                    // Encode for the target encoding first (#50): an unrepresentable
+                    // character makes `encode_for_save` return `Err`, which flows to
+                    // the `Message::Saved` error arm and blocks the write, leaving the
+                    // file untouched (#103's defined lossy-save policy). On success the
+                    // encoded bytes are written verbatim, so the BOM and code page land
+                    // exactly as chosen.
+                    async move {
+                        let bytes = core::encoding::encode_for_save(&content, encoding)?;
+                        core::io::write_file_bytes(&path, &bytes)
+                    },
                     move |result| Message::Saved {
                         id,
                         path: for_msg.clone(),
@@ -1498,12 +1599,30 @@ impl Shell {
                 if s.selection > 0 {
                     cells = cells.push(text(format!("Sel {}", s.selection)).font(ui));
                 }
+                // Encoding is two controls, not plain text (#50). The first shows
+                // the active document's encoding and *converts* to whatever the
+                // user picks (re-encode on the next Save, lossy saves blocked); its
+                // current label is the selection even for an exotic auto-detected
+                // encoding outside the list, so the readout never goes blank. The
+                // second is a "Reopen as…" action that re-reads the file and
+                // strictly re-decodes it (recovering a wrong auto-detect) — it holds
+                // no selection, so it stays an action rather than a state readout.
                 cells
                     .push(text(format!("{} chars", s.chars)).font(ui))
                     .push(text(format!("{} lines", s.lines)).font(ui))
                     .push(text(s.language).font(ui))
                     .push(text(s.eol).font(ui))
-                    .push(text(s.encoding).font(ui))
+                    .push(
+                        pick_list(encoding_options(), Some(s.encoding), Message::SetEncoding)
+                            .font(ui)
+                            .text_size(14),
+                    )
+                    .push(
+                        pick_list(encoding_options(), None::<String>, Message::ReopenAs)
+                            .placeholder("Reopen as…")
+                            .font(ui)
+                            .text_size(14),
+                    )
                     .into()
             }
         };
@@ -1888,6 +2007,19 @@ fn language_options() -> &'static [String] {
     })
 }
 
+/// The encoding-picker entries (#50), built once from the core's canonical list
+/// so the shell and core never drift. `pick_list` wants owned `String`s, and the
+/// status bar's selection is the active document's label, also a `String`.
+fn encoding_options() -> &'static [String] {
+    static OPTS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    OPTS.get_or_init(|| {
+        core::encoding::options()
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect()
+    })
+}
+
 /// The display name shown in the window title and the About panel (#40).
 const APP_NAME: &str = "Notepad Extra";
 /// The project license, shown in the About panel (matches the crate metadata and
@@ -2247,7 +2379,7 @@ mod tests {
         // Load a saved file "hello" (no trailing newline), like opening from disk.
         let _ = shell.update(Message::FileRead {
             path: PathBuf::from("/tmp/greeting.txt"),
-            result: Ok("hello".to_string()),
+            result: Ok("hello".as_bytes().to_vec()),
         });
         assert!(!shell.core.active_doc().dirty(), "freshly loaded == clean");
         // Append "goodbye" then delete it again, ending back at "hello".
@@ -2348,7 +2480,7 @@ mod tests {
         let (mut shell, _) = Shell::new();
         let _ = shell.update(Message::FileRead {
             path: PathBuf::from("/tmp/hello.rs"),
-            result: Ok("fn main() {}\n".to_string()),
+            result: Ok("fn main() {}\n".as_bytes().to_vec()),
         });
         assert_eq!(shell.core.active_doc().title(), "hello.rs");
         assert_eq!(shell.core.active_doc().language(), "Rust");
@@ -2535,7 +2667,7 @@ mod tests {
         let (mut shell, _) = Shell::new();
         let _ = shell.update(Message::FileRead {
             path: PathBuf::from("/tmp/a.txt"),
-            result: Ok("aaa".to_string()),
+            result: Ok("aaa".as_bytes().to_vec()),
         });
         let _ = shell.update(Message::NewTab);
         let _ = shell.update(Message::Edit(paste("bbb")));
@@ -2661,7 +2793,7 @@ mod tests {
         let (mut shell, _) = Shell::new();
         let _ = shell.update(Message::FileRead {
             path: PathBuf::from("/tmp/a.txt"),
-            result: Ok("aaa".to_string()),
+            result: Ok("aaa".as_bytes().to_vec()),
         }); // doc 0, clean
         let _ = shell.update(Message::NewTab); // doc 1, pristine blank, active
         let _ = shell.update(Message::TabClosed(0)); // close the clean loaded tab
@@ -2713,7 +2845,7 @@ mod tests {
         let (mut shell, _) = Shell::new();
         let _ = shell.update(Message::FileRead {
             path: PathBuf::from("/tmp/keep.txt"),
-            result: Ok("keep".to_string()),
+            result: Ok("keep".as_bytes().to_vec()),
         }); // doc 0, clean
         let _ = shell.update(Message::NewTab); // doc 1, active
         let _ = shell.update(Message::Edit(paste("throwaway"))); // doc 1 dirty
@@ -2735,7 +2867,7 @@ mod tests {
         let (mut shell, _) = Shell::new();
         let _ = shell.update(Message::FileRead {
             path: PathBuf::from("/tmp/doc.txt"),
-            result: Ok("orig".to_string()),
+            result: Ok("orig".as_bytes().to_vec()),
         }); // doc 0, clean, titled
         let _ = shell.update(Message::NewTab); // doc 1 (blank), active
         let _ = shell.update(Message::Edit(paste("second"))); // doc 1 content
@@ -2903,7 +3035,7 @@ mod tests {
         let (mut shell, _) = Shell::new();
         let _ = shell.update(Message::FileRead {
             path: PathBuf::from("/tmp/doc.txt"),
-            result: Ok("orig".to_string()),
+            result: Ok("orig".as_bytes().to_vec()),
         }); // doc 0: clean, titled
         let _ = shell.update(Message::Edit(paste("edited"))); // doc 0 dirty
         let id = shell.core.active_doc().id;
@@ -3136,12 +3268,101 @@ mod tests {
         let (mut shell, _) = Shell::new();
         let _ = shell.update(Message::FileRead {
             path: PathBuf::from("/tmp/x.rs"),
-            result: Ok("fn main() {}\r\nok\r\n".to_string()),
+            result: Ok("fn main() {}\r\nok\r\n".as_bytes().to_vec()),
         });
         let s = shell.status();
         assert_eq!(s.language, "Rust");
         assert_eq!(s.eol, "CRLF");
         assert_eq!(s.encoding, "UTF-8");
+    }
+
+    // ---- Character encoding open / reopen / convert wiring (#50/#59/#103) ----
+
+    #[test]
+    fn opening_utf16_le_bom_bytes_decodes_and_status_names_the_encoding() {
+        let (mut shell, _) = Shell::new();
+        // "hi" as UTF-16 LE with a byte-order mark.
+        let bytes = vec![0xFF, 0xFE, b'h', 0x00, b'i', 0x00];
+        let _ = shell.update(Message::FileRead {
+            path: PathBuf::from("/tmp/u16.txt"),
+            result: Ok(bytes),
+        });
+        assert_eq!(shell.core.active_doc().content, "hi");
+        assert_eq!(shell.status().encoding, "UTF-16 LE");
+        assert!(shell.error.is_none());
+    }
+
+    #[test]
+    fn opening_non_utf8_bytes_opens_lossily_without_error() {
+        let (mut shell, _) = Shell::new();
+        // 0x92 (a Windows-1252 curly apostrophe) is not valid lone UTF-8, so the
+        // file must still open rather than erroring or showing a hex dump (#59).
+        let bytes = vec![b'i', b't', 0x92, b's'];
+        let _ = shell.update(Message::FileRead {
+            path: PathBuf::from("/tmp/win.txt"),
+            result: Ok(bytes),
+        });
+        assert!(shell.error.is_none(), "a non-UTF-8 file opens, never errors");
+        assert!(!shell.core.active_doc().content.is_empty());
+    }
+
+    #[test]
+    fn reloading_bytes_redecodes_the_active_tab_under_the_chosen_encoding() {
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::FileRead {
+            path: PathBuf::from("/tmp/x.txt"),
+            result: Ok("plain".as_bytes().to_vec()),
+        });
+        let id = shell.core.active_doc().id;
+        // A reopen forcing Windows-1252: 0x97 is its em dash. The `FileReloaded`
+        // arm force-decodes the re-read bytes and replaces the buffer.
+        let _ = shell.update(Message::FileReloaded {
+            id,
+            encoding: core::FileEncoding::from_label("Windows-1252").unwrap(),
+            result: Ok(vec![b'a', 0x97, b'b']),
+        });
+        assert_eq!(shell.core.active_doc().content, "a—b");
+        assert_eq!(shell.status().encoding, "Windows-1252");
+    }
+
+    #[test]
+    fn reloading_bytes_invalid_in_the_chosen_encoding_is_blocked() {
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::FileRead {
+            path: PathBuf::from("/tmp/x.txt"),
+            result: Ok("plain".as_bytes().to_vec()),
+        });
+        let id = shell.core.active_doc().id;
+        // A reopen forcing UTF-16 LE on an odd number of bytes: those bytes are
+        // not validly decodable, so `decode_strict` refuses and the reopen is
+        // blocked — the banner names it and the buffer is left untouched, the same
+        // way a lossy save is blocked.
+        let _ = shell.update(Message::FileReloaded {
+            id,
+            encoding: core::FileEncoding::from_label("UTF-16 LE").unwrap(),
+            result: Ok(vec![0x00, 0x01, 0x02]),
+        });
+        assert!(shell.error.is_some(), "a non-decodable reopen is blocked with an error");
+        assert_eq!(shell.core.active_doc().content, "plain", "the buffer is untouched");
+        assert_eq!(shell.status().encoding, "UTF-8", "the encoding is untouched");
+    }
+
+    #[test]
+    fn set_encoding_on_an_untitled_tab_converts_and_marks_dirty() {
+        let (mut shell, _) = Shell::new();
+        // The lone blank tab has no path, so picking an encoding *converts*: it
+        // records the save encoding and marks the tab dirty for the next Save.
+        let _ = shell.update(Message::SetEncoding("UTF-16 LE".to_string()));
+        assert_eq!(shell.status().encoding, "UTF-16 LE");
+        assert!(shell.core.active_doc().dirty(), "a convert marks the tab dirty");
+    }
+
+    #[test]
+    fn set_encoding_with_an_unknown_label_is_ignored() {
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::SetEncoding("nonsense".to_string()));
+        assert_eq!(shell.status().encoding, "UTF-8");
+        assert!(!shell.core.active_doc().dirty());
     }
 
     // ---- Language selection (#32) ----
@@ -3151,7 +3372,7 @@ mod tests {
         let (mut shell, _) = Shell::new();
         let _ = shell.update(Message::FileRead {
             path: PathBuf::from("/tmp/x.rs"),
-            result: Ok("fn main() {}\n".to_string()),
+            result: Ok("fn main() {}\n".as_bytes().to_vec()),
         });
         assert_eq!(shell.status().language, "Rust"); // auto-detected
 
@@ -3179,7 +3400,7 @@ mod tests {
         // Opening a file auto-detects it: the picker follows without any manual pick.
         let _ = shell.update(Message::FileRead {
             path: PathBuf::from("/tmp/Cargo.toml"),
-            result: Ok("[package]\nname = \"x\"\n".to_string()),
+            result: Ok("[package]\nname = \"x\"\n".as_bytes().to_vec()),
         });
         assert_eq!(shell.core.active_doc().manual_lang, None, "still on auto");
         assert_eq!(
@@ -3212,7 +3433,7 @@ mod tests {
         // Auto-detect on open changes the language → nudge flips.
         let _ = shell.update(Message::FileRead {
             path: PathBuf::from("/tmp/x.rs"),
-            result: Ok("fn main() {}\n".to_string()),
+            result: Ok("fn main() {}\n".as_bytes().to_vec()),
         });
         assert_ne!(
             shell.repaint_nudge, base,
@@ -3266,7 +3487,7 @@ mod tests {
         let (mut shell, _) = Shell::new();
         let _ = shell.update(Message::FileRead {
             path: PathBuf::from("/tmp/x.rs"),
-            result: Ok("fn main() {}\n".to_string()),
+            result: Ok("fn main() {}\n".as_bytes().to_vec()),
         });
         let _ = shell.update(Message::SetLanguage(notepad_syntax::PLAIN_TEXT.to_string()));
         assert_eq!(shell.core.active_doc().language(), "Plain Text");
@@ -3277,7 +3498,7 @@ mod tests {
         let (mut shell, _) = Shell::new();
         let _ = shell.update(Message::FileRead {
             path: PathBuf::from("/tmp/x.rs"),
-            result: Ok("code".to_string()),
+            result: Ok("code".as_bytes().to_vec()),
         });
         let _ = shell.update(Message::SetLanguage(group_header("Popular")));
         assert_eq!(
@@ -3778,13 +3999,13 @@ mod tests {
     /// Land a dropped `path` exactly as the runtime does: `Message::FileDropped`
     /// calls `read_into_tab`, which reads off-thread and re-enters as `FileRead`.
     /// The async read can't run under the headless test, so we perform the same
-    /// real `read_file` here and feed its result straight into the shell — the
-    /// faithful, synchronous equivalent of a completed drop.
+    /// real `read_file_bytes` here and feed its result straight into the shell —
+    /// the faithful, synchronous equivalent of a completed drop.
     fn drop_file(shell: &mut Shell, path: &Path) {
         // Prove the drop message itself is accepted and routed without panicking
         // (it returns the read task we can't drive here), then land the bytes.
         let _ = shell.update(Message::FileDropped(path.to_path_buf()));
-        let result = core::io::read_file(path);
+        let result = core::io::read_file_bytes(path);
         let _ = shell.update(Message::FileRead {
             path: path.to_path_buf(),
             result,

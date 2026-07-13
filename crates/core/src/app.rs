@@ -422,7 +422,7 @@ pub enum Message {
         encoding: FileEncoding,
     },
     /// The shell re-read an already-open document `id` under a user-chosen
-    /// encoding (a *reopen*, see [`Message::SetEncoding`]). Replaces that tab's
+    /// encoding (a *reopen*, see [`Message::ReopenAs`]). Replaces that tab's
     /// buffer like a fresh load — re-detects EOL, resets history and the saved
     /// baseline — but keeps its path and language.
     FileReloaded {
@@ -1810,7 +1810,10 @@ mod tests {
             "a titled tab re-reads its bytes to re-decode"
         );
         assert_eq!(s.active_doc().encoding, FileEncoding::default());
-        assert!(!s.active_doc().dirty(), "the buffer is untouched until FileReloaded");
+        assert!(
+            !s.active_doc().dirty(),
+            "the buffer is untouched until FileReloaded"
+        );
     }
 
     #[test]

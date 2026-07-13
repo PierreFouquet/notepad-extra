@@ -219,7 +219,10 @@ pub fn decode_strict(bytes: &[u8], want: FileEncoding) -> Result<(String, FileEn
         Some((bom_enc, bom_len)) if bom_enc == want.enc => (&bytes[bom_len..], true),
         _ => (bytes, false),
     };
-    match want.enc.decode_without_bom_handling_and_without_replacement(body) {
+    match want
+        .enc
+        .decode_without_bom_handling_and_without_replacement(body)
+    {
         Some(text) => Ok((text.into_owned(), FileEncoding { enc: want.enc, bom })),
         None => {
             let n = count_malformed(body, want.enc);
@@ -495,7 +498,10 @@ mod tests {
         // refused with an error naming the encoding — rather than showing U+FFFD.
         let err = decode_strict(&[b'h', b'i', 0xFF], fe("UTF-8")).unwrap_err();
         assert!(err.contains("UTF-8"), "error names the encoding: {err}");
-        assert!(err.contains('1'), "error counts the one bad sequence: {err}");
+        assert!(
+            err.contains('1'),
+            "error counts the one bad sequence: {err}"
+        );
     }
 
     #[test]

@@ -1262,16 +1262,14 @@ impl Shell {
             // A reopen (#50): re-read the tab's bytes off-thread and strictly
             // re-decode them under the chosen encoding on arrival
             // (`Message::FileReloaded`).
-            Effect::ReadFileAs { id, path, encoding } => {
-                Task::perform(
-                    async move { core::io::read_file_bytes(&path) },
-                    move |result| Message::FileReloaded {
-                        id,
-                        encoding,
-                        result,
-                    },
-                )
-            }
+            Effect::ReadFileAs { id, path, encoding } => Task::perform(
+                async move { core::io::read_file_bytes(&path) },
+                move |result| Message::FileReloaded {
+                    id,
+                    encoding,
+                    result,
+                },
+            ),
             Effect::PickSavePath { id } => {
                 Task::perform(pick_save(), move |path| Message::SavePicked { id, path })
             }
@@ -3302,7 +3300,10 @@ mod tests {
             path: PathBuf::from("/tmp/win.txt"),
             result: Ok(bytes),
         });
-        assert!(shell.error.is_none(), "a non-UTF-8 file opens, never errors");
+        assert!(
+            shell.error.is_none(),
+            "a non-UTF-8 file opens, never errors"
+        );
         assert!(!shell.core.active_doc().content.is_empty());
     }
 
@@ -3342,9 +3343,20 @@ mod tests {
             encoding: core::FileEncoding::from_label("UTF-16 LE").unwrap(),
             result: Ok(vec![0x00, 0x01, 0x02]),
         });
-        assert!(shell.error.is_some(), "a non-decodable reopen is blocked with an error");
-        assert_eq!(shell.core.active_doc().content, "plain", "the buffer is untouched");
-        assert_eq!(shell.status().encoding, "UTF-8", "the encoding is untouched");
+        assert!(
+            shell.error.is_some(),
+            "a non-decodable reopen is blocked with an error"
+        );
+        assert_eq!(
+            shell.core.active_doc().content,
+            "plain",
+            "the buffer is untouched"
+        );
+        assert_eq!(
+            shell.status().encoding,
+            "UTF-8",
+            "the encoding is untouched"
+        );
     }
 
     #[test]
@@ -3354,7 +3366,10 @@ mod tests {
         // records the save encoding and marks the tab dirty for the next Save.
         let _ = shell.update(Message::SetEncoding("UTF-16 LE".to_string()));
         assert_eq!(shell.status().encoding, "UTF-16 LE");
-        assert!(shell.core.active_doc().dirty(), "a convert marks the tab dirty");
+        assert!(
+            shell.core.active_doc().dirty(),
+            "a convert marks the tab dirty"
+        );
     }
 
     #[test]

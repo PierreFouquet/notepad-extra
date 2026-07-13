@@ -345,6 +345,15 @@ mod tests {
     }
 
     #[test]
+    fn write_file_bytes_reports_an_error_when_the_write_itself_fails() {
+        // The target's parent already exists (so `create_dir_all` is skipped), but
+        // the path names an existing directory, so the write can't succeed — the
+        // `fs::write` error surfaces rather than panicking.
+        let dir = tempdir().expect("tempdir");
+        assert!(write_file_bytes(dir.path(), b"data").is_err());
+    }
+
+    #[test]
     fn safe_url_accepts_https_only() {
         assert!(is_safe_external_url(
             "https://github.com/PierreFouquet/notepad-extra"

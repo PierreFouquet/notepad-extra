@@ -305,6 +305,33 @@ mod tests {
     }
 
     #[test]
+    fn diff_suffix_never_overlaps_the_prefix() {
+        // The deleted text repeats the tail that survives it, so the common suffix
+        // would happily run back *through* the common prefix if it were not capped
+        // by it: "abc|Xbc" -> "abc" shares the prefix "abc" and the trailing "bc".
+        // Without the cap the suffix eats into text the prefix already claimed and
+        // the two spans cross, which is not merely a wrong edit — it slices
+        // `new[3..1]` and panics.
+        assert_eq!(
+            diff("abcXbc", "abc"),
+            Some(Edit {
+                at: 3,
+                removed: "Xbc".into(),
+                inserted: String::new()
+            })
+        );
+        // The mirror case: a pure insertion whose new text repeats the prefix.
+        assert_eq!(
+            diff("ab", "abab"),
+            Some(Edit {
+                at: 2,
+                removed: String::new(),
+                inserted: "ab".into()
+            })
+        );
+    }
+
+    #[test]
     fn diff_respects_utf8_boundaries() {
         // Emoji differ only in their middle bytes; the span must be the whole char.
         let d = diff("a😀b", "a🎉b").unwrap();
@@ -330,6 +357,42 @@ mod tests {
         let d = diff("e", "e\u{0301}").unwrap();
         assert_eq!(d.at, 1);
         assert_eq!(d.inserted, "\u{0301}");
+    }
+
+    #[test]
+    fn diff_backs_off_a_suffix_that_matches_mid_char() {
+        // The cases above all stop the byte-level suffix scan on a boundary already,
+        // so none of them ever enter the char-boundary back-off — the loop this
+        // function's doc comment is about ("even when bytes happen to match
+        // mid-char"). These two do.
+        //
+        // 'é' is C3 A9 and '©' is C2 A9: the *trailing* byte matches although the
+        // chars differ, so the raw suffix scan stops inside both chars and must be
+        // backed off to 0 rather than splitting either one.
+        assert_eq!("é".as_bytes(), &[0xC3, 0xA9]);
+        assert_eq!("©".as_bytes(), &[0xC2, 0xA9]);
+        assert_eq!(
+            diff("é", "©"),
+            Some(Edit {
+                at: 0,
+                removed: "é".into(),
+                inserted: "©".into()
+            }),
+            "a suffix matching only mid-char must not shrink the span"
+        );
+
+        // 'é' (C3 A9) vs 'è' (C3 A8) inside a longer string: the common suffix "aa"
+        // is real and must be *kept* — the back-off must not walk past a boundary it
+        // has already reached, or the edit span grows to swallow the trailing text.
+        assert_eq!(
+            diff("aéaa", "aèaa"),
+            Some(Edit {
+                at: 1,
+                removed: "é".into(),
+                inserted: "è".into()
+            }),
+            "a genuine char-aligned suffix is preserved"
+        );
     }
 
     #[test]
@@ -585,6 +648,37 @@ mod tests {
         assert!(
             h.dirty(),
             "the evicted saved entry can never be reached again"
+        );
+    }
+
+    #[test]
+    fn evicting_an_unrelated_entry_leaves_the_saved_baseline_reachable() {
+        // The two tests above only evict the baseline *itself*, where "is the
+        // baseline among the evicted?" is true — so they pass just as well if that
+        // test is inverted. This is the other side: the evicted entry is a stranger,
+        // the baseline must survive, and undoing back to it must come up clean.
+        let mut h = History::new();
+        let mut c = String::new();
+        for i in 0..MAX_UNDO {
+            let next = format!("{c}{i}\n");
+            type_into(&mut h, &mut c, &next);
+        }
+        assert_eq!(h.undo_depth(), MAX_UNDO, "stack filled to the cap");
+
+        h.mark_saved(); // baseline pinned at the newest entry, far from the bottom
+        assert!(!h.dirty());
+
+        // One more edit overflows by one, evicting the *oldest* entry — not the
+        // baseline, which is still sitting one step below the top.
+        let next = format!("{c}x\n");
+        type_into(&mut h, &mut c, &next);
+        assert_eq!(h.undo_depth(), MAX_UNDO, "history stays bounded");
+        assert!(h.dirty(), "the newest edit is unsaved");
+
+        assert!(undo(&mut h, &mut c));
+        assert!(
+            !h.dirty(),
+            "an unrelated eviction must not strand the saved baseline"
         );
     }
 }

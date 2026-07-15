@@ -189,6 +189,22 @@ mod tests {
     }
 
     #[test]
+    fn nested_brackets_match_the_right_partner_walking_backward() {
+        // Every case above starts on an *opener*, so they only exercise the forward
+        // scan; the backward scan's nesting counter is only reached from a closer
+        // with other pairs in between. Without these, inverting that counter still
+        // passes the whole suite (the shallow "()|" cases never nest, and "())|"
+        // reports unmatched either way).
+        //
+        // "((()))|" — the outer ')' at 5 skips two nested pairs back to '(' at 0.
+        assert_eq!(pair("((()))", 6), Some((5, Some(0))));
+        // "((()|))" — the inner ')' at 3 pairs with the '(' immediately before it.
+        assert_eq!(pair("((()))", 4), Some((3, Some(2))));
+        // Mixed nesting, backward: '}' at 5 skips "[()]" back to '{' at 0.
+        assert_eq!(pair("{[()]}", 6), Some((5, Some(0))));
+    }
+
+    #[test]
     fn unbalanced_openers_and_closers_report_no_partner() {
         assert_eq!(pair("(", 0), Some((0, None))); // lone opener
         assert_eq!(pair(")", 1), Some((0, None))); // lone closer, caret after it

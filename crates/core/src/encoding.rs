@@ -332,11 +332,50 @@ mod tests {
 
     #[test]
     fn label_from_label_round_trip() {
+        // Pin the list itself before iterating it: `for label in options()` over an
+        // empty slice runs zero times and passes vacuously, so an `options()` that
+        // returned nothing would sail through the loop below.
+        // (Both messages stay literal: a call like `options()` in a format argument
+        // is only evaluated on failure, which shows up as an uncovered line under
+        // the coverage gate.)
+        assert!(!options().is_empty(), "the picker needs some options");
+        assert!(options().contains(&"UTF-8"), "UTF-8 must be offered");
         for label in options() {
             let enc = FileEncoding::from_label(label).expect("known label");
             assert_eq!(enc.label(), *label);
         }
         assert_eq!(FileEncoding::from_label("nonsense"), None);
+    }
+
+    #[test]
+    fn decode_with_strips_a_matching_bom_and_reports_it() {
+        // A UTF-8 BOM ahead of UTF-8 text: stripped, never left as U+FEFF in the
+        // buffer, and reflected in the returned encoding.
+        let (text, enc) = decode_with(&[0xEF, 0xBB, 0xBF, b'h', b'i'], fe("UTF-8"));
+        assert_eq!(text, "hi", "the BOM must not leak into the buffer");
+        assert!(enc.bom, "a stripped BOM is reported");
+
+        // The same bytes with no BOM: nothing stripped, and `bom` stays false.
+        let (text, enc) = decode_with(b"hi", fe("UTF-8"));
+        assert_eq!(text, "hi");
+        assert!(!enc.bom);
+    }
+
+    #[test]
+    fn decode_with_keeps_a_bom_that_is_not_the_wanted_encoding() {
+        // A UTF-16 LE BOM (FF FE) decoded as Windows-1252 is *not* this encoding's
+        // BOM, so it must be decoded as ordinary bytes rather than stripped.
+        let (text, enc) = decode_with(&[0xFF, 0xFE, b'h'], fe("Windows-1252"));
+        assert_eq!(text, "ÿþh", "a foreign BOM decodes as text");
+        assert!(!enc.bom, "a foreign BOM is not reported as this file's BOM");
+    }
+
+    #[test]
+    fn decode_strict_keeps_a_bom_that_is_not_the_wanted_encoding() {
+        let (text, enc) =
+            decode_strict(&[0xFF, 0xFE, b'h'], fe("Windows-1252")).expect("1252 is total");
+        assert_eq!(text, "ÿþh", "a foreign BOM decodes as text");
+        assert!(!enc.bom, "a foreign BOM is not reported as this file's BOM");
     }
 
     #[test]
@@ -442,14 +481,30 @@ mod tests {
             err.contains("Windows-1252"),
             "error names the encoding: {err}"
         );
-        assert!(err.contains('1'), "error counts one bad char: {err}");
+        // Match the count *with its unit*, not a bare `contains('1')`: the label
+        // "Windows-1252" already contains '1' (and '2'), so a bare digit search
+        // passes for any count at all.
+        assert!(
+            err.contains("1 character(s)"),
+            "error counts one bad char: {err}"
+        );
     }
 
     #[test]
     fn lossy_count_is_accurate() {
         // Two emoji, both unrepresentable in Windows-1252, around mappable text.
         let err = encode_for_save("a😀b🎉c", fe("Windows-1252")).unwrap_err();
-        assert!(err.contains('2'), "error counts two bad chars: {err}");
+        assert!(
+            err.contains("2 character(s)"),
+            "error counts two bad chars: {err}"
+        );
+        // A third unmappable char must move the count — pins `count_unmappable`
+        // to the input rather than to any one constant.
+        let err3 = encode_for_save("a😀b🎉c✨", fe("Windows-1252")).unwrap_err();
+        assert!(
+            err3.contains("3 character(s)"),
+            "error counts three bad chars: {err3}"
+        );
     }
 
     #[test]
@@ -499,8 +554,15 @@ mod tests {
         let err = decode_strict(&[b'h', b'i', 0xFF], fe("UTF-8")).unwrap_err();
         assert!(err.contains("UTF-8"), "error names the encoding: {err}");
         assert!(
-            err.contains('1'),
+            err.contains("1 byte sequence(s)"),
             "error counts the one bad sequence: {err}"
+        );
+        // Two separated bad bytes must report two — a count pinned at a single
+        // input can't tell an accurate count from a hard-coded one.
+        let err2 = decode_strict(&[0xFF, b'h', 0xFF], fe("UTF-8")).unwrap_err();
+        assert!(
+            err2.contains("2 byte sequence(s)"),
+            "error counts both bad sequences: {err2}"
         );
     }
 

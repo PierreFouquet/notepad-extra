@@ -580,14 +580,23 @@ mod tests {
 
     #[test]
     fn group_languages_are_sorted_case_insensitively() {
+        // Checked against `<=` on the lowercased names rather than by re-running
+        // `sort_ci`: the catalogue is *built* with `sort_ci`, so sorting a clone
+        // with it again and comparing only proves the function is idempotent —
+        // which a do-nothing `sort_ci` also is.
         for group in catalog() {
-            let mut sorted = group.languages.clone();
-            sort_ci(&mut sorted);
-            assert_eq!(
-                group.languages, sorted,
-                "group {} is not sorted",
-                group.name
-            );
+            assert!(!group.languages.is_empty(), "group {} is empty", group.name);
+            for pair in group.languages.windows(2) {
+                // Bound to locals first: an index expression inside the failure
+                // message is only evaluated on failure, which the coverage gate
+                // then sees as an uncovered line.
+                let (lo, hi) = (pair[0], pair[1]);
+                assert!(
+                    lo.to_ascii_lowercase() <= hi.to_ascii_lowercase(),
+                    "group {} is not sorted: {lo:?} precedes {hi:?}",
+                    group.name
+                );
+            }
         }
     }
 

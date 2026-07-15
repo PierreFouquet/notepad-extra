@@ -1550,6 +1550,38 @@ mod tests {
     }
 
     #[test]
+    fn a_blank_tab_whose_encoding_was_picked_is_not_pristine() {
+        // Every other `is_pristine_blank` assertion is on a *genuinely* untouched
+        // tab, where all three clauses agree — so they can't tell `&&` from `||`.
+        // `SetEncoding` dirties a tab via `saved_encoding` without touching the
+        // text, which is the one reachable way to be dirty *and* empty *and*
+        // untitled: the clauses disagree, and the buffer must not be recycled.
+        let mut s = State::default();
+        assert!(
+            s.active_doc().is_pristine_blank(),
+            "a fresh tab is pristine"
+        );
+
+        update(&mut s, Message::SetEncoding("UTF-16 LE".into()));
+        assert!(
+            s.active_doc().dirty(),
+            "picking an encoding dirties the tab"
+        );
+        assert!(
+            s.active_doc().content.is_empty(),
+            "…while the buffer stays empty"
+        );
+        assert!(
+            !s.active_doc().is_pristine_blank(),
+            "a tab the user has touched must not count as a throwaway blank"
+        );
+
+        // …so opening a file adds a tab rather than silently discarding the pick.
+        load(&mut s, "/tmp/opened.txt", "hello");
+        assert_eq!(s.docs.len(), 2, "the touched blank tab is kept");
+    }
+
+    #[test]
     fn closing_a_tab_before_active_keeps_focus_stable() {
         let mut s = State::default();
         load(&mut s, "/tmp/a.txt", "a"); // reuses blank -> 1 doc
@@ -1559,6 +1591,32 @@ mod tests {
         update(&mut s, Message::TabClosed(0)); // remove one before active
         assert_eq!(s.docs.len(), 2);
         assert_eq!(s.active, 1, "focus should follow the same document");
+    }
+
+    #[test]
+    fn closing_a_tab_before_a_middle_active_shifts_focus_left() {
+        // The case above closes a tab while the *last* document is active, where the
+        // `active >= len` clamp already happens to land on the right index — so the
+        // `active -= 1` shift beneath it never runs and could be removed entirely
+        // without failing. With a middle tab active the clamp doesn't fire, and that
+        // shift is the only thing keeping focus on the same document.
+        let mut s = State::default();
+        load(&mut s, "/tmp/a.txt", "a"); // reuses blank -> 1 doc
+        update(&mut s, Message::NewTab); // 2 docs
+        update(&mut s, Message::NewTab); // 3 docs
+        update(&mut s, Message::NewTab); // 4 docs, active = 3
+        update(&mut s, Message::TabSelected(2)); // active = 2, with a tab either side
+        assert_eq!(s.active, 2);
+        let focused = s.active_doc().id;
+
+        update(&mut s, Message::TabClosed(0)); // remove one before active
+        assert_eq!(s.docs.len(), 3);
+        assert_eq!(s.active, 1, "focus shifts left with the closed tab");
+        assert_eq!(
+            s.active_doc().id,
+            focused,
+            "the same document keeps focus, not its neighbour"
+        );
     }
 
     #[test]

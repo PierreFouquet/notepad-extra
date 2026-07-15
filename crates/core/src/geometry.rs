@@ -117,6 +117,20 @@ mod tests {
     }
 
     #[test]
+    fn gutter_width_is_the_exact_reserved_strip() {
+        // The tests above only check the width *grows* with digits and font size,
+        // which any monotonic formula satisfies — `digits + text_size` passes them
+        // just as happily as `digits * text_size`. The widget's `layout`, `update`,
+        // `mouse_interaction` and `draw` must all reserve the same strip, so pin
+        // the arithmetic itself: ceil(digits * text_size * 0.6) + GUTTER_PAD * 2.
+        assert_eq!(gutter_width(true, 9, 14.0), 21.0); // 1 digit: ceil(8.4) + 12
+        assert_eq!(gutter_width(true, 99, 14.0), 29.0); // 2 digits: ceil(16.8) + 12
+        assert_eq!(gutter_width(true, 999, 14.0), 38.0); // 3 digits: ceil(25.2) + 12
+        // Half the font size is not half the gutter — the padding is a constant.
+        assert_eq!(gutter_width(true, 9, 7.0), 17.0); // ceil(4.2) + 12
+    }
+
+    #[test]
     fn digit_count_counts_decimal_digits() {
         assert_eq!(digit_count(0), 1); // empty/one-line document → "1"
         assert_eq!(digit_count(1), 1);
@@ -145,6 +159,27 @@ mod tests {
     fn thumb_sits_at_the_track_start_when_unscrolled() {
         let t = scroll_thumb(100.0, 400.0, 0.0, 300.0);
         assert_eq!(t.offset_along_track, 0.0);
+    }
+
+    #[test]
+    fn thumb_geometry_is_exact() {
+        // As with the gutter, the surrounding tests only assert the thumb's *shape*
+        // (at least MIN_THUMB_LEN, starts at 0, travels forward), which survives
+        // `content_len + viewport_len` in place of `-`. Pin the numbers.
+        // viewport 100 of content 400 on a 300px track, scrolled halfway (150):
+        //   ratio   = 100/400              = 0.25
+        //   length  = 300 * 0.25           = 75
+        //   max     = 400 - 100            = 300
+        //   travel  = 300 - 75             = 225
+        //   along   = 225 * (150 / 300)    = 112.5
+        let t = scroll_thumb(100.0, 400.0, 150.0, 300.0);
+        assert_eq!(t.length, 75.0);
+        assert_eq!(t.max_scroll, 300.0);
+        assert_eq!(t.offset_along_track, 112.5);
+
+        // Fully scrolled: the thumb ends flush with the track end (travel exactly).
+        let end = scroll_thumb(100.0, 400.0, 300.0, 300.0);
+        assert_eq!(end.offset_along_track, 225.0);
     }
 
     #[test]

@@ -460,6 +460,46 @@ mod tests {
     }
 
     #[test]
+    fn resume_after_an_empty_match_lands_on_a_char_boundary() {
+        // The ASCII walk below never exercises the boundary skip: there, `start + 1`
+        // is always already a boundary. Only a multi-byte char forces the scan past
+        // a continuation byte — and a resume offset landing mid-char is worse than
+        // a wrong number, because `find_from` floors it straight back to `start`
+        // and the same zero-width match is found forever.
+        //
+        // "xéx" = 78 | C3 A9 | 78 — boundaries at 0, 1, 3, 4; byte 2 is inside 'é'.
+        let text = "xéx";
+        assert!(!text.is_char_boundary(2), "byte 2 is mid-'é'");
+
+        let empty_at_1 = Match { start: 1, end: 1 };
+        assert_eq!(
+            resume_after(text, empty_at_1),
+            3,
+            "must skip 'é' whole, not stop at the continuation byte"
+        );
+
+        // A non-empty match still resumes at its end, multi-byte or not.
+        assert_eq!(resume_after(text, Match { start: 1, end: 3 }), 3);
+
+        // And stepping really does terminate rather than stall on 'é'. `a*` matches
+        // empty at every boundary, so `find_from` always returns a hit — the walk
+        // ends at the end-of-text fixed point, not by running out of matches.
+        let m = Matcher::new("a*", opts(false, false, true)).unwrap();
+        let mut cursor = 0;
+        let mut seen = Vec::new();
+        for _ in 0..20 {
+            let hit = m.find_from(text, cursor).expect("`a*` always matches");
+            seen.push(hit.start);
+            let next = resume_after(text, hit);
+            if next == cursor {
+                break; // the zero-width match at end-of-text
+            }
+            cursor = next;
+        }
+        assert_eq!(seen, vec![0, 1, 3, 4], "each boundary visited exactly once");
+    }
+
+    #[test]
     fn empty_match_navigation_makes_progress() {
         // `a*` matches empty everywhere plus "aa"; forward stepping must visit
         // distinct positions and terminate at the tail rather than stalling on a

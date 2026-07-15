@@ -285,8 +285,24 @@ mod tests {
     /// An unknown syntax name must fall back rather than panic.
     #[test]
     fn unknown_syntax_falls_back_to_plain_text() {
+        // Asserting only "didn't panic" would leave the name's real claim — the
+        // *fall back to plain text* — unchecked: falling back to Rust, or to
+        // whatever syntax happened to be first in the set, would pass too. Check
+        // the same property `plain_text_is_single_coloured` does.
         let mut hl = SyntectHighlighter::new(&settings("Not A Real Syntax"));
-        let _ = hl.highlight_line("anything").count(); // must not panic
+        let spans: Vec<_> = hl.highlight_line("fn main() {}").collect();
+        assert!(!spans.is_empty(), "the line still yields spans");
+        let colors: std::collections::BTreeSet<[u8; 4]> = spans
+            .iter()
+            .map(|(_, h)| {
+                let c = h.0.foreground;
+                [c.r, c.g, c.b, c.a]
+            })
+            .collect();
+        assert!(
+            colors.len() <= 1,
+            "an unknown syntax must render like plain text, not like code"
+        );
     }
 
     /// `change_line` resets the resume point and never empties the cache or

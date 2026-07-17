@@ -70,7 +70,10 @@ jobs:
         run: cargo clippy --package notepad-iced --all-targets -- -D warnings
       - name: build
         run: cargo build --package notepad-iced
-      - name: test (headless shell wiring)
+      - name: test (headless shell wiring + UI simulator)
+        # `--all-targets` runs the `ui_tests` module too — iced_test's Simulator
+        # drives the real widget tree with no window / GPU (#70), so it needs no
+        # xvfb and runs identically on all three matrix OSes.
         run: cargo test --package notepad-iced --all-targets --verbose
       - name: windowed smoke (xvfb, software renderer)
         if: runner.os == 'Linux'

@@ -84,6 +84,15 @@ advanced = []
 # in `Cargo.lock` via the workspace, so it adds nothing to vendor for #17.
 tempfile = "3.6"
 
+# Headless UI interaction tests (#70): iced 0.14's `Simulator` drives the real
+# widget tree with the tiny-skia software renderer — no window, no GPU — finding
+# widgets by their visible text and returning the `Message`s they emit, which the
+# tests feed back through `Shell::update`. This exercises `view` end-to-end on all
+# three CI OSes. Dev-only (never shipped) and, per the #70 plan's source check,
+# it enables `iced_renderer` with only `fira-sans`, so it pulls in no wgpu and
+# stays tiny-skia-only like the shell itself.
+iced_test = "=0.14.0"
+
 # --- Native packaging (#43) ---------------------------------------------------
 # The shipped binary is packaged natively — no Tauri bundler. cargo-deb and
 # cargo-generate-rpm build the Linux packages, cargo-bundle the macOS .app/.dmg,

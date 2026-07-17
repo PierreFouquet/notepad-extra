@@ -21,7 +21,8 @@
 
 use iced::widget::text::Wrapping;
 use iced::widget::{
-    button, column, container, mouse_area, pick_list, row, stack, text, text_input,
+    Space, button, column, container, mouse_area, pick_list, row, scrollable, stack, text,
+    text_input,
 };
 use iced::{Element, Fill, Length, Point, Subscription, Task};
 use notepad_core as core;
@@ -45,6 +46,12 @@ mod fonts;
 // effective language. Deliberately not iced's onig-backed `iced_highlighter`.
 mod highlight;
 use highlight::SyntectHighlighter;
+
+// Custom Tauri-matched chrome theme (#70): colour tokens ported 1:1 from the
+// retired WebView build plus the button/container/input/pick-list style helpers
+// the shell's `view` uses to paint every widget. The whole modernisation is a
+// `view`-layer change — `notepad_core` and every `Message`/`Effect` are untouched.
+mod theme;
 
 /// The Linux Wayland app-id / X11 `WM_CLASS`, matching the basename of
 /// `packaging/linux/io.github.PierreFouquet.NotepadExtra.desktop` and its
@@ -142,6 +149,10 @@ fn on_window_event(
             Some(Message::FileDropped(path))
         }
         iced::Event::Window(iced::window::Event::CloseRequested) => Some(Message::QuitRequested),
+        // Track the width so the tab strip can decide when tabs overflow (#70).
+        iced::Event::Window(iced::window::Event::Resized(size)) => {
+            Some(Message::WindowResized(size.width))
+        }
         _ => None,
     }
 }
@@ -398,6 +409,17 @@ enum Message {
     /// symptom. See [`Shell::repaint_nudge`] for the underlying iced limitation.
     ScrollNudge,
 
+    /// The window was resized; remember the new width so the tab strip knows how
+    /// much room it has and can collapse overflowing tabs into the `▾` dropdown
+    /// (#70). Like [`Message::EditorCursorMoved`] it only records geometry and
+    /// paints nothing itself, so [`Shell::update`] skips the repaint nudge for it —
+    /// a resize already forces iced to relayout and repaint the frame.
+    WindowResized(f32),
+
+    /// Show or hide the tab-overflow menu — the `▾ N more` control that lists the
+    /// tabs collapsed off the strip when they don't all fit (#70).
+    ToggleTabsMenu,
+
     // ---- Editor context menu (#97 item 3) ----
     /// The pointer moved over the editor; remember where so the context menu can
     /// open at the cursor. Published on every motion (the only way iced surfaces
@@ -629,6 +651,17 @@ struct Shell {
     /// for this app's small window) for correctness. Same class of bug as the
     /// vendored `text_editor`'s repaint gotcha.
     repaint_nudge: bool,
+    /// The current window width in logical pixels (#70), tracked from
+    /// `window::Event::Resized`. The tab strip reads it to decide when the tabs
+    /// overflow their strip and collapse the extras into a `▾` dropdown — `view`
+    /// has no other way to learn the available width, and because the chrome bars
+    /// span the whole window, the window width *is* the strip width. Seeded to the
+    /// default window width until the first resize event lands.
+    window_width: f32,
+    /// Whether the tab-overflow menu is open (#70) — the `▾ N more` control on the
+    /// tab strip lists the tabs that don't fit; this drives its card in `view`.
+    /// Shell-only chrome, like [`Shell::drag_hover`]; selecting a tab closes it.
+    tabs_menu_open: bool,
 }
 
 impl Shell {
@@ -702,6 +735,10 @@ impl Shell {
                 prefs_writing: false,
                 pending_prefs: None,
                 repaint_nudge: false,
+                // iced's default window is 1024×768; the first `Resized` event
+                // corrects this to the real width almost immediately (#70).
+                window_width: 1024.0,
+                tabs_menu_open: false,
             },
             Task::none(),
         )
@@ -722,7 +759,10 @@ impl Shell {
     /// the nudge exists to avoid. Skipping the flip lets those frames take iced's
     /// cheap no-damage path; every message that can change a pixel still nudges.
     fn update(&mut self, message: Message) -> Task<Message> {
-        let repaints = !matches!(message, Message::EditorCursorMoved(_));
+        let repaints = !matches!(
+            message,
+            Message::EditorCursorMoved(_) | Message::WindowResized(_)
+        );
         let task = self.dispatch(message);
         if repaints {
             self.repaint_nudge = !self.repaint_nudge;
@@ -730,27 +770,52 @@ impl Shell {
         task
     }
 
-    /// The application background style. Normally the theme's default; when
-    /// [`Shell::repaint_nudge`] is set it nudges the clear colour imperceptibly to
-    /// force iced's software compositor into a full redraw (see the field's docs).
+    /// The active chrome colour tokens (#70), selected by the core's light/dark
+    /// [`core::ThemeMode`]. The single source of truth for every hand-styled
+    /// widget in [`Shell::view`]; [`Shell::theme`] derives the coarse `iced::Theme`
+    /// from the same choice for the widgets we don't hand-style.
+    fn tokens(&self) -> theme::Tokens {
+        match self.core.theme() {
+            core::ThemeMode::Light => theme::LIGHT,
+            core::ThemeMode::Dark => theme::DARK,
+        }
+    }
+
+    /// The application background style. Painted from the token `app_bg` (#70) so
+    /// the window backdrop matches the custom chrome; when [`Shell::repaint_nudge`]
+    /// is set it nudges the clear colour imperceptibly to force iced's software
+    /// compositor into a full redraw (see the field's docs).
     fn app_style(&self, theme: &iced::Theme) -> iced::theme::Style {
         use iced::theme::Base;
         let mut style = theme.base();
+        style.background_color = self.tokens().app_bg;
         if self.repaint_nudge {
             style.background_color.b = (style.background_color.b - 1.0 / 255.0).max(0.0);
         }
         style
     }
 
-    /// The active `iced::Theme` for the whole app (#36), mapped from the core's
-    /// light/dark [`core::ThemeMode`]. iced reads this every frame, so a toggle
-    /// repaints the chrome in the new palette; the editor's syntect highlight
-    /// theme is paired separately in [`Shell::view`] via the same `ThemeMode`.
+    /// The active `iced::Theme` for the whole app (#36/#70), a custom theme carrying
+    /// the [`tokens`](Self::tokens)' palette so the widgets the shell does *not*
+    /// hand-style (pick-list menus, the editor's internal gutter / active-line /
+    /// selection) still land in the right colours. iced reads this every frame, so a
+    /// theme toggle repaints the chrome; the editor's syntect highlight theme is
+    /// paired separately in [`Shell::view`] via the same `ThemeMode`.
     fn theme(&self) -> iced::Theme {
-        match self.core.theme() {
-            core::ThemeMode::Light => iced::Theme::Light,
-            core::ThemeMode::Dark => iced::Theme::Dark,
-        }
+        let t = self.tokens();
+        iced::Theme::custom(
+            "Notepad Extra".to_owned(),
+            iced::theme::Palette {
+                background: t.app_bg,
+                text: t.text,
+                primary: t.accent,
+                success: t.accent,
+                // `Tokens` carries no distinct warning colour; the danger red
+                // doubles for it (nothing in the chrome uses `warning`).
+                warning: t.danger,
+                danger: t.danger,
+            },
+        )
     }
 
     /// The active tab's editor buffer. Its key is present by invariant:
@@ -789,7 +854,12 @@ impl Shell {
             // rebuilding at the top — the crux of #94. (A first-ever selection of
             // a tab that has no cached buffer is covered by `sync_editor_cache`'s
             // lazy create.)
-            Message::TabSelected(i) => self.apply_core(core::Message::TabSelected(i), false),
+            Message::TabSelected(i) => {
+                // Selecting a tab (including from the overflow menu) dismisses that
+                // menu — the chosen tab is now active and kept inline (#70).
+                self.tabs_menu_open = false;
+                self.apply_core(core::Message::TabSelected(i), false)
+            }
             // resync=false: closing a clean tab (or a save-then-close) changes the
             // active document, which `apply_core` detects and resyncs on its own;
             // a *dirty* tab only yields a `ConfirmClose`, so the editor must be
@@ -944,6 +1014,21 @@ impl Shell {
             // scroll and forces a full redraw (see the variant + `repaint_nudge`
             // docs). No state to touch.
             Message::ScrollNudge => Task::none(),
+
+            // Record the window width for the tab strip's overflow decision (#70).
+            // Pure geometry, no core round-trip and no repaint nudge (see the
+            // variant docs) — the resize itself already repaints.
+            Message::WindowResized(width) => {
+                self.window_width = width;
+                Task::none()
+            }
+
+            // Show / hide the tab-overflow menu (#70). Pure shell chrome, like the
+            // About / find toggles — no core round-trip.
+            Message::ToggleTabsMenu => {
+                self.tabs_menu_open = !self.tabs_menu_open;
+                Task::none()
+            }
 
             // ---- Editor context menu (#97 item 3) ----
             // Track the pointer so a right-click can open the menu where the
@@ -1417,30 +1502,201 @@ impl Shell {
         self.core.active_doc().language().to_string()
     }
 
+    /// The segmented zoom control (`A− │ A │ A+`, #35) as one Chrome-style group:
+    /// three square-cornered [`theme::segment`] cells butting together inside a
+    /// single rounded, clipped [`theme::segment_group`] border. The middle cell
+    /// shows the current point size and resets it (Ctrl+0, #39) when clicked —
+    /// same messages the three toolbar buttons carried before, so behaviour is
+    /// unchanged and only the grouping is new.
+    fn zoom_group(&self, ui: iced::Font, t: theme::Tokens) -> Element<'_, Message> {
+        let seg = |label: String, msg: Message| {
+            button(text(label).font(ui))
+                .style(theme::segment(t))
+                .padding([4, 9])
+                .on_press(msg)
+        };
+        container(
+            row![
+                seg("A\u{2212}".to_owned(), Message::ZoomOut),
+                seg(format!("{} pt", self.core.font_size()), Message::ZoomReset),
+                seg("A+".to_owned(), Message::ZoomIn),
+            ]
+            .spacing(0),
+        )
+        .style(theme::segment_group(t))
+        .clip(true)
+        .into()
+    }
+
+    /// One tab (#70): the 2px accent strip stacked over the body that carries the
+    /// select button and the `×` close. Each tab is one visual unit — two buttons
+    /// styled to read as a single tab (iced won't let a `button` nest an
+    /// interactive child, so this is how the filename and its close stay together).
+    /// The active tab is filled with `tab_active_bg`, which equals `app_bg`, so it
+    /// folds into the editor rendered directly below; the strip on top is the
+    /// Chrome cue. Pinned to `Shrink` width: `column!`/`push` widen a column to
+    /// *enclose* its children, so the `Fill` accent strip would otherwise promote
+    /// the whole tab to `Fill` — making every tab stretch to an equal share of the
+    /// window (and squeezing the `×` off narrow tabs). Back at `Shrink`, tabs size
+    /// to `label + ×` and pack left, while the strip still spans each tab's width
+    /// via the flex cross-axis pass.
+    fn tab_widget(
+        &self,
+        i: usize,
+        name: String,
+        active: bool,
+        ui: iced::Font,
+        t: theme::Tokens,
+    ) -> Element<'_, Message> {
+        let fg = if active { t.tab_active_fg } else { t.tab_fg };
+        let strip = container(Space::new())
+            .width(Fill)
+            .height(Length::Fixed(2.0))
+            .style(theme::tab_top(active, t));
+        let body = container(
+            row![
+                button(text(name).font(ui))
+                    .style(theme::tab_label(fg))
+                    .on_press(Message::TabSelected(i)),
+                button(text("\u{00d7}").font(ui))
+                    .style(theme::tab_close(t))
+                    .on_press(Message::TabClosed(i)),
+            ]
+            .spacing(2)
+            .align_y(iced::Alignment::Center)
+            .padding([5, 10]),
+        )
+        .style(theme::tab_body(active, t));
+        column![strip, body].width(Length::Shrink).into()
+    }
+
+    /// Each tab's display name plus the split into `(names, inline, overflow)`
+    /// index lists (#70). `view` can't measure text, so the widths are estimated
+    /// from iced's default ~16px chrome text; the constants cover the body padding,
+    /// both buttons' own padding, the `×`, and the row spacing, and are generous on
+    /// purpose so the overflow control appears *before* a tab would clip. Shared by
+    /// [`Shell::tab_strip`] and [`Shell::tabs_overflow_menu`] so both agree on which
+    /// tabs are collapsed.
+    fn tab_split(&self) -> (Vec<String>, Vec<usize>, Vec<usize>) {
+        let names: Vec<String> = self
+            .core
+            .docs
+            .iter()
+            .map(|doc| {
+                if doc.dirty() {
+                    format!("{} \u{2022}", doc.title())
+                } else {
+                    doc.title().to_string()
+                }
+            })
+            .collect();
+        const GLYPH_W: f32 = 9.0;
+        const TAB_CHROME_W: f32 = 70.0;
+        // Reserved for the `▾ N more` control at the right end of the strip.
+        const OVERFLOW_W: f32 = 130.0;
+        let widths: Vec<f32> = names
+            .iter()
+            .map(|s| s.chars().count() as f32 * GLYPH_W + TAB_CHROME_W)
+            .collect();
+        let (visible, overflow) =
+            split_tabs_for_width(&widths, self.window_width, OVERFLOW_W, self.core.active);
+        (names, visible, overflow)
+    }
+
+    /// The Chrome-style tab strip (#70): content-sized tabs packed from the left,
+    /// with any that overflow the strip width collapsed behind a `▾ N more` button
+    /// (rather than a scrollbar) that toggles [`Shell::tabs_overflow_menu`]. The
+    /// active tab is always kept inline so it stays visible. The bar spans the full
+    /// width in `tabs_bg`, which the active tab (`app_bg`) sits proud of.
+    fn tab_strip(&self, ui: iced::Font, t: theme::Tokens) -> Element<'_, Message> {
+        let active = self.core.active;
+        let (names, visible, overflow) = self.tab_split();
+        let mut tabs = row![].spacing(0);
+        for &i in &visible {
+            tabs = tabs.push(self.tab_widget(i, names[i].clone(), i == active, ui, t));
+        }
+        if !overflow.is_empty() {
+            // Accent "on" look while the menu is open, matching the toolbar toggles.
+            tabs = tabs.push(
+                button(text(format!("\u{25be} {} more", overflow.len())).font(ui))
+                    .style(theme::toggle(t, self.tabs_menu_open))
+                    .padding([6, 10])
+                    .on_press(Message::ToggleTabsMenu),
+            );
+        }
+        container(tabs)
+            .width(Fill)
+            .style(theme::bar(t.tabs_bg))
+            .into()
+    }
+
+    /// The tab-overflow menu (#70): a card listing every tab collapsed off the
+    /// strip — each a select button plus its `×` close. Floated over the editor's
+    /// top-right (see `view`), so it drops from under the `▾ N more` button and
+    /// covers the editor body rather than displacing it. It sizes to a fixed,
+    /// readable width and clips over-long names. Returns an empty element when
+    /// nothing has overflowed, so a stale open flag (e.g. after the window was
+    /// widened) renders nothing.
+    fn tabs_overflow_menu(&self, ui: iced::Font, t: theme::Tokens) -> Element<'_, Message> {
+        let (names, _visible, overflow) = self.tab_split();
+        if overflow.is_empty() {
+            return Space::new().into();
+        }
+        let mut list = column![].spacing(2);
+        for &i in &overflow {
+            list = list.push(
+                row![
+                    button(text(names[i].clone()).font(ui))
+                        .style(theme::ghost(t))
+                        .width(Fill)
+                        .on_press(Message::TabSelected(i)),
+                    button(text("\u{00d7}").font(ui))
+                        .style(theme::tab_close(t))
+                        .on_press(Message::TabClosed(i)),
+                ]
+                .spacing(4)
+                .align_y(iced::Alignment::Center),
+            );
+        }
+        // Cap the card height and scroll the list inside it, so a long overflow
+        // list can't push the editor off-screen. A scroll *within the menu* is
+        // fine — it's the tab strip itself that must not scroll. `ROW_H` is a
+        // per-row height estimate; the cap is what actually bounds the card.
+        const ROW_H: f32 = 34.0;
+        const MAX_H: f32 = 360.0;
+        let list_h = (overflow.len() as f32 * ROW_H).min(MAX_H);
+        let card = container(scrollable(list).height(Length::Fixed(list_h)))
+            .padding(6)
+            .width(Length::Fixed(260.0))
+            .clip(true)
+            .style(theme::card(t));
+        // Fill the editor area and pin the card to the top-right, a few px in from
+        // the corner, so it floats from under the `▾ N more` button. The fill area
+        // is transparent and non-interactive, so off-card clicks fall through to
+        // the dismiss backdrop below it in the stack.
+        container(card)
+            .width(Fill)
+            .height(Fill)
+            .align_x(iced::alignment::Horizontal::Right)
+            .align_y(iced::alignment::Vertical::Top)
+            .padding(iced::Padding {
+                top: 4.0,
+                right: 8.0,
+                bottom: 0.0,
+                left: 0.0,
+            })
+            .into()
+    }
+
     fn view(&self) -> Element<'_, Message> {
-        let find_style = if self.core.find.open {
-            button::primary
-        } else {
-            button::secondary
-        };
-        // The Wrap button reads as "pressed" (primary) while wrapping is on (#34).
-        let wrap_style = if self.core.word_wrap() {
-            button::primary
-        } else {
-            button::secondary
-        };
-        // The line-number button reads as "pressed" while the gutter is on (#41).
-        let nums_style = if self.core.show_line_numbers() {
-            button::primary
-        } else {
-            button::secondary
-        };
-        // The About button reads as "pressed" while the panel is showing (#40).
-        let about_style = if self.core.about_open() {
-            button::primary
-        } else {
-            button::secondary
-        };
+        // The UI-chrome font (#61), resolved from the persisted preference and
+        // applied to every chrome widget below so the UI-font picker takes effect
+        // *live* (iced has no app-wide runtime default font — each widget must
+        // carry it). `Font` is `Copy`, so `ui` is threaded by value.
+        let ui = self.ui_font();
+        // Every chrome colour comes from the active theme's tokens (#70); `Tokens`
+        // is `Copy`, so `t` threads into each `.style()` closure by value.
+        let t = self.tokens();
         // Theme toggle (#36): the label names the theme you'll switch *to*, like
         // the WebView build's button — clearer than a lit on/off state (which
         // read as if "Dark" labelled the current mode). The moon/sun glyphs are
@@ -1451,67 +1707,61 @@ impl Shell {
         } else {
             "\u{263E} Dark" // ☾ — click to switch to dark
         };
-        // The UI-chrome font (#61), resolved from the persisted preference and
-        // applied to every chrome widget below so the UI-font picker takes effect
-        // *live* (iced has no app-wide runtime default font — each widget must
-        // carry it). `Font` is `Copy`, so `ui` is threaded by value.
-        let ui = self.ui_font();
-        // A toolbar/label button whose text renders in the UI font.
-        let tbtn = |label: &'static str| button(text(label).font(ui));
-        let toolbar = row![
-            tbtn("New").on_press(Message::NewTab),
-            tbtn("Open").on_press(Message::Open),
-            tbtn("Save").on_press(Message::Save),
-            tbtn("Save As").on_press(Message::SaveAs),
-            tbtn("Undo").on_press(Message::Undo),
-            tbtn("Redo").on_press(Message::Redo),
-            tbtn("Find").style(find_style).on_press(Message::ToggleFind),
-            // Zoom group (#35): shrink / reset / enlarge. The middle button shows
-            // the current point size and resets it when clicked (Ctrl+0 in #39).
-            tbtn("A\u{2212}").on_press(Message::ZoomOut),
-            button(text(format!("{} pt", self.core.font_size())).font(ui))
-                .on_press(Message::ZoomReset),
-            tbtn("A+").on_press(Message::ZoomIn),
-            // Word wrap toggle (#34): lit while wrapping is on.
-            tbtn("Wrap")
-                .style(wrap_style)
-                .on_press(Message::ToggleWordWrap),
-            // Line-number gutter toggle (#41): lit while the gutter is shown.
-            tbtn("#")
-                .style(nums_style)
-                .on_press(Message::ToggleLineNumbers),
-            // About panel toggle (#40): lit while the panel is showing.
-            tbtn("About")
-                .style(about_style)
-                .on_press(Message::ToggleAbout),
-            // Theme toggle (#36): a plain action button whose label names the
-            // theme you'll switch *to* (☾ Dark / ☀ Light), matching the WebView
-            // build. Secondary style so it sits as a utility next to the toggles.
-            button(text(theme_label).font(ui))
-                .style(button::secondary)
-                .on_press(Message::ToggleTheme),
-        ]
-        .spacing(6);
+        // Solid file-action buttons (New/Open/Save) vs. ghost utility buttons —
+        // Tauri's `.btn` / `.btn-ghost`. The toggles below swap to the accent
+        // "on" look (`theme::accent`) while their feature is active.
+        let tb = |label: &'static str| button(text(label).font(ui)).style(theme::btn(t));
+        let gh = |label: &'static str| button(text(label).font(ui)).style(theme::ghost(t));
+        // A thin vertical divider between toolbar groups — Tauri's `.sep`.
+        let sep = || {
+            container(Space::new())
+                .width(Length::Fixed(1.0))
+                .height(Length::Fixed(20.0))
+                .style(theme::bar(t.divider))
+        };
+        let toolbar = container(
+            row![
+                tb("New").on_press(Message::NewTab),
+                tb("Open").on_press(Message::Open),
+                tb("Save").on_press(Message::Save),
+                gh("Save As").on_press(Message::SaveAs),
+                sep(),
+                tb("Undo").on_press(Message::Undo),
+                tb("Redo").on_press(Message::Redo),
+                // Find toggle (#33): accent "on" while the find bar is open.
+                button(text("Find").font(ui))
+                    .style(theme::toggle(t, self.core.find.open))
+                    .on_press(Message::ToggleFind),
+                // Push the View group to the right — iced has no flex spacer, so a
+                // fill-width `Space` absorbs the slack (Tauri's `.toolbar-spacer`).
+                Space::new().width(Fill),
+                // Zoom group (#35): shrink / reset-to-size / enlarge, as one control.
+                self.zoom_group(ui, t),
+                // Word wrap toggle (#34): accent "on" while wrapping.
+                button(text("Wrap").font(ui))
+                    .style(theme::toggle(t, self.core.word_wrap()))
+                    .on_press(Message::ToggleWordWrap),
+                // Line-number gutter toggle (#41): accent "on" while the gutter shows.
+                button(text("#").font(ui))
+                    .style(theme::toggle(t, self.core.show_line_numbers()))
+                    .on_press(Message::ToggleLineNumbers),
+                // Theme toggle (#36): a plain ghost action whose label names the
+                // theme you'll switch *to* (☾ Dark / ☀ Light), matching the WebView.
+                gh(theme_label).on_press(Message::ToggleTheme),
+                // About panel toggle (#40): accent "on" while the panel shows.
+                button(text("About").font(ui))
+                    .style(theme::toggle(t, self.core.about_open()))
+                    .on_press(Message::ToggleAbout),
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center)
+            .padding([6, 8])
+            .width(Fill),
+        )
+        .style(theme::bar(t.toolbar_bg))
+        .width(Fill);
 
-        let mut tabs = row![].spacing(4);
-        for (i, doc) in self.core.docs.iter().enumerate() {
-            let label = if doc.dirty() {
-                format!("{} \u{2022}", doc.title())
-            } else {
-                doc.title().to_string()
-            };
-            let style = if i == self.core.active {
-                button::primary
-            } else {
-                button::secondary
-            };
-            tabs = tabs.push(
-                button(text(label).font(ui))
-                    .style(style)
-                    .on_press(Message::TabSelected(i)),
-            );
-            tabs = tabs.push(button(text("\u{00d7}").font(ui)).on_press(Message::TabClosed(i)));
-        }
+        let tabs = self.tab_strip(ui, t);
 
         let editor = text_editor(self.active_editor())
             .on_action(Message::Edit)
@@ -1544,6 +1794,23 @@ impl Shell {
                 },
                 highlight::to_format,
             )
+            // Editor surface (#70): painted in the token palette so it matches the
+            // chrome. Deliberately borderless — the active tab is `app_bg` too, so
+            // a border along the editor's top edge would draw a line between the
+            // tab and the editor and break the Chrome-style fold. Syntax
+            // highlighting still overrides `value` per span; the gutter and
+            // active-line tint come from the custom `iced::Theme` for free.
+            .style(move |_theme, _status| text_editor::Style {
+                background: iced::Background::Color(t.app_bg),
+                border: iced::Border {
+                    color: iced::Color::TRANSPARENT,
+                    width: 0.0,
+                    radius: 0.0.into(),
+                },
+                placeholder: t.text_muted,
+                value: t.text,
+                selection: t.accent,
+            })
             .height(Fill);
 
         // Right-click the editor for a minimal cut/copy/paste/select-all menu
@@ -1569,6 +1836,24 @@ impl Shell {
             // the cursor is (`update` skips the repaint nudge for this).
             None => editor.on_move(Message::EditorCursorMoved).into(),
         };
+        // Float the tab-overflow menu over the editor's top-right while open (#70).
+        // The editor's top edge sits directly under the tab strip, so its top-right
+        // corner is right below the `▾ N more` button — floating here needs no
+        // absolute offset. A full-area transparent backdrop dismisses on any
+        // off-menu click (toggling the flag back off), like the context menu.
+        let (_, _, overflow) = self.tab_split();
+        let editor: Element<'_, Message> = if self.tabs_menu_open && !overflow.is_empty() {
+            stack![
+                editor,
+                mouse_area(container(text("")).width(Fill).height(Fill))
+                    .on_press(Message::ToggleTabsMenu)
+                    .on_right_press(Message::ToggleTabsMenu),
+                self.tabs_overflow_menu(ui, t),
+            ]
+            .into()
+        } else {
+            editor
+        };
 
         let status: Element<'_, Message> = match &self.error {
             // A read/save error takes the status row, but with a `×` to dismiss it
@@ -1576,15 +1861,18 @@ impl Shell {
             // happens to succeed. Editing clears it too (see the `Edit` handler).
             Some(e) => row![
                 text(format!("Error: {e}")).font(ui),
-                button(text("\u{00d7}").font(ui)).on_press(Message::DismissError),
+                Space::new().width(Fill),
+                button(text("\u{00d7}").font(ui))
+                    .style(theme::ghost(t))
+                    .on_press(Message::DismissError),
             ]
             .spacing(16)
             .align_y(iced::Alignment::Center)
             .into(),
             None => {
                 let s = self.status();
-                // Caret position first, then a selection count only when there
-                // is one, then document size, language, EOL and encoding.
+                // Left group: caret position first, then a selection count only
+                // when there is one, then document size.
                 //
                 // The "Sel n" readout is deliberately a single selection shown
                 // only when non-zero (#97 item 8): the WebView build summed every
@@ -1592,36 +1880,47 @@ impl Shell {
                 // one selection, and hiding the cell at 0 keeps the row quiet when
                 // nothing is picked. `core::status` guarantees `selection == 0` for
                 // an empty selection, which is exactly what this `> 0` gate relies on.
-                let mut cells =
+                let mut left =
                     row![text(format!("Ln {}, Col {}", s.line, s.column)).font(ui)].spacing(16);
                 if s.selection > 0 {
-                    cells = cells.push(text(format!("Sel {}", s.selection)).font(ui));
+                    left = left.push(text(format!("Sel {}", s.selection)).font(ui));
                 }
-                // Encoding is two controls, not plain text (#50). The first shows
-                // the active document's encoding and *converts* to whatever the
-                // user picks (re-encode on the next Save, lossy saves blocked); its
-                // current label is the selection even for an exotic auto-detected
-                // encoding outside the list, so the readout never goes blank. The
-                // second is a "Reopen as…" action that re-reads the file and
-                // strictly re-decodes it (recovering a wrong auto-detect) — it holds
-                // no selection, so it stays an action rather than a state readout.
-                cells
+                left = left
                     .push(text(format!("{} chars", s.chars)).font(ui))
-                    .push(text(format!("{} lines", s.lines)).font(ui))
-                    .push(text(s.language).font(ui))
-                    .push(text(s.eol).font(ui))
-                    .push(
-                        pick_list(encoding_options(), Some(s.encoding), Message::SetEncoding)
-                            .font(ui)
-                            .text_size(14),
-                    )
-                    .push(
-                        pick_list(encoding_options(), None::<String>, Message::ReopenAs)
-                            .placeholder("Reopen as…")
-                            .font(ui)
-                            .text_size(14),
-                    )
-                    .into()
+                    .push(text(format!("{} lines", s.lines)).font(ui));
+                // Right group: the language as a Mode pill (Tauri's `.status-pill`),
+                // the EOL, then the two encoding controls (#50). The first shows the
+                // active document's encoding and *converts* to whatever the user
+                // picks (re-encode on the next Save, lossy saves blocked); its label
+                // is the selection even for an exotic auto-detected encoding outside
+                // the list, so the readout never goes blank. The second is a "Reopen
+                // as…" action that re-reads the file and strictly re-decodes it
+                // (recovering a wrong auto-detect) — it holds no selection, so it
+                // stays an action rather than a state readout.
+                let mode = container(text(s.language).font(ui).size(11))
+                    .padding([1, 9])
+                    .style(theme::pill(t));
+                row![
+                    left,
+                    // Push the right group to the far edge (Tauri's status spacer).
+                    Space::new().width(Fill),
+                    mode,
+                    text(s.eol).font(ui),
+                    pick_list(encoding_options(), Some(s.encoding), Message::SetEncoding)
+                        .style(theme::picker(t))
+                        .menu_style(theme::picker_menu(t))
+                        .font(ui)
+                        .text_size(14),
+                    pick_list(encoding_options(), None::<String>, Message::ReopenAs)
+                        .placeholder("Reopen as…")
+                        .style(theme::picker(t))
+                        .menu_style(theme::picker_menu(t))
+                        .font(ui)
+                        .text_size(14),
+                ]
+                .spacing(16)
+                .align_y(iced::Alignment::Center)
+                .into()
             }
         };
 
@@ -1636,48 +1935,72 @@ impl Shell {
         // in the list to clear an override. Every value `language()` can return is
         // present in `language_options()`, so the selection always resolves.
         let language_selection = self.language_picker_selection();
-        let font_row = row![
-            text("Editor font:").font(ui),
-            pick_list(
-                families,
-                Some(self.core.editor_font().to_string()),
-                Message::SetEditorFont,
-            )
-            .font(ui)
-            .text_size(14),
-            text("UI font:").font(ui),
-            pick_list(
-                families,
-                Some(self.core.ui_font().to_string()),
-                Message::SetUiFont,
-            )
-            .font(ui)
-            .text_size(14),
-            text("Language:").font(ui),
-            pick_list(
-                language_options(),
-                Some(language_selection),
-                Message::SetLanguage,
-            )
-            .font(ui)
-            .text_size(14),
-        ]
-        .spacing(6)
-        .align_y(iced::Alignment::Center);
+        // Secondary controls bar (#70): the editor-font, UI-font and language
+        // pickers live on their own `toolbar_bg` bar placed *above* the tab strip,
+        // so the tabs sit directly on top of the editor and the active tab can
+        // fold into it (Phase C). Each picker is styled to match the chrome
+        // (`theme::picker`) and opens a matching menu (`theme::picker_menu`).
+        let controls = container(
+            row![
+                text("Editor font:").font(ui),
+                pick_list(
+                    families,
+                    Some(self.core.editor_font().to_string()),
+                    Message::SetEditorFont,
+                )
+                .style(theme::picker(t))
+                .menu_style(theme::picker_menu(t))
+                .font(ui)
+                .text_size(14),
+                text("UI font:").font(ui),
+                pick_list(
+                    families,
+                    Some(self.core.ui_font().to_string()),
+                    Message::SetUiFont,
+                )
+                .style(theme::picker(t))
+                .menu_style(theme::picker_menu(t))
+                .font(ui)
+                .text_size(14),
+                text("Language:").font(ui),
+                pick_list(
+                    language_options(),
+                    Some(language_selection),
+                    Message::SetLanguage,
+                )
+                .style(theme::picker(t))
+                .menu_style(theme::picker_menu(t))
+                .font(ui)
+                .text_size(14),
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center)
+            .padding([4, 8])
+            .width(Fill),
+        )
+        .style(theme::bar(t.toolbar_bg))
+        .width(Fill);
 
-        // The root column must fill the window on both axes. Left at its default
-        // `Shrink`, iced's flex layout hands the editor a wrap width equal to the
-        // widest non-fill sibling (the toolbar) instead of the window width, so
-        // `Wrapping::Word` never has a real boundary to wrap against and long
+        // Docked chrome (#70): no outer padding and no inter-row spacing, so the
+        // toolbar and controls bars span edge-to-edge and stack flush, and the tab
+        // strip sits directly on top of the editor — the adjacency the Chrome-style
+        // active-tab fold relies on (Phase C). The controls bar goes *above* the
+        // tabs for the same reason.
+        //
+        // The root column must still fill the window on both axes. Left at its
+        // default `Shrink`, iced's flex layout hands the editor a wrap width equal
+        // to the widest non-fill sibling (the toolbar) instead of the window width,
+        // so `Wrapping::Word` never has a real boundary to wrap against and long
         // lines overflow with no way to scroll (#34).
-        let mut layout = column![toolbar, tabs, font_row]
-            .spacing(8)
-            .padding(10)
+        // A 1px separator under the chrome — Tauri's toolbar `border-bottom` —
+        // dividing the toolbar / controls block from the tab strip below (#70).
+        let chrome_sep = container(Space::new())
+            .width(Fill)
+            .height(Length::Fixed(1.0))
+            .style(theme::bar(t.toolbar_border));
+        let mut layout = column![toolbar, controls, chrome_sep, tabs]
             .width(Fill)
             .height(Fill);
-        if self.core.about_open() {
-            layout = layout.push(self.about_panel());
-        }
         if self.confirm_close.is_some() {
             layout = layout.push(self.confirm_bar());
         }
@@ -1687,13 +2010,40 @@ impl Shell {
         if self.core.find.open {
             layout = layout.push(self.find_bar());
         }
-        let content = layout.push(editor).push(container(status));
+        let content = layout.push(editor).push(
+            container(status)
+                .width(Fill)
+                .padding([4, 12])
+                .style(theme::status_bar(t)),
+        );
+
+        // About modal (#40): centered over the whole window behind a dimming
+        // backdrop that dismisses on an off-card click. Floated (not pushed into
+        // the column) so it overlays the editor instead of displacing it.
+        let content: Element<'_, Message> = if self.core.about_open() {
+            stack![
+                content,
+                mouse_area(
+                    container(Space::new())
+                        .width(Fill)
+                        .height(Fill)
+                        .style(theme::bar(t.overlay)),
+                )
+                .on_press(Message::CloseAbout)
+                .on_right_press(Message::CloseAbout),
+                self.about_panel(),
+            ]
+            .into()
+        } else {
+            content.into()
+        };
+
         // While a file drags over the window, float the "drop to open" overlay on
         // top of everything (#42); otherwise the plain layout.
         if self.drag_hover {
-            stack![content, Self::drop_overlay(ui)].into()
+            stack![content, Self::drop_overlay(ui, t)].into()
         } else {
-            content.into()
+            content
         }
     }
 
@@ -1707,32 +2057,35 @@ impl Shell {
         };
         let id = pending.id;
         let ui = self.ui_font();
+        let t = self.tokens();
         let prompt = format!("\u{201c}{}\u{201d} has unsaved changes.", pending.title);
         container(
             row![
                 text(prompt).font(ui),
                 button(text("Save").font(ui))
-                    .style(button::primary)
+                    .style(theme::accent(t))
                     .on_press(Message::CloseChoiceMade {
                         id,
                         choice: CloseChoice::Save,
                     }),
                 button(text("Don\u{2019}t Save").font(ui))
-                    .style(button::danger)
+                    .style(theme::danger(t))
                     .on_press(Message::CloseChoiceMade {
                         id,
                         choice: CloseChoice::Discard,
                     }),
                 button(text("Cancel").font(ui))
-                    .style(button::secondary)
+                    .style(theme::ghost(t))
                     .on_press(Message::CloseChoiceMade {
                         id,
                         choice: CloseChoice::Cancel,
                     }),
             ]
-            .spacing(8),
+            .spacing(8)
+            .align_y(iced::Alignment::Center),
         )
-        .padding(6)
+        .padding(10)
+        .style(theme::card(t))
         .into()
     }
 
@@ -1747,24 +2100,27 @@ impl Shell {
             return row![].into(); // never rendered unless set; empty as a guard
         };
         let ui = self.ui_font();
+        let t = self.tokens();
         let noun = if dirty == 1 { "document" } else { "documents" };
         let prompt = format!("{dirty} unsaved {noun}.");
         container(
             row![
                 text(prompt).font(ui),
                 button(text("Save all").font(ui))
-                    .style(button::primary)
+                    .style(theme::accent(t))
                     .on_press(Message::QuitChoiceMade(QuitChoice::SaveAll)),
                 button(text("Discard all").font(ui))
-                    .style(button::danger)
+                    .style(theme::danger(t))
                     .on_press(Message::QuitChoiceMade(QuitChoice::DiscardAll)),
                 button(text("Cancel").font(ui))
-                    .style(button::secondary)
+                    .style(theme::ghost(t))
                     .on_press(Message::QuitChoiceMade(QuitChoice::Cancel)),
             ]
-            .spacing(8),
+            .spacing(8)
+            .align_y(iced::Alignment::Center),
         )
-        .padding(6)
+        .padding(10)
+        .style(theme::card(t))
         .into()
     }
 
@@ -1773,24 +2129,21 @@ impl Shell {
     /// a "Drop files to open" card, mirroring the WebView build's drop overlay so
     /// the user sees a drop will land. Purely visual — it captures no input and
     /// disappears the instant the drag drops or leaves.
-    fn drop_overlay<'a>(font: iced::Font) -> Element<'a, Message> {
+    fn drop_overlay<'a>(font: iced::Font, t: theme::Tokens) -> Element<'a, Message> {
         let card = container(text("Drop files to open").font(font).size(22))
             .padding([16, 28])
-            .style(|theme: &iced::Theme| {
-                let palette = theme.extended_palette();
-                container::Style {
-                    text_color: Some(palette.primary.strong.text),
-                    background: Some(palette.primary.strong.color.into()),
-                    border: iced::border::rounded(8),
-                    ..container::Style::default()
-                }
+            .style(move |_theme: &iced::Theme| container::Style {
+                text_color: Some(t.accent_fg),
+                background: Some(t.accent.into()),
+                border: iced::border::rounded(8),
+                ..container::Style::default()
             });
         container(card)
             .center(Fill)
             .width(Fill)
             .height(Fill)
-            .style(|_theme| container::Style {
-                background: Some(iced::Color::from_rgba(0.0, 0.0, 0.0, 0.45).into()),
+            .style(move |_theme| container::Style {
+                background: Some(t.overlay.into()),
                 ..container::Style::default()
             })
             .into()
@@ -1803,9 +2156,10 @@ impl Shell {
     /// top-left with padding rather than absolute coordinates, since a `stack`
     /// simply lays each layer at its own origin.
     fn context_menu_card(&self, ui: iced::Font, anchor: Point) -> Element<'_, Message> {
+        let t = self.tokens();
         let item = |label: &'static str, msg: Message| {
             button(text(label).font(ui))
-                .style(button::secondary)
+                .style(theme::ghost(t))
                 .width(Fill)
                 .on_press(msg)
         };
@@ -1820,18 +2174,7 @@ impl Shell {
         )
         .padding(4)
         .width(Length::Fixed(160.0))
-        .style(|theme: &iced::Theme| {
-            let palette = theme.extended_palette();
-            container::Style {
-                background: Some(palette.background.weak.color.into()),
-                border: iced::Border {
-                    color: palette.background.strong.color,
-                    width: 1.0,
-                    radius: 6.0.into(),
-                },
-                ..container::Style::default()
-            }
-        });
+        .style(theme::card(t));
         // Push the card to the cursor with left/top padding. `on_move` reports a
         // position within the editor bounds, so the offset is non-negative; a
         // right-click very near an edge can run the card past it, which is fine
@@ -1860,31 +2203,35 @@ impl Shell {
     /// testable.
     fn about_panel(&self) -> Element<'_, Message> {
         let ui = self.ui_font();
+        let t = self.tokens();
         let heading = format!("{APP_NAME} {}", env!("NOTEPAD_EXTRA_VERSION"));
-        container(
+        let card = container(
             column![
                 text(heading).font(ui).size(20),
                 text(LICENSE).font(ui),
                 row![
                     button(text("Homepage").font(ui))
-                        .style(button::secondary)
+                        .style(theme::ghost(t))
                         .on_press(Message::OpenLink(HOMEPAGE_URL.to_string())),
                     button(text("License").font(ui))
-                        .style(button::secondary)
+                        .style(theme::ghost(t))
                         .on_press(Message::OpenLink(LICENSE_URL.to_string())),
                     button(text("Report an issue").font(ui))
-                        .style(button::secondary)
+                        .style(theme::ghost(t))
                         .on_press(Message::OpenLink(ISSUES_URL.to_string())),
                     button(text("Close").font(ui))
-                        .style(button::primary)
+                        .style(theme::accent(t))
                         .on_press(Message::CloseAbout),
                 ]
                 .spacing(8),
             ]
             .spacing(8),
         )
-        .padding(10)
-        .into()
+        .padding(16)
+        .style(theme::card(t));
+        // Centre the card in the window; `view` floats this over a dimming backdrop
+        // that dismisses on an off-card click (#40), so it reads as a modal dialog.
+        container(card).center(Fill).into()
     }
 
     /// The find / replace / go-to bar, shown only while `find.open`. All state
@@ -1893,6 +2240,7 @@ impl Shell {
     fn find_bar(&self) -> Element<'_, Message> {
         let find = &self.core.find;
         let ui = self.ui_font();
+        let t = self.tokens();
 
         let readout = if let Some(err) = &find.error {
             format!("\u{26a0} {err}")
@@ -1909,63 +2257,128 @@ impl Shell {
         let find_row = row![
             text_input("Find", &find.query)
                 .font(ui)
+                .style(theme::input(t))
                 .on_input(Message::FindQueryChanged)
                 .on_submit(Message::FindNext)
                 .width(Length::Fixed(220.0)),
-            button(text("Prev").font(ui)).on_press(Message::FindPrev),
-            button(text("Next").font(ui)).on_press(Message::FindNext),
+            button(text("Prev").font(ui))
+                .style(theme::btn(t))
+                .on_press(Message::FindPrev),
+            button(text("Next").font(ui))
+                .style(theme::btn(t))
+                .on_press(Message::FindNext),
             option_button(
                 "Aa",
                 find.options.case_sensitive,
                 FindOption::CaseSensitive,
-                ui
+                ui,
+                t,
             ),
-            option_button("W", find.options.whole_word, FindOption::WholeWord, ui),
-            option_button(".*", find.options.regex, FindOption::Regex, ui),
+            option_button("W", find.options.whole_word, FindOption::WholeWord, ui, t),
+            option_button(".*", find.options.regex, FindOption::Regex, ui, t),
             text(readout).font(ui),
-            button(text("\u{00d7}").font(ui)).on_press(Message::CloseFind),
+            button(text("\u{00d7}").font(ui))
+                .style(theme::ghost(t))
+                .on_press(Message::CloseFind),
         ]
-        .spacing(6);
+        .spacing(6)
+        .align_y(iced::Alignment::Center);
 
         let replace_row = row![
             text_input("Replace with", &find.replacement)
                 .font(ui)
+                .style(theme::input(t))
                 .on_input(Message::ReplaceQueryChanged)
                 .on_submit(Message::ReplaceOne)
                 .width(Length::Fixed(220.0)),
-            button(text("Replace").font(ui)).on_press(Message::ReplaceOne),
-            button(text("All").font(ui)).on_press(Message::ReplaceAll),
+            button(text("Replace").font(ui))
+                .style(theme::btn(t))
+                .on_press(Message::ReplaceOne),
+            button(text("All").font(ui))
+                .style(theme::btn(t))
+                .on_press(Message::ReplaceAll),
             text("Go to line:").font(ui),
             text_input("n", &self.goto_input)
                 .font(ui)
+                .style(theme::input(t))
                 .on_input(Message::GoToInputChanged)
                 .on_submit(Message::GoToSubmit)
                 .width(Length::Fixed(70.0)),
-            button(text("Go").font(ui)).on_press(Message::GoToSubmit),
+            button(text("Go").font(ui))
+                .style(theme::btn(t))
+                .on_press(Message::GoToSubmit),
         ]
-        .spacing(6);
+        .spacing(6)
+        .align_y(iced::Alignment::Center);
 
-        container(column![find_row, replace_row].spacing(6))
-            .padding(6)
-            .into()
+        // Show the find bar on the right (#70): wrap the card in a full-width
+        // container that right-aligns it, a few px in from the edge. Still pushed
+        // into the layout rather than floated — the behaviour to keep — just
+        // anchored right instead of left.
+        container(
+            container(column![find_row, replace_row].spacing(6))
+                .padding(10)
+                .style(theme::card(t)),
+        )
+        .width(Fill)
+        .align_x(iced::alignment::Horizontal::Right)
+        .padding([0, 8])
+        .into()
     }
 }
 
-/// A search-option toggle button, highlighted (primary) while the option is on.
-/// Takes the UI font (#61) so it matches the rest of the chrome.
+/// Split tab indices into `(inline, overflow)` for the tab strip (#70). When the
+/// tabs all fit in `avail`, every one is inline and nothing overflows. Otherwise
+/// it greedily fills the strip from the left within `avail - reserve` (the
+/// `reserve` leaves room for the `▾` dropdown), then guarantees the `active` tab
+/// is inline — if `active` spilled into the overflow, the last inline tab is
+/// dropped to make room for it. Kept a pure fn (widths in, index lists out) so the
+/// overflow behaviour is unit-testable without a renderer or a real window.
+fn split_tabs_for_width(
+    widths: &[f32],
+    avail: f32,
+    reserve: f32,
+    active: usize,
+) -> (Vec<usize>, Vec<usize>) {
+    let n = widths.len();
+    let total: f32 = widths.iter().sum();
+    if total <= avail {
+        return ((0..n).collect(), Vec::new());
+    }
+    let budget = (avail - reserve).max(0.0);
+    let mut used = 0.0;
+    let mut visible: Vec<usize> = Vec::new();
+    for (i, &w) in widths.iter().enumerate() {
+        if used + w <= budget {
+            used += w;
+            visible.push(i);
+        } else {
+            break;
+        }
+    }
+    // Keep the active tab on screen: if it fell past the inline budget, evict the
+    // last inline tab and show the active one in its place.
+    if !visible.contains(&active) {
+        visible.pop();
+        visible.push(active);
+    }
+    let shown: HashSet<usize> = visible.iter().copied().collect();
+    let overflow: Vec<usize> = (0..n).filter(|i| !shown.contains(i)).collect();
+    (visible, overflow)
+}
+
+/// A search-option toggle button, showing the accent "on" look while the option
+/// is on and the ghost look otherwise (#70). Takes the UI font (#61) and the
+/// theme tokens so it matches the rest of the chrome.
 fn option_button<'a>(
     label: &'a str,
     active: bool,
     option: FindOption,
     font: iced::Font,
+    t: theme::Tokens,
 ) -> iced::widget::Button<'a, Message> {
-    let style = if active {
-        button::primary
-    } else {
-        button::secondary
-    };
     button(text(label).font(font))
-        .style(style)
+        .style(theme::toggle(t, active))
         .on_press(Message::ToggleOption(option))
 }
 
@@ -2454,6 +2867,37 @@ mod tests {
         assert_eq!(shell.core.docs.len(), 2);
         assert_eq!(shell.core.active, 1);
         assert_eq!(shell.active_editor().text().trim_end(), "");
+    }
+
+    // ---- Tab-strip overflow (#70) ----
+
+    #[test]
+    fn tab_overflow_splits_inline_vs_dropdown_and_keeps_active_visible() {
+        // Five equal 100px tabs in 250px of strip, reserving 40px for the `▾`
+        // dropdown → a 210px inline budget, so exactly two tabs fit.
+        let widths = [100.0_f32; 5];
+
+        // Active is already inline: the first two show, the last three collapse.
+        let (visible, overflow) = split_tabs_for_width(&widths, 250.0, 40.0, 0);
+        assert_eq!(visible, vec![0, 1], "two 100px tabs fit the 210px budget");
+        assert_eq!(
+            overflow,
+            vec![2, 3, 4],
+            "the rest collapse into the dropdown"
+        );
+
+        // Active spilled past the budget: it must be pulled inline, evicting the
+        // last inline tab (1) to make room — otherwise the active tab would be
+        // invisible, the bug this guards against.
+        let (visible, overflow) = split_tabs_for_width(&widths, 250.0, 40.0, 4);
+        assert!(visible.contains(&4), "the active tab is always kept inline");
+        assert_eq!(visible, vec![0, 4]);
+        assert_eq!(overflow, vec![1, 2, 3]);
+
+        // Everything fits: all inline, nothing in the dropdown.
+        let (visible, overflow) = split_tabs_for_width(&widths, 10_000.0, 40.0, 3);
+        assert_eq!(visible, vec![0, 1, 2, 3, 4]);
+        assert!(overflow.is_empty(), "no dropdown when the tabs all fit");
     }
 
     #[test]
@@ -3600,22 +4044,50 @@ mod tests {
     #[test]
     fn theme_toggle_flips_core_and_maps_to_iced_theme() {
         // The Dark button routes straight through to the core, like Wrap, and must
-        // not resync/clear the editor. Light by default; each toggle flips it and
-        // the shell's `iced::Theme` follows. The view builds in either theme.
+        // not resync/clear the editor. Light by default; each toggle flips it, and
+        // the shell's custom `iced::Theme` follows (#70): `theme()` rebuilds the
+        // palette from the *matching* token set, so light must carry the `LIGHT`
+        // tokens and dark the `DARK` ones. The view builds in either theme.
         let (mut shell, _) = Shell::new();
         let _ = shell.update(Message::Edit(paste("keep me")));
+
         assert_eq!(shell.core.theme(), core::ThemeMode::Light, "starts light");
-        assert_eq!(shell.theme(), iced::Theme::Light);
+        let light = shell.theme().palette();
+        assert_eq!(
+            light.background,
+            theme::LIGHT.app_bg,
+            "light bg is LIGHT.app_bg"
+        );
+        assert_eq!(light.text, theme::LIGHT.text, "light text is LIGHT.text");
+        assert_eq!(
+            light.primary,
+            theme::LIGHT.accent,
+            "light primary is LIGHT.accent"
+        );
         let _ = shell.view(); // the light view builds
 
         let _ = shell.update(Message::ToggleTheme);
         assert_eq!(shell.core.theme(), core::ThemeMode::Dark);
-        assert_eq!(shell.theme(), iced::Theme::Dark);
+        let dark = shell.theme().palette();
+        assert_eq!(
+            dark.background,
+            theme::DARK.app_bg,
+            "dark bg is DARK.app_bg"
+        );
+        assert_eq!(dark.text, theme::DARK.text, "dark text is DARK.text");
+        assert_eq!(
+            dark.primary,
+            theme::DARK.accent,
+            "dark primary is DARK.accent"
+        );
+        // The mapping actually depends on the mode — a stuck or swapped `tokens()`
+        // (light and dark yielding the same palette) fails right here.
+        assert_ne!(dark.background, light.background, "dark and light differ");
         let _ = shell.view(); // the dark view builds
 
         let _ = shell.update(Message::ToggleTheme);
         assert_eq!(shell.core.theme(), core::ThemeMode::Light);
-        assert_eq!(shell.theme(), iced::Theme::Light);
+        assert_eq!(shell.theme().palette().background, theme::LIGHT.app_bg);
 
         // The toggle left the live buffer and its dirty flag untouched.
         assert_eq!(shell.active_editor().text().trim_end(), "keep me");
@@ -4230,5 +4702,124 @@ mod tests {
         let path = config_path().expect("a config path in the test environment");
         assert_eq!(path.file_name().unwrap(), "preferences.json");
         assert_eq!(path.parent().unwrap().file_name().unwrap(), "notepad-extra");
+    }
+}
+
+/// Headless widget-tree interaction tests (#70) — the "Playwright equivalent" the
+/// issue's plan calls for. iced 0.14's [`Simulator`](iced_test::Simulator) builds
+/// the real `view` with the tiny-skia software renderer (no window, no GPU), finds
+/// widgets by their visible text, synthesises clicks / keystrokes, and returns the
+/// [`Message`]s they emit, which each test feeds back through [`Shell::update`] —
+/// exercising `view` end-to-end. Selectors match on widget *text*, so these run
+/// unchanged on Linux / macOS / Windows in CI (no fonts, no baselines).
+///
+/// Every test is written to **fail if the widget it names is broken**: a selector
+/// that no longer resolves errors the `click`/`find` (the `expect`s below), and a
+/// control wired to the wrong message — or to none — produces no state change, so
+/// the follow-up assertion fails. This is the same "a test must fail when the
+/// feature it names is broken" discipline the rest of the suite follows.
+#[cfg(test)]
+mod ui_tests {
+    use super::*;
+    use iced_test::simulator;
+
+    // NB: each test inlines the "drain the produced messages back through
+    // `update`" loop rather than calling a `drain(&mut shell, ui)` helper. `ui`
+    // borrows `shell` (via `shell.view()`), so passing `&mut shell` *and* the
+    // still-borrowing `ui` into one call would alias; `ui.into_messages()`
+    // consumes the simulator first, ending that borrow, and only then is `shell`
+    // free to be mutated.
+
+    #[test]
+    fn clicking_new_opens_a_second_tab() {
+        let (mut shell, _) = Shell::new();
+        assert_eq!(shell.core.docs.len(), 1, "starts with one tab");
+
+        let mut ui = simulator(shell.view());
+        ui.click("New").expect("the New toolbar button");
+        for message in ui.into_messages() {
+            let _ = shell.update(message);
+        }
+
+        assert_eq!(shell.core.docs.len(), 2, "New opened a second tab");
+    }
+
+    #[test]
+    fn clicking_the_in_tab_close_glyph_closes_a_clean_tab() {
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::NewTab); // two clean tabs
+        assert_eq!(shell.core.docs.len(), 2);
+
+        let mut ui = simulator(shell.view());
+        // The first `×` in the tree is the first tab's unified close button.
+        ui.click("\u{00d7}").expect("an in-tab close glyph");
+        for message in ui.into_messages() {
+            let _ = shell.update(message);
+        }
+
+        assert_eq!(shell.core.docs.len(), 1, "the close glyph closed a tab");
+    }
+
+    #[test]
+    fn find_button_reveals_the_find_bar() {
+        let (mut shell, _) = Shell::new();
+        assert!(!shell.core.find.open, "find starts closed");
+
+        let mut ui = simulator(shell.view());
+        ui.click("Find").expect("the Find toolbar button");
+        for message in ui.into_messages() {
+            let _ = shell.update(message);
+        }
+        assert!(shell.core.find.open, "Find opened the bar");
+
+        // Rebuild the tree: the find/replace bar's controls are now present.
+        let mut ui = simulator(shell.view());
+        assert!(
+            ui.find("Replace").is_ok(),
+            "the find/replace bar should be visible once open"
+        );
+    }
+
+    #[test]
+    fn clicking_about_opens_the_centred_modal() {
+        let (mut shell, _) = Shell::new();
+        assert!(!shell.core.about_open(), "about starts closed");
+
+        let mut ui = simulator(shell.view());
+        ui.click("About").expect("the About toolbar button");
+        for message in ui.into_messages() {
+            let _ = shell.update(message);
+        }
+        assert!(shell.core.about_open(), "About opened the panel");
+
+        // Rebuild the tree: the modal's link buttons are now present.
+        let mut ui = simulator(shell.view());
+        assert!(
+            ui.find("Homepage").is_ok(),
+            "the About modal should be visible once open"
+        );
+    }
+
+    #[test]
+    fn typing_in_the_editor_marks_the_document_dirty() {
+        let (mut shell, _) = Shell::new();
+        assert!(!shell.core.active_doc().dirty(), "starts clean");
+
+        let mut ui = simulator(shell.view());
+        // Focus the editor with a left click in its area — the toolbar / tabs sit
+        // above (~110px) and the status bar below (~740px) in the 1024×768 default,
+        // so (400, 400) lands in the editor. Its `mouse_area` wrapper sets no
+        // `on_press`, so the left click passes through and focuses the editor.
+        ui.point_at(Point::new(400.0, 400.0));
+        let _ = ui.simulate(simulator::click());
+        let _ = ui.typewrite("hello");
+        for message in ui.into_messages() {
+            let _ = shell.update(message);
+        }
+
+        assert!(
+            shell.core.active_doc().dirty(),
+            "typing into the editor marks the document dirty"
+        );
     }
 }

@@ -56,7 +56,7 @@ is never pulled into `cargo test`.
 ## Coverage gate
 
 ```sh
-scripts/coverage.sh              # fails under the gate (default 98%)
+scripts/coverage.sh              # fails under the gate (default 99%)
 COVERAGE_GATE=100 scripts/coverage.sh --html   # write an HTML report
 ```
 
@@ -72,9 +72,22 @@ tested **headlessly** (no window, no GPU) in `crates/iced` `mod tests`: driving
 buffer, e.g. typing marks the document dirty, switching tabs swaps the buffer, a
 failed read surfaces an error without touching the docs.
 
-The `view` needs a real renderer, so it is not unit-tested; instead the CI
-`shell` job launches the built binary under `xvfb` (software renderer) and treats
-a clean startup as success — proving the window actually comes up.
+`view` is exercised too, and still headlessly: `mod ui_tests` (#70) uses iced
+0.14's [`iced_test`] `Simulator`, which builds the **real widget tree** with the
+tiny-skia software renderer (no window, no GPU), finds widgets by their visible
+text, synthesises clicks / keystrokes, and returns the `Message`s they emit —
+which the tests feed back through `Shell::update`. Each is written to fail if its
+widget is missing or mis-wired: clicking **New** opens a second tab, the in-tab
+`×` closes a clean tab, **Find** reveals the find bar, **About** opens the modal,
+and typing marks the document dirty. Selectors match on text, so these run
+unchanged on all three CI OSes with no fonts and no GPU.
+
+The CI `shell` job additionally launches the built binary under `xvfb` (software
+renderer) and treats a clean startup as success — the complementary "the real
+window actually comes up" check that the headless Simulator, by design, does not
+make.
+
+[`iced_test`]: https://docs.rs/iced_test
 
 ## Definition of Done — coverage map
 
@@ -88,5 +101,6 @@ a clean startup as success — proving the window actually comes up.
 | Fuzz targets (`cargo-fuzz`) | `fuzz/fuzz_targets/*` |
 | CI coverage gate (~100% logic) | `native-ci.yml` → `scripts/coverage.sh` |
 | Render-shell wiring (headless) | `crates/iced` `mod tests` |
+| Render-shell `view` interaction (headless) | `crates/iced` `mod ui_tests` (`iced_test` Simulator) |
 | Windowed launch under `xvfb` | `native-ci.yml` → `shell` job smoke |
 | Packaged install/launch under `xvfb` | deferred — needs packaging (#43/#44) |

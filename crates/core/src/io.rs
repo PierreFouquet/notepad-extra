@@ -8,13 +8,30 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// Whether `url` is safe to hand to the OS URL handler for the About dialog's
-/// external links (#40). It must be an `https` URL with an actual host and no
-/// control characters or whitespace.
+/// external links (#40). It must be an `https` URL with an actual host, no
+/// userinfo, and no control characters or whitespace.
+///
+/// This is a deliberately conservative *shape* check, sufficient because every
+/// caller today feeds a compile-time constant (the About links). If a future
+/// feature ever opens URLs drawn from document content (e.g. clickable links in
+/// the editor), graduate this to a real URL parse with host validation / an
+/// allowlist before that lands — a shape check is not a substitute for parsing
+/// attacker-controlled input.
 pub fn is_safe_external_url(url: &str) -> bool {
     const PREFIX: &str = "https://";
-    url.starts_with(PREFIX)
-        && url.len() > PREFIX.len()
-        && !url.chars().any(|c| c.is_control() || c.is_whitespace())
+    let Some(rest) = url.strip_prefix(PREFIX) else {
+        return false;
+    };
+    // No control characters or whitespace anywhere in the URL.
+    if url.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return false;
+    }
+    // The authority is everything up to the first '/', '?' or '#'. Require a
+    // non-empty host and reject userinfo: a `@` lets `https://github.com@evil`
+    // disguise its real host (the part after `@`), so refuse any authority
+    // carrying one.
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    !authority.is_empty() && !authority.contains('@')
 }
 
 /// Read `path` as UTF-8 text. Non-UTF-8 input surfaces an error rather than
@@ -168,16 +185,26 @@ fn open_external_with(
     spawn(program, &args)
 }
 
-/// Spawn `program` with `args` as a *detached* child — launched but never waited
-/// on, so a slow browser can't stall the editor — mapping a launch failure to an
-/// error string. Split from [`open_external`] so this last OS-touching step can be
-/// driven in tests with a harmless command instead of a real URL handler.
+/// Spawn `program` with `args` as a *detached* child — the editor never blocks on
+/// it, so a slow browser can't stall the UI — mapping a launch failure to an error
+/// string. Split from [`open_external`] so this last OS-touching step can be driven
+/// in tests with a harmless command instead of a real URL handler.
+///
+/// The child is reaped on a throwaway thread rather than left unwaited: on Unix an
+/// unwaited child lingers as a zombie in the process table until the app exits, one
+/// per opened link. The launcher (`xdg-open` / `open` / `cmd /c start`) forks the
+/// real browser and returns almost immediately, so the wait thread finishes at once
+/// and never holds anything up.
 fn spawn_detached(program: &str, args: &[String]) -> Result<(), String> {
-    std::process::Command::new(program)
+    let child = std::process::Command::new(program)
         .args(args)
         .spawn()
-        .map(|_child| ()) // detached: don't wait on the handler
-        .map_err(|e| format!("Failed to open link: {e}"))
+        .map_err(|e| format!("Failed to open link: {e}"))?;
+    std::thread::spawn(move || {
+        let mut child = child;
+        let _ = child.wait();
+    });
+    Ok(())
 }
 
 #[cfg(test)]
@@ -365,6 +392,14 @@ mod tests {
         assert!(!is_safe_external_url("https://exa mple.com")); // whitespace
         assert!(!is_safe_external_url("https://example.com\n")); // control
         assert!(!is_safe_external_url("")); // empty
+        // Userinfo hides the real host (everything after `@`), so reject it — both
+        // a bare `user@host` and the `trusted.com@evil.com` disguise.
+        assert!(!is_safe_external_url("https://user@example.com"));
+        assert!(!is_safe_external_url(
+            "https://github.com@evil.example/path"
+        ));
+        // A `@` only in the *path* is fine — the host is still github.com.
+        assert!(is_safe_external_url("https://github.com/sponsors/@user"));
     }
 
     #[test]

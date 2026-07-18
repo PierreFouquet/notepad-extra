@@ -2,8 +2,8 @@
 //!
 //! syntect is the **single source of truth** for languages: its bundled
 //! [`SyntaxSet`] resolves file extensions to syntaxes *and* backs the manual
-//! language picker, so a language is added in exactly one place (retiring the
-//! hand-maintained CodeMirror mode table). This crate exposes three things:
+//! language picker, so a language is added in exactly one place. This crate
+//! exposes three things:
 //!
 //!  * [`detect`] — extension → syntax **name** (for auto-detection and the
 //!    status bar), owned by the pure core.
@@ -51,19 +51,17 @@ pub fn syntax_set() -> &'static SyntaxSet {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ThemeMode {
-    /// Light UI chrome + a GitHub-light highlight theme. The default, matching
-    /// the previous WebView build's light look.
+    /// Light UI chrome + a GitHub-light highlight theme. The default.
     #[default]
     Light,
-    /// Dark UI chrome + the Monokai highlight theme, matching the previous
-    /// WebView build's Monokai editor theme.
+    /// Dark UI chrome + the Monokai highlight theme.
     Dark,
 }
 
 /// The embedded theme set (two-face's, ~30 themes), loaded once. We use
 /// **two-face**'s set rather than syntect's own defaults because it carries
-/// **Monokai** — the dark theme the previous WebView build shipped — which
-/// syntect's defaults lack. The dumps are embedded (no runtime fetch) and built
+/// **Monokai** — the app's dark editor theme — which syntect's defaults lack.
+/// The dumps are embedded (no runtime fetch) and built
 /// with the fancy-regex backend, so this stays fully offline and oniguruma-free.
 fn embedded_themes() -> &'static EmbeddedLazyThemeSet {
     static SET: OnceLock<EmbeddedLazyThemeSet> = OnceLock::new();
@@ -72,9 +70,8 @@ fn embedded_themes() -> &'static EmbeddedLazyThemeSet {
 
 /// The concrete syntect highlight [`Theme`] paired with a UI [`ThemeMode`] (#36):
 ///
-///  * [`ThemeMode::Light`] → **InspiredGitHub** (GitHub-light), matching the
-///    previous WebView build's light editor.
-///  * [`ThemeMode::Dark`] → **Monokai Extended**, matching that build's Monokai.
+///  * [`ThemeMode::Light`] → **InspiredGitHub** (GitHub-light).
+///  * [`ThemeMode::Dark`] → **Monokai Extended** (Monokai).
 ///
 /// The theme is borrowed from the process-wide [`embedded_themes`] set, so the
 /// returned reference is `'static` — which is exactly what the shell's
@@ -88,8 +85,8 @@ pub fn highlight_theme(mode: ThemeMode) -> &'static Theme {
 }
 
 /// Extension → syntax-**name** aliases for extensions the bundled set doesn't
-/// carry but users reasonably expect to highlight (the old CodeMirror table
-/// covered several of these). Each target name is asserted to exist in the set by
+/// carry but users reasonably expect to highlight. Each target name is asserted
+/// to exist in the set by
 /// a test, so the alias always resolves. First-match; the set itself is tried
 /// first, so an alias only ever *fills a gap*, never overrides a real grammar.
 const EXT_ALIASES: &[(&str, &str)] = &[
@@ -386,8 +383,7 @@ mod tests {
 
     #[test]
     fn theme_mode_defaults_to_light() {
-        // A fresh install (and any config predating the theme key) opens light,
-        // matching the previous WebView build.
+        // A fresh install (and any config predating the theme key) opens light.
         assert_eq!(ThemeMode::default(), ThemeMode::Light);
     }
 
@@ -501,8 +497,8 @@ mod tests {
 
     #[test]
     fn shell_dotfiles_detect_as_a_shell_not_plain_text() {
-        // #97 item 6: the old CodeMirror table mapped shell rc/profile files to
-        // Shell, and the pre-cutover review flagged that the native `detect` —
+        // #97 item 6: shell rc/profile dotfiles should resolve to a shell grammar,
+        // and the pre-cutover review flagged that the native `detect` —
         // which leans on syntect's whole-filename tokens (step 2 of `detect`,
         // since a leading-dot name has no extension) — *might* now fall back to
         // Plain Text. It doesn't: the real on-disk dotfiles resolve to a shell

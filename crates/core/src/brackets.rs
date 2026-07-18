@@ -30,7 +30,7 @@ pub struct BracketMatch {
 ///
 /// The caret sits *between* characters, so two positions are "adjacent": the
 /// character immediately before it and the one at/after it. Following the common
-/// editor convention (CodeMirror, Vim's `%`), the character **before** the caret
+/// editor convention (Vim's `%`), the character **before** the caret
 /// wins when both are brackets — that highlights the bracket you just typed.
 ///
 /// `caret` is clamped into range and onto a char boundary, so any value the

@@ -11,7 +11,7 @@ not a guarantee.
 ## The one bundled family: DejaVu Sans Mono
 
 | File(s) | Styles | Licence | Upstream |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `dejavu-sans-mono/DejaVuSansMono*.ttf` | Book, Bold, Oblique, Bold-Oblique | DejaVu Fonts Licence (Bitstream Vera derivative) — see `LICENSE` | Debian `fonts-dejavu-core` |
 
 Why this font, specifically:

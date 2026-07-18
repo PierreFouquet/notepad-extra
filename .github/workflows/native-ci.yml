@@ -1,9 +1,7 @@
 name: "native-ci"
 
 # Test infrastructure for the native (iced) rewrite crates — issue #27.
-# Deliberately scoped to the workspace's native crates so it does not build the
-# Tauri app (no webkit needed). The existing `ci.yml` stays as-is until the #45
-# CI migration / #46 cutover fold these together.
+# Scoped to the workspace's native crates under `crates/`.
 # Feature branches are covered by the `pull_request` trigger; the old
 # `feat/iced-migration` push entry was the Phase 0 integration branch, merged
 # and deleted via #60 (#98 hygiene).

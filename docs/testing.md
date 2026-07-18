@@ -10,8 +10,7 @@ display**.
 ## Layers
 
 | Layer | Where | Run it |
-|-------|-------|--------|
-
+| --- | --- | --- |
 | Unit tests | `#[cfg(test)]` in each `crates/core/src/*.rs` | `cargo test -p notepad-core` |
 | Property tests (`proptest`) | `app.rs` `mod tests` | `cargo test -p notepad-core` |
 | Adversarial / stress | `crates/core/tests/stress.rs` | `cargo test -p notepad-core --test stress` |
@@ -92,8 +91,7 @@ make.
 ## Definition of Done — coverage map
 
 | DoD requirement | Covered by |
-|-----------------|------------|
-
+| --- | --- |
 | Unit tests on pure logic | per-module `mod tests` |
 | Property-based tests (`proptest`) | `app.rs` proptests |
 | Adversarial / stress | `tests/stress.rs` |

@@ -87,9 +87,8 @@ impl Document {
 
     /// The tab / window title: the file name, or `Untitled` for a fresh buffer.
     ///
-    /// Deliberately the basename, not the full path (#97 item 4). The WebView
-    /// build titled the window `Notepad Extra - {full path}`; the native build
-    /// keeps just the file name (the shell appends " — Notepad Extra"), so a deep
+    /// Deliberately the basename, not the full path (#97 item 4). The window shows
+    /// just the file name (the shell appends " — Notepad Extra"), so a deep
     /// path can't crowd the app name out of the title bar.
     pub fn title(&self) -> &str {
         match &self.path {
@@ -166,13 +165,11 @@ pub struct State {
     font_size: u16,
     /// Whether soft word-wrap is on, a single app-wide toggle shared by every
     /// tab (#34). Read via [`State::word_wrap`], flipped by
-    /// [`Message::ToggleWordWrap`]. Off by default, matching the WebView build.
-    /// Persisted by #38.
+    /// [`Message::ToggleWordWrap`]. Off by default. Persisted by #38.
     word_wrap: bool,
     /// Whether the line-number gutter is shown, a single app-wide toggle shared
     /// by every tab (#41). Read via [`State::show_line_numbers`], flipped by
-    /// [`Message::ToggleLineNumbers`]. On by default, matching the WebView build's
-    /// CodeMirror gutter. Persisted by #38.
+    /// [`Message::ToggleLineNumbers`]. On by default. Persisted by #38.
     show_line_numbers: bool,
     /// The bundled font family the editor buffer renders in (#61). A display name
     /// the shell maps to a registered face; never empty (see [`State::set_editor_font`]).
@@ -184,8 +181,8 @@ pub struct State {
     /// [`State::ui_font`], changed by [`Message::SetUiFont`]. Persisted by #38.
     ui_font: String,
     /// The UI light/dark theme, app-wide (#36). Read via [`State::theme`],
-    /// flipped by [`Message::ToggleTheme`]. Light by default, matching the
-    /// WebView build. The shell maps it to both the `iced::Theme` chrome and the
+    /// flipped by [`Message::ToggleTheme`]. Light by default. The shell maps it
+    /// to both the `iced::Theme` chrome and the
     /// paired syntect highlight theme ([`notepad_syntax::highlight_theme`]).
     /// Persisted by #38.
     theme: ThemeMode,
@@ -391,10 +388,10 @@ impl State {
 /// The zoom bounds (#35) must form a non-empty range with a default inside it.
 /// Checked at compile time so a bad edit to the constants never builds.
 ///
-/// The exact 6–96 pt span is a deliberate parity decision (#97 item 5): the
-/// WebView build clamped to 8–40 px, and the wider native range is confirmed
-/// intended, not a regression. Pinning the values means a silent edit back toward
-/// the WebView bounds fails to compile — 40 pt would satisfy the range invariants
+/// The exact 6–96 pt span is a deliberate decision (#97 item 5): the earlier
+/// build clamped to 8–40 px, and the wider native range is confirmed intended,
+/// not a regression. Pinning the values means a silent edit back toward the
+/// narrower bounds fails to compile — 40 pt would satisfy the range invariants
 /// above while quietly dropping the ceiling, so the invariants alone can't catch it.
 const _: () = {
     assert!(State::MIN_FONT_SIZE > 0);
@@ -1655,7 +1652,7 @@ mod tests {
     #[test]
     fn title_is_the_basename_not_the_full_path() {
         // #97 item 4: the window/tab title is deliberately the file's basename,
-        // never the full path the WebView build showed. A fresh buffer is Untitled.
+        // never the full path. A fresh buffer is Untitled.
         let mut s = State::default();
         assert_eq!(s.active_doc().title(), "Untitled");
 
@@ -2857,7 +2854,7 @@ mod tests {
     fn opening_the_bar_does_not_move_the_caret_on_a_residual_query() {
         // #97 item 2: reopening the bar with a query left over from a previous
         // search recounts for the readout but must not jump to (select) the
-        // first match — the WebView left the caret alone until Enter/Find Next.
+        // first match — the caret stays put until Enter/Find Next.
         let mut s = State::default();
         update(&mut s, Message::Edited("foo bar foo".into()));
         find_for(&mut s, "foo");
@@ -2957,10 +2954,7 @@ mod tests {
     #[test]
     fn word_wrap_is_off_by_default() {
         let s = State::default();
-        assert!(
-            !s.word_wrap(),
-            "parity with the WebView build: wrap starts off"
-        );
+        assert!(!s.word_wrap(), "wrap starts off by default");
     }
 
     #[test]
@@ -2996,10 +2990,7 @@ mod tests {
     #[test]
     fn line_numbers_are_on_by_default() {
         let s = State::default();
-        assert!(
-            s.show_line_numbers(),
-            "parity with the WebView CodeMirror gutter: line numbers start on"
-        );
+        assert!(s.show_line_numbers(), "line numbers start on by default");
     }
 
     #[test]

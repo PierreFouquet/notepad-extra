@@ -11,13 +11,13 @@
   <description>
     <p>
       Notepad Extra is a small, fast, fully offline text and code editor for
-      Windows, macOS and Linux, built with Rust and Tauri and inspired by
-      Notepad++.
+      Windows, macOS and Linux, built as a native Rust application and inspired
+      by Notepad++.
     </p>
     <p>Features:</p>
     <ul>
       <li>Tabbed editing with unsaved-change indicators</li>
-      <li>Syntax highlighting for 80+ languages, with automatic detection from the file extension</li>
+      <li>Syntax highlighting for 200+ languages, with automatic detection from the file extension</li>
       <li>Find, Replace and Go-to-line, with regex and case options</li>
       <li>Word wrap toggle, editor zoom, and light and dark themes</li>
       <li>Preserves each file's original line endings (LF or CRLF) on save</li>
@@ -51,6 +51,7 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.5.0" date="2026-07-18"/>
     <release version="0.4.0" date="2026-07-03"/>
   </releases>
 </component>

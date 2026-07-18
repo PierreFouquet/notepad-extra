@@ -28,7 +28,7 @@ so word wrap (#34) forced us to copy it into the tree. The extension seam is the
 `iced_graphics::text::Editor`, which reaches into its cosmic-text `buffer()`:
 
 | Method | Returns | Used by |
-|--------|---------|---------|
+| --- | --- | --- |
 | `scroll_top` | pixels scrolled past the top | vertical scrollbar thumb |
 | `content_height` | full wrapped document height | scrollbar sizing |
 | `line_height` | pixels per line | thumb-drag → line delta |
@@ -171,7 +171,7 @@ The UI theme is one app-wide `ThemeMode { Light, Dark }` in the pure core
 `iced::Theme` chrome (`Shell::theme` → `Theme::Light`/`Dark`, wired with `.theme()`
 on the application builder) and to the editor's syntect highlight theme, which
 `notepad_syntax::highlight_theme(mode)` pairs — **InspiredGitHub** for light,
-**Monokai Extended** for dark, matching the retired WebView build (light by
+**Monokai Extended** for dark — the app's default light/dark pairing (light by
 default, Monokai for dark). Monokai isn't in syntect's *own* default theme set, so
 the themes come from `two-face` (already vendored for the syntaxes), keeping the
 app offline and oniguruma-free.
@@ -183,14 +183,14 @@ repaint is free too — the new `iced::Theme` changes the clear colour, so the
 software compositor redraws the surface (no repaint-nudge needed here, unlike the
 `pick_list` trap above).
 
-The toolbar button matches the WebView build: its label names the theme you'll
+The toolbar button's label names the theme you'll
 switch *to* (☾ Dark / ☀ Light), not the current state — a plain action button, not
-a lit on/off toggle (which read as if the word labelled the current mode). The
-WebView's 🌙 emoji isn't in the bundled DejaVu Sans Mono, so ☾ stands in for it.
+a lit on/off toggle (which read as if the word labelled the current mode). A
+🌙 emoji isn't in the bundled DejaVu Sans Mono, so ☾ stands in for it.
 
 ## Dialogs are in-app panels, not native windows
 
-The `rfd` `xdg-portal` backend (chosen to stay off GTK/webkit build deps) exposes
+The `rfd` `xdg-portal` backend (chosen to stay off GTK build deps) exposes
 no *message* dialog, and native modals aren't headless-testable. So the
 confirm-close bar (#31), About panel (#40), find/replace bar (#33) and drag-drop
 overlay (#42) are all ordinary in-app widgets pushed into the layout — keeping

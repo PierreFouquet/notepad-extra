@@ -1,5 +1,4 @@
-//! Pure Find / Replace / Go-to-line over the text buffer (#33), replacing
-//! CodeMirror's `getSearchCursor`.
+//! Pure Find / Replace / Go-to-line over the text buffer (#33).
 //!
 //! Everything here is a deterministic function of `(text, pattern, options)` —
 //! no cursor state, no widget, no I/O — so the whole feature is exercised as
@@ -122,7 +121,7 @@ impl Matcher {
         let re = RegexBuilder::new(&full)
             .case_insensitive(!options.case_sensitive)
             // `^`/`$` anchor to line boundaries, which is what an editor's find
-            // is expected to do (and what CodeMirror did).
+            // is expected to do.
             .multi_line(true)
             .size_limit(COMPILE_SIZE_LIMIT)
             .build()

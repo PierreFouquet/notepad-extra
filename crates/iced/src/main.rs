@@ -374,6 +374,12 @@ enum Message {
         path: PathBuf,
         result: Result<Vec<u8>, String>,
     },
+    /// The user chose to open a large file anyway, past the confirm bar (#102):
+    /// load the buffer stashed in [`Shell::confirm_large_open`] as usual.
+    LargeOpenConfirmed,
+    /// The user declined to open a large file (#102): drop the stashed buffer and
+    /// leave the current tabs untouched.
+    LargeOpenCancelled,
     /// Document `id` was re-read for a *reopen* under a user-chosen encoding
     /// ([`Message::ReopenAs`]). The raw bytes are *strictly* re-decoded here with
     /// [`core::encoding::decode_strict`]: if they are not valid in that encoding
@@ -583,6 +589,45 @@ struct PendingClose {
     title: String,
 }
 
+/// Above this many lines, opening a file first asks the user to confirm (#102).
+/// The vendored `text_editor`'s open cost is dominated by cosmic-text shaping
+/// *every line up front* — ~20 µs/line in a release build, so ~200k lines is
+/// ~4 s and a multi-million-line log is tens of seconds. Scrolling and editing
+/// an already-shaped buffer stay cheap; the whole cost is paid at open.
+const LARGE_FILE_LINES: usize = 200_000;
+/// Above this many bytes on a single line, opening also asks first (#102). A
+/// lone enormous line shapes *fast* to open (one shaped line), but then every
+/// later edit reshapes the whole line — ~245 µs/char at 1M vs ~4 µs on a normal
+/// line — so a very long line is gated for the interaction cost, not open time.
+const LARGE_FILE_LINE_BYTES: usize = 500_000;
+
+/// A freshly decoded buffer awaiting the user's "this file is large, open it
+/// anyway?" answer (#102). Holds the already-decoded content so accepting is a
+/// plain load with no second read. Rendered as an in-app bar, not a native
+/// dialog, for the same reasons as [`PendingClose`].
+#[derive(Debug, Clone)]
+struct PendingLargeOpen {
+    path: PathBuf,
+    content: String,
+    encoding: core::FileEncoding,
+    /// The measured line count, shown in the prompt so the user knows the scale.
+    lines: usize,
+}
+
+/// Measure a freshly decoded buffer against the large-file thresholds (#102) in
+/// a single pass. Returns `Some(lines)` when opening should confirm first —
+/// either the line count crosses [`LARGE_FILE_LINES`] or the longest single line
+/// crosses [`LARGE_FILE_LINE_BYTES`] — otherwise `None` to open straight away.
+fn large_file_lines(content: &str) -> Option<usize> {
+    let mut lines = 0usize;
+    let mut longest = 0usize;
+    for line in content.lines() {
+        lines += 1;
+        longest = longest.max(line.len());
+    }
+    (lines >= LARGE_FILE_LINES || longest >= LARGE_FILE_LINE_BYTES).then_some(lines)
+}
+
 /// The whole shell: the pure core plus the per-tab editor buffers, window title,
 /// the last error surfaced in the status bar, and the go-to-line input's text.
 struct Shell {
@@ -608,6 +653,10 @@ struct Shell {
     /// core raised [`Effect::ConfirmQuit`] for `n` unsaved documents; `None` means
     /// no quit is pending. The whole-app analogue of `confirm_close`.
     confirm_quit: Option<usize>,
+    /// A large file awaiting the user's "open it anyway?" answer (#102), if any;
+    /// drives the in-app large-file confirm bar in [`Shell::view`]. `Some` holds
+    /// the already-decoded buffer so accepting loads it without re-reading disk.
+    confirm_large_open: Option<PendingLargeOpen>,
     /// Whether a file drag is currently hovering over the window (#42); drives the
     /// "drop to open" overlay in [`Shell::view`].
     drag_hover: bool,
@@ -728,6 +777,7 @@ impl Shell {
                 goto_input: String::new(),
                 confirm_close: None,
                 confirm_quit: None,
+                confirm_large_open: None,
                 drag_hover: false,
                 context_menu: None,
                 cursor_in_editor: Point::ORIGIN,
@@ -938,6 +988,19 @@ impl Shell {
                     // Auto-detect the encoding from the raw bytes (#50); a binary
                     // or non-UTF-8 file decodes lossily rather than erroring (#59).
                     let (content, encoding) = core::encoding::decode(&bytes);
+                    // Large-file guard (#102): the vendored editor shapes every
+                    // line up front, so a huge file is slow to open. Stash the
+                    // decoded buffer and ask before loading rather than freezing
+                    // the UI unexpectedly; `LargeOpenConfirmed` finishes the load.
+                    if let Some(lines) = large_file_lines(&content) {
+                        self.confirm_large_open = Some(PendingLargeOpen {
+                            path,
+                            content,
+                            encoding,
+                            lines,
+                        });
+                        return Task::none();
+                    }
                     self.apply_core(
                         core::Message::FileLoaded {
                             path,
@@ -952,6 +1015,26 @@ impl Shell {
                     Task::none()
                 }
             },
+
+            // The user accepted the large-file confirm bar (#102): load the
+            // buffer stashed at read time, exactly as the non-large path would.
+            Message::LargeOpenConfirmed => match self.confirm_large_open.take() {
+                Some(pending) => self.apply_core(
+                    core::Message::FileLoaded {
+                        path: pending.path,
+                        content: pending.content,
+                        encoding: pending.encoding,
+                    },
+                    true,
+                ),
+                None => Task::none(),
+            },
+
+            // The user declined (#102): drop the stashed buffer, open nothing.
+            Message::LargeOpenCancelled => {
+                self.confirm_large_open = None;
+                Task::none()
+            }
 
             // A reopen (#50): the tab's bytes were re-read; *strictly* re-decode
             // them under the picked encoding. If the bytes aren't valid in it the
@@ -2004,6 +2087,9 @@ impl Shell {
         if self.confirm_quit.is_some() {
             layout = layout.push(self.quit_confirm_bar());
         }
+        if self.confirm_large_open.is_some() {
+            layout = layout.push(self.large_open_confirm_bar());
+        }
         if self.core.find.open {
             layout = layout.push(self.find_bar());
         }
@@ -2112,6 +2198,49 @@ impl Shell {
                 button(text("Cancel").font(ui))
                     .style(theme::ghost(t))
                     .on_press(Message::QuitChoiceMade(QuitChoice::Cancel)),
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center),
+        )
+        .padding(10)
+        .style(theme::card(t))
+        .into()
+    }
+
+    /// The in-app "this file is large — open anyway?" bar, shown while a big file
+    /// awaits the user's answer (#102). The vendored editor shapes every line up
+    /// front, so opening a many-line (or one enormous-line) file blocks the UI
+    /// for seconds; this warns first and lets the user open it anyway or back
+    /// out. Rendered as an in-app bar rather than a native dialog for the same
+    /// reasons as [`Shell::confirm_bar`].
+    fn large_open_confirm_bar(&self) -> Element<'_, Message> {
+        let Some(pending) = &self.confirm_large_open else {
+            return row![].into(); // never rendered unless set; empty as a guard
+        };
+        let ui = self.ui_font();
+        let t = self.tokens();
+        let name = pending.path.file_name().map_or_else(
+            || pending.path.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        // Two triggers, two phrasings (#102): a many-line file reports its line
+        // count, while a lone enormous line (which trips on byte length, not line
+        // count — "1 lines" would mislead) is described as such.
+        let scale = if pending.lines >= LARGE_FILE_LINES {
+            format!("{} lines", pending.lines)
+        } else {
+            "a very long line".to_string()
+        };
+        let prompt = format!("\u{201c}{name}\u{201d} has {scale} and may be slow to open.");
+        container(
+            row![
+                text(prompt).font(ui),
+                button(text("Open anyway").font(ui))
+                    .style(theme::accent(t))
+                    .on_press(Message::LargeOpenConfirmed),
+                button(text("Cancel").font(ui))
+                    .style(theme::ghost(t))
+                    .on_press(Message::LargeOpenCancelled),
             ]
             .spacing(8)
             .align_y(iced::Alignment::Center),
@@ -3349,6 +3478,109 @@ mod tests {
             result: Ok(()),
         });
         assert_eq!(shell.core.docs.len(), 1);
+    }
+
+    // ---- Large-file open guard wiring (#102) ----
+    // The vendored editor shapes every line up front, so a huge file is slow to
+    // open; these assert the confirm-first wiring. They deliberately never let a
+    // huge buffer reach the editor — shaping ~200k lines in a debug build is ~65s
+    // (see #102) — so the *load* path is exercised through a small stashed buffer,
+    // while the *trip* path uses a big string that is only counted, never shaped.
+
+    #[test]
+    fn opening_a_many_line_file_asks_before_loading() {
+        let (mut shell, _) = Shell::new();
+        let big = "x\n".repeat(LARGE_FILE_LINES);
+        let _ = shell.update(Message::FileRead {
+            path: PathBuf::from("/tmp/huge.log"),
+            result: Ok(big.into_bytes()),
+        });
+        // The buffer is stashed for confirmation; nothing is loaded or shaped.
+        let pending = shell
+            .confirm_large_open
+            .as_ref()
+            .expect("a many-line file arms the confirm bar");
+        assert_eq!(pending.lines, LARGE_FILE_LINES);
+        assert_eq!(shell.core.docs.len(), 1);
+        assert_eq!(shell.active_editor().text().trim_end(), "");
+        let _ = shell.view(); // the large-file bar builds (many-line phrasing)
+    }
+
+    #[test]
+    fn opening_one_enormous_line_asks_before_loading() {
+        // A lone long line is fast to *open* but slow to *edit*, so it is gated on
+        // its byte length even though the line count is only 1 (#102).
+        let (mut shell, _) = Shell::new();
+        let long = "a".repeat(LARGE_FILE_LINE_BYTES);
+        let _ = shell.update(Message::FileRead {
+            path: PathBuf::from("/tmp/oneline.txt"),
+            result: Ok(long.into_bytes()),
+        });
+        let pending = shell
+            .confirm_large_open
+            .as_ref()
+            .expect("an enormous single line arms the confirm bar");
+        assert_eq!(pending.lines, 1);
+        assert_eq!(shell.active_editor().text().trim_end(), "");
+        let _ = shell.view(); // the large-file bar builds (long-line phrasing)
+    }
+
+    #[test]
+    fn an_ordinary_file_opens_without_asking() {
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::FileRead {
+            path: PathBuf::from("/tmp/small.txt"),
+            result: Ok("just a few lines\nnothing huge\n".as_bytes().to_vec()),
+        });
+        assert!(
+            shell.confirm_large_open.is_none(),
+            "no prompt for a small file"
+        );
+        assert_eq!(
+            shell.active_editor().text().trim_end(),
+            "just a few lines\nnothing huge"
+        );
+    }
+
+    #[test]
+    fn confirming_a_large_open_loads_the_stashed_buffer() {
+        // Drive only the confirm handler: the pending holds a *small* buffer so
+        // the load actually shapes it, standing in for the huge real one.
+        let (mut shell, _) = Shell::new();
+        shell.confirm_large_open = Some(PendingLargeOpen {
+            path: PathBuf::from("/tmp/huge.log"),
+            content: "loaded at last".to_string(),
+            encoding: core::FileEncoding::default(),
+            lines: LARGE_FILE_LINES,
+        });
+        let _ = shell.update(Message::LargeOpenConfirmed);
+        assert!(
+            shell.confirm_large_open.is_none(),
+            "confirming clears the bar"
+        );
+        assert_eq!(shell.active_editor().text().trim_end(), "loaded at last");
+    }
+
+    #[test]
+    fn cancelling_a_large_open_loads_nothing() {
+        let (mut shell, _) = Shell::new();
+        shell.confirm_large_open = Some(PendingLargeOpen {
+            path: PathBuf::from("/tmp/huge.log"),
+            content: "never loaded".to_string(),
+            encoding: core::FileEncoding::default(),
+            lines: LARGE_FILE_LINES,
+        });
+        let _ = shell.update(Message::LargeOpenCancelled);
+        assert!(
+            shell.confirm_large_open.is_none(),
+            "cancelling clears the bar"
+        );
+        assert_eq!(shell.core.docs.len(), 1);
+        assert_eq!(
+            shell.active_editor().text().trim_end(),
+            "",
+            "nothing was loaded"
+        );
     }
 
     // ---- Quit / window-close guard wiring (#69) ----
@@ -4846,6 +5078,87 @@ mod ui_tests {
         assert!(
             shell.core.active_doc().dirty(),
             "typing into the editor marks the document dirty"
+        );
+    }
+
+    // ---- Large-file open guard, through the real widget tree (#102) ----
+    // These drive the confirm bar the same way a user would: a real oversized
+    // file trips it, then a real click on the rendered button resolves it. They
+    // fail if the guard regresses — if the threshold stops arming the bar the
+    // `find`/`click` selectors error, and if a button loses its message the
+    // follow-up state assertion fails.
+
+    #[test]
+    fn large_file_bar_cancel_button_loads_nothing() {
+        // A genuinely huge (200k-line) file arms the bar; the buffer is never
+        // shaped because the user cancels, so this stays fast while still
+        // exercising the real threshold trip and the real Cancel button.
+        let (mut shell, _) = Shell::new();
+        let big = "x\n".repeat(LARGE_FILE_LINES);
+        let _ = shell.update(Message::FileRead {
+            path: PathBuf::from("/tmp/huge.log"),
+            result: Ok(big.into_bytes()),
+        });
+        assert!(
+            shell.confirm_large_open.is_some(),
+            "the big file armed the bar"
+        );
+
+        let mut ui = simulator(shell.view());
+        // Both buttons must actually be present in the rendered tree.
+        assert!(
+            ui.find("Open anyway").is_ok(),
+            "the confirm bar offers an Open anyway button"
+        );
+        ui.click("Cancel").expect("the large-file Cancel button");
+        for message in ui.into_messages() {
+            let _ = shell.update(message);
+        }
+
+        assert!(
+            shell.confirm_large_open.is_none(),
+            "Cancel dismissed the bar"
+        );
+        assert_eq!(shell.core.docs.len(), 1, "nothing was opened");
+        assert_eq!(
+            shell.active_editor().text().trim_end(),
+            "",
+            "the editor stays empty after cancelling"
+        );
+    }
+
+    #[test]
+    fn large_file_bar_open_anyway_button_loads_the_file() {
+        // A lone enormous line also trips the guard (on byte length, not line
+        // count) and — unlike 200k separate lines — shapes cheaply once loaded,
+        // so the real Open-anyway click can drive the whole accept-and-load path
+        // without the ~65s a 200k-line debug shape would cost.
+        let (mut shell, _) = Shell::new();
+        let long = "a".repeat(LARGE_FILE_LINE_BYTES);
+        let _ = shell.update(Message::FileRead {
+            path: PathBuf::from("/tmp/oneline.txt"),
+            result: Ok(long.into_bytes()),
+        });
+        assert!(
+            shell.confirm_large_open.is_some(),
+            "the long line armed the bar"
+        );
+
+        let mut ui = simulator(shell.view());
+        ui.click("Open anyway")
+            .expect("the large-file Open anyway button");
+        for message in ui.into_messages() {
+            let _ = shell.update(message);
+        }
+
+        assert!(
+            shell.confirm_large_open.is_none(),
+            "Open anyway dismissed the bar"
+        );
+        assert_eq!(
+            shell.active_editor().text().trim_end().len(),
+            LARGE_FILE_LINE_BYTES,
+            "Open anyway loaded the whole line into the editor"
         );
     }
 }

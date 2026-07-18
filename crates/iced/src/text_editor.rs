@@ -472,7 +472,14 @@ where
     }
 
     /// Highlights the [`TextEditor`] using the given syntax and theme.
-    #[cfg(feature = "highlighter")]
+    // NOTEPAD-EXTRA(#25): upstream gates this on the `highlighter` Cargo feature.
+    // We highlight through our own syntect path (`SyntectHighlighter`) and never
+    // link `iced_highlighter`, so this upstream method stays compiled out. It
+    // hangs off a private cfg that is *never set* rather than a Cargo feature on
+    // purpose: a real feature is switched on by `cargo test --all-features`, which
+    // would then fail to compile against the absent `iced_highlighter` crate. The
+    // name is declared in `Cargo.toml`'s `check-cfg` so `-D warnings` stays clean.
+    #[cfg(notepad_extra_upstream_highlighter)]
     pub fn highlight(
         self,
         syntax: &str,
@@ -544,7 +551,11 @@ where
     }
 
     /// Sets the style class of the [`TextEditor`].
-    #[cfg(feature = "advanced")]
+    // NOTEPAD-EXTRA(#25): upstream gates this on the `advanced` Cargo feature; we
+    // style through the `style` closure above and never call `class`. Kept
+    // compiled out via a never-set private cfg for the same reason as `highlight`
+    // above — see that note and `Cargo.toml`'s `check-cfg`.
+    #[cfg(notepad_extra_upstream_advanced)]
     #[must_use]
     pub fn class(mut self, class: impl Into<Theme::Class<'a>>) -> Self {
         self.class = class.into();

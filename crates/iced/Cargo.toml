@@ -68,15 +68,21 @@ rfd = { version = "0.15", default-features = false, features = [
 # hand raw RGBA to `window::icon::from_rgba`.
 png = { version = "0.18", default-features = false }
 
-# The vendored `text_editor` (src/text_editor.rs) keeps upstream iced's
-# `#[cfg(feature = ...)]` gates on capabilities we don't build: `highlighter`
-# (syntax highlighting via `iced_highlighter`, tracked in #32) and `advanced`
-# (the `class` style setter — we use the `style` closure instead). Declaring the
-# features here — off, enabling nothing — leaves that code compiled out while
-# making the cfg names known, so the `-D warnings` clippy job stays clean (#34).
-[features]
-highlighter = []
-advanced = []
+# The vendored `text_editor` (src/text_editor.rs) carries two upstream iced
+# methods we don't build — `highlight` (syntax highlighting via `iced_highlighter`,
+# tracked in #32; we use our own syntect path) and `class` (the `advanced` style
+# setter — we use the `style` closure instead). Upstream gates them on Cargo
+# features; here they hang off **private cfgs that are never set**, so the code
+# stays compiled out. They are deliberately NOT Cargo features: a real feature is
+# switched on by `cargo test --all-features`, which then fails to compile because
+# `iced_highlighter` is not a dependency (#25). `check-cfg` makes the cfg names
+# known so the compiled-out `#[cfg(...)]` gates don't trip the `-D warnings`
+# clippy job (#34).
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+    "cfg(notepad_extra_upstream_highlighter)",
+    "cfg(notepad_extra_upstream_advanced)",
+] }
 
 [dev-dependencies]
 # Real temp files for the preferences save→reload round-trip test (#38). Already

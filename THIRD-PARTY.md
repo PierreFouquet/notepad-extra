@@ -7,7 +7,10 @@ of what, from where, and under which license, for distro licensing review
 (Debian `debian/copyright`, Fedora license audit — #7 / #8 / #17 / #47).
 
 Ordinary crate dependencies (resolved via `Cargo.lock`) are *not* listed here;
-their licenses travel with the crates themselves.
+their licenses travel with the crates themselves. For the audited, per-crate
+licence inventory those distro reviews consume — regenerated from `cargo
+metadata` by [`scripts/license-audit.sh`](scripts/license-audit.sh) — see
+[packaging/CRATE-LICENSES.md](packaging/CRATE-LICENSES.md).
 
 ## Vendored source code
 

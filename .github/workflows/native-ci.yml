@@ -132,3 +132,19 @@ jobs:
             cargo fuzz run --fuzz-dir crates/core/fuzz --target x86_64-unknown-linux-gnu "$target" -- -max_total_time=15
             echo "::endgroup::"
           done
+
+  licenses:
+    name: "dependency licence audit (#17)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+      # Two gates in one (see scripts/license-audit.sh): fails if a copyleft-only
+      # dependency sneaks into the tree, or if packaging/CRATE-LICENSES.md is out
+      # of date with Cargo.lock. Online so cargo can populate the registry index.
+      - name: licence audit + inventory freshness
+        run: LICENSE_AUDIT_ONLINE=1 bash scripts/license-audit.sh --check
+      # Keep the per-distro dependency lists (#8/#12/#13) in step with Cargo.lock.
+      - name: packaging dependency lists freshness
+        run: PACKAGING_DEPS_ONLINE=1 bash scripts/packaging-deps.sh --check

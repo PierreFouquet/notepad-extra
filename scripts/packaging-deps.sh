@@ -42,6 +42,11 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+# Pin collation so the generated ordering is identical on every machine (glibc's
+# locale-aware sort ignores punctuation, a C locale sorts by byte); otherwise the
+# CI --check re-render disagrees with a locally generated file.
+export LC_ALL=C
+
 TARGET="${TARGET:-$(rustc -vV | sed -n 's/^host: //p')}"
 DEPS_DIR="packaging/deps"
 GENTOO_OUT="$DEPS_DIR/gentoo-crates.txt"

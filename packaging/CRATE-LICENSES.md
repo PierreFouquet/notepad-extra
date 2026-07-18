@@ -31,21 +31,21 @@ shipped under their permissive branch.
 | MIT OR Apache-2.0 OR Zlib | 5 |
 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | 4 |
 | Zlib OR Apache-2.0 OR MIT | 3 |
-| Unlicense OR MIT | 2 |
 | Unlicense/MIT | 2 |
+| Unlicense OR MIT | 2 |
 | BSD-3-Clause | 2 |
 | BSD-2-Clause OR Apache-2.0 OR MIT | 2 |
 | Apache-2.0/MIT | 2 |
 | Zlib | 1 |
 | MIT OR Zlib OR Apache-2.0 | 1 |
-| (MIT OR Apache-2.0) AND Unicode-3.0 | 1 |
 | ISC | 1 |
 | BSD-2-Clause | 1 |
-| (Apache-2.0 OR MIT) AND BSD-3-Clause | 1 |
 | Apache-2.0 OR GPL-2.0-only | 1 |
-| Apache-2.0 / MIT | 1 |
 | Apache-2.0 AND MIT | 1 |
+| Apache-2.0 / MIT | 1 |
 | 0BSD OR MIT OR Apache-2.0 | 1 |
+| (MIT OR Apache-2.0) AND Unicode-3.0 | 1 |
+| (Apache-2.0 OR MIT) AND BSD-3-Clause | 1 |
 
 ## Inventory
 
@@ -58,8 +58,8 @@ shipped under their permissive branch.
 | aho-corasick | 1.1.4 | Unlicense OR MIT |
 | arrayref | 0.3.9 | BSD-2-Clause |
 | arrayvec | 0.7.8 | MIT OR Apache-2.0 |
-| ashpd | 0.11.1 | MIT |
 | as-raw-xcb-connection | 1.0.1 | MIT OR Apache-2.0 |
+| ashpd | 0.11.1 | MIT |
 | async-broadcast | 0.7.2 | MIT OR Apache-2.0 |
 | async-channel | 2.5.0 | Apache-2.0 OR MIT |
 | async-executor | 1.14.0 | Apache-2.0 OR MIT |
@@ -76,9 +76,9 @@ shipped under their permissive branch.
 | autocfg | 1.5.1 | Apache-2.0 OR MIT |
 | base64 | 0.22.1 | MIT OR Apache-2.0 |
 | bincode | 1.3.3 | MIT |
-| bitflags | 2.13.0 | MIT OR Apache-2.0 |
 | bit-set | 0.8.0 | Apache-2.0 OR MIT |
 | bit-vec | 0.8.0 | Apache-2.0 OR MIT |
+| bitflags | 2.13.0 | MIT OR Apache-2.0 |
 | block-buffer | 0.10.4 | MIT OR Apache-2.0 |
 | blocking | 1.6.2 | Apache-2.0 OR MIT |
 | bytemuck | 1.25.1 | Zlib OR Apache-2.0 OR MIT |
@@ -89,8 +89,8 @@ shipped under their permissive branch.
 | calloop-wayland-source | 0.3.0 | MIT |
 | calloop-wayland-source | 0.4.1 | MIT |
 | cc | 1.2.67 | MIT OR Apache-2.0 |
-| cfg_aliases | 0.2.1 | MIT |
 | cfg-if | 1.0.4 | MIT OR Apache-2.0 |
+| cfg_aliases | 0.2.1 | MIT |
 | chardetng | 1.0.0 | Apache-2.0 OR MIT |
 | clipboard_wayland | 0.2.2 | Apache-2.0 |
 | clipboard_x11 | 0.4.3 | MIT |
@@ -124,10 +124,10 @@ shipped under their permissive branch.
 | find-msvc-tools | 0.1.9 | MIT OR Apache-2.0 |
 | flate2 | 1.1.9 | MIT OR Apache-2.0 |
 | fnv | 1.0.7 | Apache-2.0 / MIT |
-| fontconfig-parser | 0.5.8 | MIT |
-| fontdb | 0.23.0 | MIT |
 | font-types | 0.10.1 | MIT OR Apache-2.0 |
 | font-types | 0.11.3 | MIT OR Apache-2.0 |
+| fontconfig-parser | 0.5.8 | MIT |
+| fontdb | 0.23.0 | MIT |
 | form_urlencoded | 1.2.2 | MIT OR Apache-2.0 |
 | futures | 0.3.32 | MIT OR Apache-2.0 |
 | futures-channel | 0.3.32 | MIT OR Apache-2.0 |
@@ -205,8 +205,8 @@ shipped under their permissive branch.
 | potential_utf | 0.1.5 | Unicode-3.0 |
 | powerfmt | 0.2.0 | MIT OR Apache-2.0 |
 | ppv-lite86 | 0.2.21 | MIT OR Apache-2.0 |
-| proc-macro2 | 1.0.106 | MIT OR Apache-2.0 |
 | proc-macro-crate | 3.5.0 | MIT OR Apache-2.0 |
+| proc-macro2 | 1.0.106 | MIT OR Apache-2.0 |
 | proptest | 1.11.0 | MIT OR Apache-2.0 |
 | quick-error | 1.2.3 | MIT/Apache-2.0 |
 | quick-xml | 0.39.4 | MIT |
@@ -270,10 +270,10 @@ shipped under their permissive branch.
 | time-macros | 0.2.31 | MIT OR Apache-2.0 |
 | tiny-skia | 0.11.4 | BSD-3-Clause |
 | tiny-skia-path | 0.11.4 | BSD-3-Clause |
+| tiny-xlib | 0.2.5 | MIT OR Apache-2.0 OR Zlib |
 | tinystr | 0.8.3 | Unicode-3.0 |
 | tinyvec | 1.12.0 | Zlib OR Apache-2.0 OR MIT |
 | tinyvec_macros | 0.1.1 | MIT OR Apache-2.0 OR Zlib |
-| tiny-xlib | 0.2.5 | MIT OR Apache-2.0 OR Zlib |
 | toml_datetime | 1.1.1+spec-1.1.0 | MIT OR Apache-2.0 |
 | toml_edit | 0.25.12+spec-1.1.0 | MIT OR Apache-2.0 |
 | toml_parser | 1.1.2+spec-1.1.0 | MIT OR Apache-2.0 |

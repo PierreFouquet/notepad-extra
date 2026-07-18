@@ -43,6 +43,12 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+# Pin collation so the generated ordering is identical on every machine — glibc's
+# locale-aware sort ignores punctuation (tiny-xlib after tinyvec_macros) while a C
+# locale sorts by byte (tiny-xlib before tinystr); without this the CI --check
+# re-render disagrees with a locally generated file.
+export LC_ALL=C
+
 TARGET="${TARGET:-$(rustc -vV | sed -n 's/^host: //p')}"
 OUT="packaging/CRATE-LICENSES.md"
 

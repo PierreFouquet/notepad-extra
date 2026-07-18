@@ -5,7 +5,7 @@
 //! widgets we *don't* hand-style (pick-list menus, the editor's internal
 //! gutter / active-line / selection) still land in the right palette.
 use iced::widget::{button, container, text_input};
-use iced::{Background, Border, Color, Shadow, Vector};
+use iced::{Background, Border, Color, Shadow};
 
 /// One theme's worth of colour tokens. `Copy` (every field is a `Color`), so a
 /// `Tokens` threads into each `.style()` closure by value with no allocation.
@@ -37,7 +37,6 @@ pub struct Tokens {
     pub input_bg: Color,
     pub danger: Color,
     pub overlay: Color,
-    pub shadow: Color,
 }
 
 /// Build a `Color` from a packed `0xRRGGBB`. `const` (composed from components,
@@ -78,7 +77,6 @@ pub const LIGHT: Tokens = Tokens {
     input_bg: rgb(0xffffff),
     danger: rgb(0xe5534b),
     overlay: Color::from_rgba(0.07, 0.09, 0.15, 0.38),
-    shadow: Color::from_rgba(0.07, 0.09, 0.15, 0.18),
 };
 
 /// Dark-theme tokens — the app's dark palette. The Monokai-ish
@@ -111,7 +109,6 @@ pub const DARK: Tokens = Tokens {
     input_bg: rgb(0x24251f),
     danger: rgb(0xe5534b),
     overlay: Color::from_rgba(0.0, 0.0, 0.0, 0.5),
-    shadow: Color::from_rgba(0.0, 0.0, 0.0, 0.5),
 };
 
 // ---- Buttons --------------------------------------------------------------
@@ -419,9 +416,15 @@ pub fn picker(
     }
 }
 
-/// The dropdown menu a pick-list opens: popup background / border, accent-tinted
-/// selection — so the menu matches the [`card`] surfaces rather than iced's
-/// default palette.
+/// The dropdown menu a pick-list opens (fonts, language, encoding, "Reopen as…"):
+/// popup background / border, accent-tinted selection — so the menu matches the
+/// [`card`] surfaces rather than iced's default palette.
+///
+/// Like [`card`], it casts **no** soft drop shadow. On the tiny-skia software
+/// renderer a blurred shadow smears: hovering a row repaints just that row without
+/// recomposing the overlapping blur, so stale shadow pixels accumulate and grow as
+/// the pointer moves across the menu. The 1px border carries the elevation instead
+/// — crisp edges repaint cleanly.
 pub fn picker_menu(t: Tokens) -> impl Fn(&iced::Theme) -> iced::widget::overlay::menu::Style {
     move |_| iced::widget::overlay::menu::Style {
         background: Background::Color(t.popup_bg),
@@ -433,10 +436,34 @@ pub fn picker_menu(t: Tokens) -> impl Fn(&iced::Theme) -> iced::widget::overlay:
         text_color: t.text,
         selected_text_color: t.accent_fg,
         selected_background: Background::Color(t.accent),
-        shadow: Shadow {
-            color: t.shadow,
-            offset: Vector::new(0.0, 6.0),
-            blur_radius: 18.0,
-        },
+        shadow: Shadow::default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A blurred drop shadow smears on the tiny-skia software renderer: hovering a
+    /// control repaints it without recomposing the overlapping blur, so stale
+    /// shadow pixels accumulate and grow as the pointer moves (the trap [`card`]
+    /// documents). Every floating surface must stay shadow-free — the elevated
+    /// cards (find / About / confirm bars / context + overflow menus) and the
+    /// pick-list dropdown menus (both font pickers, language, encoding, "Reopen
+    /// as…"). This fails if any regains a soft (blurred) shadow.
+    #[test]
+    fn floating_surfaces_cast_no_soft_shadow() {
+        for t in [LIGHT, DARK] {
+            assert_eq!(
+                card(t)(&iced::Theme::Light).shadow.blur_radius,
+                0.0,
+                "card surfaces must have no soft shadow"
+            );
+            assert_eq!(
+                picker_menu(t)(&iced::Theme::Light).shadow.blur_radius,
+                0.0,
+                "pick-list dropdown menus must have no soft shadow"
+            );
+        }
     }
 }

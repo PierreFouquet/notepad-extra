@@ -5,11 +5,10 @@ name: "release"
 # is kept as a manual fallback that saves the packages as run artifacts instead
 # of touching a release.
 #
-# This replaces the old tauri-action matrix (#45). The native binary carries no
-# webkit/gtk, so there are no build-time system deps on any platform beyond the
-# Rust toolchain and the packaging tools. Every job drives the same packaging/
-# scripts the #44 smoke workflow install-tests, so what ships here is exactly
-# what CI proved installs and launches.
+# Every platform builds with just the Rust toolchain and the packaging tools —
+# the native binary needs no system GUI-toolkit build deps (#45). Every job drives
+# the same packaging/ scripts the #44 smoke workflow install-tests, so what ships
+# here is exactly what CI proved installs and launches.
 on:
   release:
     types: [published]

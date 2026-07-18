@@ -11,9 +11,8 @@ repository = "https://github.com/PierreFouquet/notepad-extra"
 # The shipped binary is `notepad-extra`, not the crate name (#95): the desktop
 # entry (`Exec=notepad-extra %F`), the man page `notepad-extra(1)` and the
 # packaged install all point at that name, so the built binary must match. The
-# legacy Tauri root package (which also produced a `notepad-extra` binary) was
-# retired in #43 — the workspace root is now a virtual manifest — so the former
-# "output filename collision" warning from a workspace-root build is gone.
+# workspace root is a virtual manifest with no package of its own, so this binary
+# name is unambiguous across the workspace.
 [[bin]]
 name = "notepad-extra"
 path = "src/main.rs"
@@ -54,8 +53,8 @@ iced = { version = "0.14", default-features = false, features = [
 iced_core = "=0.14.0"
 iced_graphics = "=0.14.0"
 
-# Native file dialogs. `xdg-portal` keeps us off GTK/webkit build deps (the whole
-# point of the migration); `async-std` gives rfd its own executor so it works
+# Native file dialogs. `xdg-portal` keeps us off GTK system build deps (a goal of
+# the native rewrite); `async-std` gives rfd its own executor so it works
 # regardless of iced's runtime.
 rfd = { version = "0.15", default-features = false, features = [
     "xdg-portal",
@@ -94,14 +93,14 @@ tempfile = "3.6"
 iced_test = "=0.14.0"
 
 # --- Native packaging (#43) ---------------------------------------------------
-# The shipped binary is packaged natively — no Tauri bundler. cargo-deb and
+# The shipped binary is packaged with standard cargo tooling. cargo-deb and
 # cargo-generate-rpm build the Linux packages, cargo-bundle the macOS .app/.dmg,
 # and cargo-wix the Windows .msi (via wix/main.wxs). All read this crate's
-# package fields (version 0.4.0, description, license, homepage) plus the
-# per-format metadata below. The `notepad-extra` binary carries no webkit/gtk
-# runtime (software-rendered iced + xdg-portal dialogs), so the old
-# libwebkit2gtk / appindicator deps are gone — only the X11/Wayland/xkb/font
-# libraries it dlopens remain (see `depends`/`requires`; #44 proves them).
+# package fields (version, description, license, homepage) plus the
+# per-format metadata below. The `notepad-extra` binary needs no system
+# GUI-toolkit runtime (software-rendered iced + xdg-portal dialogs) — only the
+# X11/Wayland/xkb/font libraries it dlopens remain (see `depends`/`requires`;
+# #44 proves them).
 
 # cargo-deb: asset *source* paths are relative to this manifest (`crates/iced/`),
 # so repo-root files use `../../`; the built binary is taken from the workspace
@@ -171,6 +170,10 @@ name = "Notepad Extra"
 identifier = "io.github.PierreFouquet.NotepadExtra"
 icon = ["../../icons/32x32.png", "../../icons/128x128.png", "../../icons/128x128@2x.png", "../../icons/icon.png"]
 category = "public.app-category.utilities"
+# The supported macOS floor: 14 (Sonoma). Declared as LSMinimumSystemVersion in
+# the .app's Info.plist so LaunchServices enforces it on both arch bundles; older
+# macOS is out of support (Apple Silicon is 11.0+ by hardware anyway). (#99)
+osx_minimum_system_version = "14.0"
 short_description = "Small, fast, fully offline text and code editor"
 long_description = "Notepad Extra is a small, fast, fully offline text and code editor for Windows, macOS and Linux, inspired by Notepad++."
 copyright = "Copyright © Pierre Fouquet. GNU GPL v3 or later."

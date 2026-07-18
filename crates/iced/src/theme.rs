@@ -1,12 +1,11 @@
-//! Custom Tauri-matched theme for the native shell (#70). Single source of truth
-//! for every chrome colour: the tokens from the retired Tauri/WebView build
-//! (`src-tauri/dist/styles.css`) ported 1:1 so the native app matches the look it
-//! had before the migration. The shell hand-styles its chrome from [`Tokens`];
+//! Custom theme for the native shell (#70). Single source of truth for every
+//! chrome colour: a palette of design tokens defining the app's light and dark
+//! looks. The shell hand-styles its chrome from [`Tokens`];
 //! the custom [`iced::Theme`] built alongside (see `main.rs`) only exists so the
 //! widgets we *don't* hand-style (pick-list menus, the editor's internal
 //! gutter / active-line / selection) still land in the right palette.
 use iced::widget::{button, container, text_input};
-use iced::{Background, Border, Color, Shadow, Vector};
+use iced::{Background, Border, Color, Shadow};
 
 /// One theme's worth of colour tokens. `Copy` (every field is a `Color`), so a
 /// `Tokens` threads into each `.style()` closure by value with no allocation.
@@ -38,7 +37,6 @@ pub struct Tokens {
     pub input_bg: Color,
     pub danger: Color,
     pub overlay: Color,
-    pub shadow: Color,
 }
 
 /// Build a `Color` from a packed `0xRRGGBB`. `const` (composed from components,
@@ -51,7 +49,7 @@ const fn rgb(hex: u32) -> Color {
     )
 }
 
-/// Light-theme tokens — the Tauri `:root` palette (`src-tauri/dist/styles.css`).
+/// Light-theme tokens — the app's light palette.
 pub const LIGHT: Tokens = Tokens {
     accent: rgb(0x2563eb),
     accent_hover: rgb(0x1d4ed8),
@@ -79,10 +77,9 @@ pub const LIGHT: Tokens = Tokens {
     input_bg: rgb(0xffffff),
     danger: rgb(0xe5534b),
     overlay: Color::from_rgba(0.07, 0.09, 0.15, 0.38),
-    shadow: Color::from_rgba(0.07, 0.09, 0.15, 0.18),
 };
 
-/// Dark-theme tokens — the Tauri `[data-theme="dark"]` palette. The Monokai-ish
+/// Dark-theme tokens — the app's dark palette. The Monokai-ish
 /// `app_bg` `#272822` is deliberately **equal** to `tab_active_bg`, which is what
 /// lets the active tab visually fold into the editor below it (#70).
 pub const DARK: Tokens = Tokens {
@@ -112,7 +109,6 @@ pub const DARK: Tokens = Tokens {
     input_bg: rgb(0x24251f),
     danger: rgb(0xe5534b),
     overlay: Color::from_rgba(0.0, 0.0, 0.0, 0.5),
-    shadow: Color::from_rgba(0.0, 0.0, 0.0, 0.5),
 };
 
 // ---- Buttons --------------------------------------------------------------
@@ -134,7 +130,7 @@ fn button_base(bg: Color, fg: Color, border: Color) -> button::Style {
     }
 }
 
-/// Solid file-action button (New / Open / Save) — Tauri's `.btn`.
+/// Solid file-action button (New / Open / Save).
 pub fn btn(t: Tokens) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
     move |_, status| match status {
         button::Status::Hovered => button_base(t.btn_hover, t.text, t.btn_border),
@@ -143,7 +139,7 @@ pub fn btn(t: Tokens) -> impl Fn(&iced::Theme, button::Status) -> button::Style 
     }
 }
 
-/// The ghost look for one button status — Tauri's `.btn-ghost`: transparent and
+/// The ghost look for one button status: transparent and
 /// muted until hovered. Factored out of the closure so [`ghost`] and [`toggle`]
 /// share one body (and so the two are the *same* opaque type where it matters).
 fn ghost_style(t: Tokens, status: button::Status) -> button::Style {
@@ -154,7 +150,7 @@ fn ghost_style(t: Tokens, status: button::Status) -> button::Style {
     }
 }
 
-/// The accent "on" look for one button status — Tauri's `.btn.active`. Shared by
+/// The accent "on" look for one button status. Shared by
 /// [`toggle`]'s on-state (see [`ghost_style`] for why it's a free fn).
 fn accent_style(t: Tokens, status: button::Status) -> button::Style {
     let bg = if matches!(status, button::Status::Hovered) {
@@ -165,7 +161,7 @@ fn accent_style(t: Tokens, status: button::Status) -> button::Style {
     button_base(bg, t.accent_fg, t.accent)
 }
 
-/// Ghost / utility button (Save As, Theme…) — Tauri's `.btn-ghost`: transparent
+/// Ghost / utility button (Save As, Theme…): transparent
 /// and muted until hovered. A real, fully-functional button; only the look
 /// differs from [`btn`].
 pub fn ghost(t: Tokens) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
@@ -174,7 +170,7 @@ pub fn ghost(t: Tokens) -> impl Fn(&iced::Theme, button::Status) -> button::Styl
 
 /// A solid accent button — the primary call-to-action in the panels (a confirm
 /// bar's Save, the About panel's Close). The same look [`toggle`] shows in its
-/// "on" state; mirrors Tauri's `.btn.primary`.
+/// "on" state.
 pub fn accent(t: Tokens) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
     move |_, status| accent_style(t, status)
 }
@@ -194,7 +190,7 @@ pub fn toggle(t: Tokens, on: bool) -> impl Fn(&iced::Theme, button::Status) -> b
     }
 }
 
-/// The destructive-action button (Don't Save / Discard all) — Tauri's `.btn-danger`.
+/// The destructive-action button (Don't Save / Discard all).
 pub fn danger(t: Tokens) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
     move |_, status| {
         let bg = if matches!(status, button::Status::Hovered) {
@@ -258,8 +254,7 @@ pub fn tab_label(fg: Color) -> impl Fn(&iced::Theme, button::Status) -> button::
     }
 }
 
-/// A tab's close (`×`) button: muted and transparent, reddening on hover like
-/// Tauri's `.tab-close:hover`.
+/// A tab's close (`×`) button: muted and transparent, reddening on hover.
 pub fn tab_close(t: Tokens) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
     move |_, status| {
         let (bg, fg) = match status {
@@ -349,7 +344,7 @@ pub fn card(t: Tokens) -> impl Fn(&iced::Theme) -> container::Style {
     }
 }
 
-/// A status-bar / mode pill (rounded rectangle in `pill_bg`) — Tauri's `.status-pill`.
+/// A status-bar / mode pill (rounded rectangle in `pill_bg`).
 pub fn pill(t: Tokens) -> impl Fn(&iced::Theme) -> container::Style {
     move |_| container::Style {
         text_color: Some(t.text),
@@ -363,8 +358,8 @@ pub fn pill(t: Tokens) -> impl Fn(&iced::Theme) -> container::Style {
 }
 
 /// The bottom status bar — filled `status_bg` with the muted `status_fg` as its
-/// default text colour (so the readouts read quieter than the toolbar), matching
-/// Tauri's `.statusbar`. Distinct from [`bar`] only in that it also sets the text
+/// default text colour (so the readouts read quieter than the toolbar).
+/// Distinct from [`bar`] only in that it also sets the text
 /// colour.
 pub fn status_bar(t: Tokens) -> impl Fn(&iced::Theme) -> container::Style {
     move |_| container::Style {
@@ -376,8 +371,7 @@ pub fn status_bar(t: Tokens) -> impl Fn(&iced::Theme) -> container::Style {
 
 // ---- Inputs & pickers -----------------------------------------------------
 
-/// A text input with the accent focus ring — mirrors Tauri's
-/// `input:focus { border-color: accent }`. `text_input::Style` has no `Default`,
+/// A text input with the accent focus ring. `text_input::Style` has no `Default`,
 /// so every field is explicit.
 pub fn input(t: Tokens) -> impl Fn(&iced::Theme, text_input::Status) -> text_input::Style {
     move |_, status| {
@@ -422,9 +416,15 @@ pub fn picker(
     }
 }
 
-/// The dropdown menu a pick-list opens: popup background / border, accent-tinted
-/// selection — so the menu matches the [`card`] surfaces rather than iced's
-/// default palette.
+/// The dropdown menu a pick-list opens (fonts, language, encoding, "Reopen as…"):
+/// popup background / border, accent-tinted selection — so the menu matches the
+/// [`card`] surfaces rather than iced's default palette.
+///
+/// Like [`card`], it casts **no** soft drop shadow. On the tiny-skia software
+/// renderer a blurred shadow smears: hovering a row repaints just that row without
+/// recomposing the overlapping blur, so stale shadow pixels accumulate and grow as
+/// the pointer moves across the menu. The 1px border carries the elevation instead
+/// — crisp edges repaint cleanly.
 pub fn picker_menu(t: Tokens) -> impl Fn(&iced::Theme) -> iced::widget::overlay::menu::Style {
     move |_| iced::widget::overlay::menu::Style {
         background: Background::Color(t.popup_bg),
@@ -436,10 +436,34 @@ pub fn picker_menu(t: Tokens) -> impl Fn(&iced::Theme) -> iced::widget::overlay:
         text_color: t.text,
         selected_text_color: t.accent_fg,
         selected_background: Background::Color(t.accent),
-        shadow: Shadow {
-            color: t.shadow,
-            offset: Vector::new(0.0, 6.0),
-            blur_radius: 18.0,
-        },
+        shadow: Shadow::default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A blurred drop shadow smears on the tiny-skia software renderer: hovering a
+    /// control repaints it without recomposing the overlapping blur, so stale
+    /// shadow pixels accumulate and grow as the pointer moves (the trap [`card`]
+    /// documents). Every floating surface must stay shadow-free — the elevated
+    /// cards (find / About / confirm bars / context + overflow menus) and the
+    /// pick-list dropdown menus (both font pickers, language, encoding, "Reopen
+    /// as…"). This fails if any regains a soft (blurred) shadow.
+    #[test]
+    fn floating_surfaces_cast_no_soft_shadow() {
+        for t in [LIGHT, DARK] {
+            assert_eq!(
+                card(t)(&iced::Theme::Light).shadow.blur_radius,
+                0.0,
+                "card surfaces must have no soft shadow"
+            );
+            assert_eq!(
+                picker_menu(t)(&iced::Theme::Light).shadow.blur_radius,
+                0.0,
+                "pick-list dropdown menus must have no soft shadow"
+            );
+        }
     }
 }

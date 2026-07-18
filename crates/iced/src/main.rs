@@ -47,10 +47,10 @@ mod fonts;
 mod highlight;
 use highlight::SyntectHighlighter;
 
-// Custom Tauri-matched chrome theme (#70): colour tokens ported 1:1 from the
-// retired WebView build plus the button/container/input/pick-list style helpers
-// the shell's `view` uses to paint every widget. The whole modernisation is a
-// `view`-layer change — `notepad_core` and every `Message`/`Effect` are untouched.
+// Custom chrome theme (#70): the palette colour tokens plus the button / container
+// / input / pick-list style helpers the shell's `view` uses to paint every widget.
+// The whole modernisation is a `view`-layer change — `notepad_core` and every
+// `Message`/`Effect` are untouched.
 mod theme;
 
 /// The Linux Wayland app-id / X11 `WM_CLASS`, matching the basename of
@@ -171,7 +171,7 @@ fn request_exit() -> Task<Message> {
 /// subscription (#39). Pure and unit-testable, like [`on_window_event`]. Handles
 /// both the named-key shortcuts and the Ctrl/Cmd character accelerators so every
 /// shortcut works from any focus (and immediately after launch, before the editor
-/// is clicked) — matching the WebView build's document-level listener.
+/// is clicked).
 ///
 /// * **F3 / Shift+F3** — find next / previous.
 /// * **Escape** — dismiss the About panel or find bar (resolved against live
@@ -203,7 +203,7 @@ fn on_key(key: iced::keyboard::Key, modifiers: iced::keyboard::Modifiers) -> Opt
 /// The Ctrl/Cmd **character** accelerator table (#39), shared by the global
 /// [`on_key`] subscription (which publishes the message) and [`editor_key_binding`]
 /// (which suppresses the matching character insertion in the focused editor). The
-/// table matches the WebView build's global shortcuts (`src-tauri/dist/main.js`):
+/// table covers the app's global shortcuts:
 ///
 /// * **Ctrl/Cmd+N / O / S** — new / open / save (**+Shift** on `S` = save as).
 /// * **Ctrl/Cmd+Z / Ctrl/Cmd+Shift+Z / Ctrl/Cmd+Y** — undo / redo.
@@ -427,7 +427,7 @@ enum Message {
     /// [`Shell::update`] skips the repaint nudge for it — see there.
     EditorCursorMoved(Point),
     /// Right-click on the editor: show the minimal cut/copy/paste/select-all
-    /// menu the WebView gave for free (the vendored `text_editor` has none), at
+    /// menu the vendored `text_editor` lacks, at
     /// the last tracked cursor position.
     ContextMenuOpened,
     /// Dismiss the context menu — an action was chosen, or the user clicked away.
@@ -483,9 +483,8 @@ enum Message {
     ZoomReset,
 
     // ---- Word wrap (#34) ----
-    /// Toggle soft word-wrap. Toolbar-driven, with no key accelerator — the
-    /// WebView build bound none for it either, so #39 adds none (its shortcut set
-    /// mirrors that build's).
+    /// Toggle soft word-wrap. Toolbar-driven, with no key accelerator (#39 binds
+    /// none for it).
     ToggleWordWrap,
 
     // ---- Line numbers (#41) ----
@@ -544,8 +543,8 @@ enum Message {
 
     // ---- Keyboard shortcuts (#39) ----
     /// The Escape key: contextually dismiss the top-most transient panel — the
-    /// About panel first, then the find bar — matching the WebView build's
-    /// priority. A no-op when neither is open. The remaining accelerators reuse
+    /// About panel first, then the find bar. A no-op when neither is open. The
+    /// remaining accelerators reuse
     /// the existing intents (New, Save, Undo, …); only Escape needs the current
     /// state to decide what it means, so only it gets its own message.
     Escape,
@@ -613,9 +612,9 @@ struct Shell {
     /// "drop to open" overlay in [`Shell::view`].
     drag_hover: bool,
     /// Where the editor's right-click context menu is showing, if at all (#97
-    /// item 3) — `Some(anchor)` while up, `None` while hidden. The WebView gave
-    /// right-click cut/copy/paste/select-all for free; the vendored `text_editor`
-    /// offers none, so the shell draws a minimal menu at the cursor. The anchor
+    /// item 3) — `Some(anchor)` while up, `None` while hidden. The vendored
+    /// `text_editor` offers no right-click cut/copy/paste/select-all, so the
+    /// shell draws a minimal menu at the cursor. The anchor
     /// is editor-relative (the offset `on_move` reports), so [`Shell::view`] can
     /// place the card without knowing the editor's on-screen origin.
     context_menu: Option<Point>,
@@ -1209,7 +1208,7 @@ impl Shell {
             Message::LinkOpened => Task::none(),
 
             // Escape (#39): dismiss the top-most transient panel, About first then
-            // the find bar (matching the WebView priority); a no-op otherwise. The
+            // the find bar; a no-op otherwise. The
             // vendored editor separately unfocuses on Escape, which is harmless.
             Message::Escape => {
                 if self.core.about_open() {
@@ -1301,8 +1300,8 @@ impl Shell {
         }
     }
 
-    /// Open the find bar, seeding the query from a single-line selection the way
-    /// the WebView's `openFind` did (#97 item 1): a selection with no newline
+    /// Open the find bar, seeding the query from a single-line selection (#97
+    /// item 1): a selection with no newline
     /// prefills the field, while a multi-line or empty selection opens it as-is.
     /// Either way opening never moves the caret (item 2) — the core recounts but
     /// leaves the search until Enter / Find Next.
@@ -1697,22 +1696,21 @@ impl Shell {
         // Every chrome colour comes from the active theme's tokens (#70); `Tokens`
         // is `Copy`, so `t` threads into each `.style()` closure by value.
         let t = self.tokens();
-        // Theme toggle (#36): the label names the theme you'll switch *to*, like
-        // the WebView build's button — clearer than a lit on/off state (which
-        // read as if "Dark" labelled the current mode). The moon/sun glyphs are
-        // both in the bundled DejaVu Sans Mono; the WebView's 🌙 emoji is not, so
-        // ☾ stands in for it.
+        // Theme toggle (#36): the label names the theme you'll switch *to* —
+        // clearer than a lit on/off state (which read as if "Dark" labelled the
+        // current mode). The moon/sun glyphs are both in the bundled DejaVu Sans
+        // Mono; a 🌙 emoji is not, so ☾ stands in for it.
         let theme_label = if self.core.theme() == core::ThemeMode::Dark {
             "\u{2600} Light" // ☀ — click to switch to light
         } else {
             "\u{263E} Dark" // ☾ — click to switch to dark
         };
-        // Solid file-action buttons (New/Open/Save) vs. ghost utility buttons —
-        // Tauri's `.btn` / `.btn-ghost`. The toggles below swap to the accent
-        // "on" look (`theme::accent`) while their feature is active.
+        // Solid file-action buttons (New/Open/Save) vs. ghost utility buttons.
+        // The toggles below swap to the accent "on" look (`theme::accent`) while
+        // their feature is active.
         let tb = |label: &'static str| button(text(label).font(ui)).style(theme::btn(t));
         let gh = |label: &'static str| button(text(label).font(ui)).style(theme::ghost(t));
-        // A thin vertical divider between toolbar groups — Tauri's `.sep`.
+        // A thin vertical divider between toolbar groups.
         let sep = || {
             container(Space::new())
                 .width(Length::Fixed(1.0))
@@ -1733,7 +1731,7 @@ impl Shell {
                     .style(theme::toggle(t, self.core.find.open))
                     .on_press(Message::ToggleFind),
                 // Push the View group to the right — iced has no flex spacer, so a
-                // fill-width `Space` absorbs the slack (Tauri's `.toolbar-spacer`).
+                // fill-width `Space` absorbs the slack.
                 Space::new().width(Fill),
                 // Zoom group (#35): shrink / reset-to-size / enlarge, as one control.
                 self.zoom_group(ui, t),
@@ -1746,7 +1744,7 @@ impl Shell {
                     .style(theme::toggle(t, self.core.show_line_numbers()))
                     .on_press(Message::ToggleLineNumbers),
                 // Theme toggle (#36): a plain ghost action whose label names the
-                // theme you'll switch *to* (☾ Dark / ☀ Light), matching the WebView.
+                // theme you'll switch *to* (☾ Dark / ☀ Light).
                 gh(theme_label).on_press(Message::ToggleTheme),
                 // About panel toggle (#40): accent "on" while the panel shows.
                 button(text("About").font(ui))
@@ -1814,7 +1812,7 @@ impl Shell {
             .height(Fill);
 
         // Right-click the editor for a minimal cut/copy/paste/select-all menu
-        // (#97 item 3) — the mouse-only editing the WebView gave for free. The
+        // (#97 item 3) — mouse-only editing the vendored editor lacks. The
         // vendored editor ignores the right button, so wrapping it lets the shell
         // catch the press and open the menu at the cursor.
         let editor = mouse_area(editor).on_right_press(Message::ContextMenuOpened);
@@ -1875,10 +1873,9 @@ impl Shell {
                 // when there is one, then document size.
                 //
                 // The "Sel n" readout is deliberately a single selection shown
-                // only when non-zero (#97 item 8): the WebView build summed every
-                // selection and always showed "Sel n", even at 0; iced's editor has
-                // one selection, and hiding the cell at 0 keeps the row quiet when
-                // nothing is picked. `core::status` guarantees `selection == 0` for
+                // only when non-zero (#97 item 8): iced's editor has one selection,
+                // and hiding the cell at 0 keeps the row quiet when nothing is
+                // picked. `core::status` guarantees `selection == 0` for
                 // an empty selection, which is exactly what this `> 0` gate relies on.
                 let mut left =
                     row![text(format!("Ln {}, Col {}", s.line, s.column)).font(ui)].spacing(16);
@@ -1888,7 +1885,7 @@ impl Shell {
                 left = left
                     .push(text(format!("{} chars", s.chars)).font(ui))
                     .push(text(format!("{} lines", s.lines)).font(ui));
-                // Right group: the language as a Mode pill (Tauri's `.status-pill`),
+                // Right group: the language as a Mode pill,
                 // the EOL, then the two encoding controls (#50). The first shows the
                 // active document's encoding and *converts* to whatever the user
                 // picks (re-encode on the next Save, lossy saves blocked); its label
@@ -1902,7 +1899,7 @@ impl Shell {
                     .style(theme::pill(t));
                 row![
                     left,
-                    // Push the right group to the far edge (Tauri's status spacer).
+                    // Push the right group to the far edge.
                     Space::new().width(Fill),
                     mode,
                     text(s.eol).font(ui),
@@ -1992,8 +1989,8 @@ impl Shell {
         // to the widest non-fill sibling (the toolbar) instead of the window width,
         // so `Wrapping::Word` never has a real boundary to wrap against and long
         // lines overflow with no way to scroll (#34).
-        // A 1px separator under the chrome — Tauri's toolbar `border-bottom` —
-        // dividing the toolbar / controls block from the tab strip below (#70).
+        // A 1px separator under the chrome, dividing the toolbar / controls block
+        // from the tab strip below (#70).
         let chrome_sep = container(Space::new())
             .width(Fill)
             .height(Length::Fixed(1.0))
@@ -2126,8 +2123,8 @@ impl Shell {
 
     /// The drag-and-drop hint overlay (#42), shown while a file is hovering over
     /// the window. A translucent full-window backdrop dims the editor and centres
-    /// a "Drop files to open" card, mirroring the WebView build's drop overlay so
-    /// the user sees a drop will land. Purely visual — it captures no input and
+    /// a "Drop files to open" card, so the user sees a drop will land. Purely
+    /// visual — it captures no input and
     /// disappears the instant the drag drops or leaves.
     fn drop_overlay<'a>(font: iced::Font, t: theme::Tokens) -> Element<'a, Message> {
         let card = container(text("Drop files to open").font(font).size(22))
@@ -2191,8 +2188,8 @@ impl Shell {
 
     /// The About panel (#40), shown while `core.about_open()`. Renders the app
     /// name, version, license, and the project links. The version is
-    /// `NOTEPAD_EXTRA_VERSION`, resolved from the release tag at build time (see
-    /// `build.rs`) so it tracks the GitHub release while the app stays offline.
+    /// `NOTEPAD_EXTRA_VERSION`, resolved from the workspace `[workspace.package]`
+    /// version at build time (see `build.rs`), so it needs no network.
     /// The links dispatch [`Message::OpenLink`]; the core vets each URL and only
     /// then asks the shell to hand it to the OS browser via
     /// [`core::io::open_external`] — the app never makes a network request itself.
@@ -3645,7 +3642,7 @@ mod tests {
     #[test]
     fn opening_find_ignores_a_multiline_selection() {
         // #97 item 1 prefills only from a *single-line* selection; a multi-line
-        // selection opens the bar with an empty field, matching the WebView.
+        // selection opens the bar with an empty field.
         let (mut shell, _) = Shell::new();
         let _ = shell.update(Message::Edit(paste("one\ntwo")));
         let _ = shell.update(Message::Edit(text_editor::Action::SelectAll));
@@ -4278,7 +4275,7 @@ mod tests {
     #[test]
     fn command_char_accelerators_map_to_their_intents() {
         // The core of #39: each Ctrl/Cmd letter maps to the matching editing
-        // intent, matching the WebView build's global shortcut table. `on_key`
+        // intent. `on_key`
         // publishes them from the global subscription (working from any focus).
         assert!(matches!(on_key(ch("n"), cmd()), Some(Message::NewTab)));
         assert!(matches!(on_key(ch("o"), cmd()), Some(Message::Open)));
@@ -4314,7 +4311,7 @@ mod tests {
     #[test]
     fn zoom_accelerators_cover_both_glyphs_of_each_key() {
         // Ctrl+= and Ctrl++ both zoom in; Ctrl+- and Ctrl+_ both zoom out; Ctrl+0
-        // resets — mirroring the WebView's `case '=': case '+':` grouping.
+        // resets. Each key's two glyphs are handled together.
         for c in ["=", "+"] {
             assert!(matches!(on_key(ch(c), cmd()), Some(Message::ZoomIn)));
         }
@@ -4468,7 +4465,7 @@ mod tests {
         let _ = shell.update(Message::Escape);
         assert!(!shell.core.about_open() && !shell.core.find.open);
 
-        // With both open, Escape closes About first (WebView priority)…
+        // With both open, Escape closes About first (About takes priority)…
         let _ = shell.update(Message::OpenFind);
         let _ = shell.update(Message::ToggleAbout);
         assert!(shell.core.about_open() && shell.core.find.open);
@@ -4678,19 +4675,48 @@ mod tests {
     }
 
     #[test]
-    fn about_version_is_resolved_from_the_release_tag() {
-        // The About panel's version is baked in at build time from the release
-        // tag (see `build.rs`). Whatever resolved it, the value must be a clean,
-        // offline, tag-shaped string: non-empty, no leading `v`, dotted numbers.
+    fn about_version_is_resolved_from_the_workspace_version() {
+        // The About panel's version is baked in at build time from the workspace
+        // `[workspace.package]` version (see `build.rs`). Whatever resolved it, the
+        // value must be a clean, offline, dotted version string.
         let version = env!("NOTEPAD_EXTRA_VERSION");
         assert!(!version.is_empty(), "a version is always resolved");
         assert!(
             !version.starts_with('v'),
-            "the leading `v` from the git tag is stripped: {version:?}"
+            "a Cargo version carries no leading `v`: {version:?}"
         );
         assert!(
             version.contains('.') && version.chars().next().is_some_and(|c| c.is_ascii_digit()),
             "looks like a dotted version: {version:?}"
+        );
+    }
+
+    /// Guard against release-metadata drift (#99): the shipped man page and
+    /// AppStream metainfo must both carry the current crate version — the workspace
+    /// `[workspace.package]` version (`version.workspace = true`), the single source
+    /// of truth. Bumping `Cargo.toml` but not these files (exactly how the 0.4.0
+    /// metadata went stale) fails here.
+    #[test]
+    fn shipped_metadata_matches_the_crate_version() {
+        let version = env!("CARGO_PKG_VERSION");
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
+
+        let metainfo = std::fs::read_to_string(
+            root.join("packaging/linux/io.github.PierreFouquet.NotepadExtra.metainfo.xml"),
+        )
+        .expect("read metainfo.xml");
+        assert!(
+            metainfo.contains(&format!(r#"<release version="{version}""#)),
+            "metainfo.xml has no <release> entry for {version} — bump it with the version"
+        );
+
+        let man = std::fs::read_to_string(root.join("packaging/linux/notepad-extra.1"))
+            .expect("read man page");
+        assert!(
+            man.contains(&format!("notepad-extra {version}")),
+            "man page .TH line is not at {version} — bump it with the version"
         );
     }
 

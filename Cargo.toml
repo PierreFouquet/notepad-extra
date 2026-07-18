@@ -1,14 +1,11 @@
 # --- Native-rewrite workspace (issue #25) -------------------------------------
-# The root is now a *virtual* manifest: it defines only the workspace and its
-# shared profiles, no package of its own. The former root package was the legacy
-# Tauri/WebView app; #43 removed its bundling config (`tauri.conf.json`,
-# `capabilities/`) and, since a Tauri package can't build without them, retired
-# the root package here too. The native app lives entirely under `crates/`:
+# The root is a *virtual* manifest: it defines only the workspace and its shared
+# profiles, no package of its own. The native app lives entirely under `crates/`:
 #   * notepad-syntax — shared syntect-backed language catalogue (#32)
 #   * notepad-core   — pure, UI-free `update(State, Message) -> Effect` core (#28)
 #   * notepad-iced   — thin iced render shell; builds the `notepad-extra` binary
-# The orphaned Tauri *source* (`src/`, `src-tauri/`, `gen/`, `tests/frontend/`)
-# is deleted in the #46 cutover; it no longer belongs to any package.
+# The native cutover (#46) removed the last of the original app's source, so the
+# workspace is now native-only.
 [workspace]
 members = ["crates/syntax", "crates/core", "crates/iced"]
 resolver = "2"
@@ -17,7 +14,7 @@ resolver = "2"
 # `version.workspace = true`, so a release bump has a single source of truth and
 # the packagers (deb/rpm/msi/dmg, #43) all read the same number.
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 
 # Syntax highlighting (#32) runs on syntect + fancy-regex, whose regex engine is
 # an order of magnitude slower when built without optimisation — enough to make

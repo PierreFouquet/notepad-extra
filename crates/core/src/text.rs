@@ -1,5 +1,5 @@
-//! Pure text helpers ported from the WebView app's `logic.js`. No I/O, no
-//! toolkit — just deterministic string functions the core and shell share.
+//! Pure text helpers. No I/O, no toolkit — just deterministic string functions
+//! the core and shell share.
 
 /// A file's line-ending style. The editor stores text canonically with `\n`
 /// (see [`EndOfLine::to_lf`]) and re-applies the original ending on save (see

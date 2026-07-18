@@ -1,4 +1,4 @@
-.TH NOTEPAD-EXTRA 1 "2026-07-03" "notepad-extra 0.4.0" "User Commands"
+.TH NOTEPAD-EXTRA 1 "2026-07-18" "notepad-extra 0.5.0" "User Commands"
 .SH NAME
 notepad-extra \- small, fast, fully offline text and code editor
 .SH SYNOPSIS
@@ -7,9 +7,9 @@ notepad-extra \- small, fast, fully offline text and code editor
 .SH DESCRIPTION
 .B Notepad Extra
 is a small, fast, fully offline text and code editor for Windows, macOS and
-Linux, built with Rust and Tauri and inspired by Notepad++.
+Linux, built as a native Rust application and inspired by Notepad++.
 .PP
-It offers tabbed editing, syntax highlighting for over 80 languages with
+It offers tabbed editing, syntax highlighting for over 200 languages with
 automatic detection from the file extension, find/replace/go\-to\-line with
 regex and case options, word wrap, editor zoom and light/dark themes. A file's
 original line endings (LF or CRLF) are preserved on save. The application works
@@ -38,6 +38,9 @@ Save the current file.
 .B Ctrl+Shift+S
 Save As.
 .TP
+.B "Ctrl+Z , Ctrl+Shift+Z , Ctrl+Y"
+Undo, and redo (either redo binding).
+.TP
 .B Ctrl+F
 Find.
 .TP
@@ -52,9 +55,18 @@ Go to line.
 .TP
 .B "Ctrl++ , Ctrl+- , Ctrl+0"
 Zoom in, out and reset.
+.TP
+.B Esc
+Dismiss the About panel or the find bar.
 .SH FILES
-None. Editor preferences (theme, word wrap and zoom) are stored by the platform
-web view's local storage.
+.TP
+.I $XDG_CONFIG_HOME/notepad-extra/preferences.json
+Editor preferences: theme, word wrap, zoom, the line-number gutter and the chosen
+editor and UI fonts. Falls back to
+.I ~/.config/notepad-extra/preferences.json
+when
+.B $XDG_CONFIG_HOME
+is unset. Written atomically, and absent until preferences are first saved.
 .SH BUGS
 Report bugs at
 .UR https://github.com/PierreFouquet/notepad-extra/issues

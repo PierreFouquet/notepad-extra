@@ -1,36 +1,40 @@
 # Notepad Extra
 
-Notepad but extra. A small, fast, **fully offline** text/code editor for Windows, macOS and Linux,
-built with Rust and [Tauri](https://tauri.app/). Inspired by Notepad++.
-
-> **Heads-up — a native rewrite is in progress.** Notepad Extra is migrating from
-> Tauri/WebView to a native Rust GUI ([iced](https://iced.rs/)). The app described
-> below is the current Tauri build; see [Native rewrite](#native-rewrite-in-progress)
-> for the in-flight work.
+Notepad but extra. A small, fast, **fully offline** text/code editor for Windows, macOS and
+Linux, built as a native Rust GUI with [iced](https://iced.rs/). Inspired by Notepad++.
 
 ## Features
 
 - Cross-platform: Windows (x64 + ARM64), macOS (Intel + Apple Silicon), Linux (x64 + ARM64)
-- **Works fully offline** — CodeMirror is vendored locally, no network access at runtime
-- Tabbed editing with unsaved-change indicators
-- **Syntax highlighting for 80+ languages** — C/C++/C#, Java, JavaScript/TypeScript/JSX, Python, Go, Rust, Ruby, PHP, Swift, Kotlin, HTML/CSS/SCSS, Markdown, SQL, YAML/TOML, shell, PowerShell, Haskell, and many more, grouped in the language menu (all modes vendored locally)
+- **Works fully offline** — no runtime network access of any kind; fonts are embedded as bytes and all syntax data is compiled in
+- Tabbed editing with unsaved-change indicators, and a guard against closing a tab or quitting the app with unsaved work
+- **Syntax highlighting for 200+ languages** — C/C++/C#, Java, JavaScript/TypeScript/JSX, Python, Go, Rust, Ruby, PHP, Swift, Kotlin, HTML/CSS/SCSS, Markdown, SQL, YAML/TOML, shell, PowerShell, Haskell, and many more, grouped in the language menu (powered by [syntect](https://github.com/trishume/syntect) with the pure-Rust fancy-regex backend — no native highlighting dependency)
 - Automatic language detection from the file extension
-- **Find / Replace / Go-to-line** (`Ctrl+F` / `Ctrl+H` / `Ctrl+G`, `F3` for next) with regex & case options
+- **Find / Replace / Go-to-line** (`Ctrl+F` / `Ctrl+H` / `Ctrl+G`, `F3` for next) with regex, case and whole-word options
+- **Multi-encoding** open/save — BOM/heuristic detection on open, per-tab encoding, a convert picker and a separate "Reopen as…", with lossy saves blocked
 - **Word wrap** toggle
 - **Zoom** the editor font (`Ctrl++` / `Ctrl+-` / `Ctrl+0`)
-- **Light / Dark theme** toggle (remembers your choice, along with wrap & zoom)
+- **Light / Dark theme** toggle (remembers your choice, along with wrap, zoom, fonts and the gutter)
+- Separate **editor and UI font pickers** — bundled DejaVu Sans Mono is always available; the rest come from your installed fonts
 - **Status bar**: line/column, selection length, document length & line count, EOL style, encoding
 - **About dialog** with version, license and links (opens in your own browser; the app never fetches anything itself)
 - Preserves a file's original line endings (LF / CRLF) on save
-- Open / Save / **Save As** with broad file-type filters
+- Open / Save / **Save As** with broad file-type filters, plus drag-and-drop and command-line file opening
 - Line numbers, bracket matching, active-line highlight
 
 ### Adding a language
 
-All languages are defined in one table — `LANGUAGES` in [`src-tauri/dist/logic.js`](src-tauri/dist/logic.js).
-Add a row (value, label, group, extensions), drop the matching CodeMirror mode file
-under `src-tauri/dist/vendor/codemirror/mode/`, add it to `MODE_SCRIPTS`, then run
-`node scripts/gen-index.js` to regenerate the dropdown and `<script>` tags in `index.html`.
+Languages come from syntect's bundled grammar set (the extended
+[`two-face`](https://github.com/CosmicHorrorDev/two-face) set, ~200 languages), compiled
+into the binary — there is no per-language table to maintain and no mode files to vendor.
+To cover a language the set doesn't already highlight:
+
+- If it's an **extension the grammar doesn't list** but which maps to an existing grammar,
+  add a `(extension, syntax-name)` row to `EXT_ALIASES` in
+  [`crates/syntax/src/lib.rs`](crates/syntax/src/lib.rs) — a test asserts every alias resolves.
+- If it's a **genuinely new grammar**, add its `.sublime-syntax` to the set the crate loads.
+
+Everything stays offline and pure-Rust (fancy-regex, no oniguruma C dependency).
 
 ## Keyboard shortcuts
 
@@ -48,86 +52,70 @@ under `src-tauri/dist/vendor/codemirror/mode/`, add it to `MODE_SCRIPTS`, then r
 | Zoom in / out / reset | `Ctrl/Cmd + +` / `-` / `0` |
 | Close find bar / About panel | `Esc` |
 
-## Native rewrite (in progress)
-
-To qualify for official inclusion in Debian, Fedora/RHEL and downstream distros —
-and to drop the `webkit2gtk` runtime dependency — Notepad Extra is moving off
-Tauri/WebView + CodeMirror to a **native Rust GUI built with [iced](https://iced.rs/)**.
-It stays **fully offline** and cross-platform (Windows/macOS/Linux remain first-class).
-
-- **Epic:** [#25](https://github.com/PierreFouquet/notepad-extra/issues/25) ·
-  **Toolkit RFC (decided → iced):** [#26](https://github.com/PierreFouquet/notepad-extra/issues/26)
-- The rewrite lands incrementally as a Cargo workspace under `crates/`. The root
-  crate stays the Tauri app until the final cutover (#46), so today's released
-  build is unaffected.
-  - `crates/core` — the pure, UI-free `update(State, Message) -> Effect` core: all
-    editor behaviour with **no window and no GPU**, so it is exhaustively testable
-    (unit + property + fuzz + stress).
-  - `crates/iced` — the thin [iced](https://iced.rs/) render shell: renders the
-    core's state and executes its `Effect`s (native dialogs, file I/O, window
-    title). Software-rendered (`tiny-skia`, no GPU); its core wiring is tested
-    headlessly and CI smoke-launches it under `xvfb`.
-- Test standard and how to run each layer: [docs/testing.md](docs/testing.md).
-  Native CI lives in [`.github/workflows/native-ci.yml`](.github/workflows/native-ci.yml).
-- Rendering the shell (the vendored `text_editor`, damage/repaint traps, drawing
-  decorations): [docs/native-rendering.md](docs/native-rendering.md).
-
 ## Development
 
 ### Prerequisites
 
 - Rust (latest stable) via [rustup](https://rustup.rs/)
-- Tauri CLI: `cargo install tauri-cli --version "^2.0.0" --locked`
-- Node.js (only to run the frontend logic tests — **not** required to build the app)
-- Linux only — system libraries:
+- **Linux only** — the editor is software-rendered (no GPU required), but it dlopens the
+  X11/Wayland, xkbcommon and fontconfig client libraries at runtime. On a typical desktop
+  they are already installed; CI adds just:
 
   ```bash
   sudo apt-get update && sudo apt-get install -y \
-    libwebkit2gtk-4.1-dev build-essential curl wget file \
-    libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf libfuse2
+    libxkbcommon0 libxkbcommon-x11-0
   ```
+
+  (The packaged `.deb`/`.rpm` declare the full runtime dependency set — see
+  [`crates/iced/Cargo.toml`](crates/iced/Cargo.toml).)
+
+Windows and macOS need no extra system packages; they use their native window and dialog backends.
 
 ### Run & build
 
 ```bash
-cargo tauri dev     # run with hot-reload
-cargo tauri build   # build optimized installers for the current platform
+cargo run --package notepad-iced              # run the app
+cargo build --release --package notepad-iced  # optimised binary → target/release/notepad-extra
 ```
+
+The built binary is named `notepad-extra`. Native installers are produced by the
+`packaging/` scripts (see [Releases](#releases)).
 
 ### Tests
 
 ```bash
-# Current Tauri app
-cargo test -p notepad-extra            # Rust backend (file I/O, EOL handling, error cases)
-node --test tests/frontend/*.test.js   # frontend logic (language/EOL/path helpers)
-
-# Native rewrite core (no window / no GPU)
-cargo test -p notepad-core             # unit + property + stress tests
-scripts/coverage.sh                    # coverage gate (needs `cargo install cargo-llvm-cov`)
+cargo test --package notepad-core --package notepad-syntax   # pure logic: unit + property + stress
+cargo test --package notepad-iced --all-targets              # shell wiring + headless UI simulator
+scripts/coverage.sh                                          # coverage gate (needs `cargo install cargo-llvm-cov`)
 ```
 
-The Tauri suites run in `.github/workflows/ci.yml`; the native crates run in
-`.github/workflows/native-ci.yml`. See [docs/testing.md](docs/testing.md) for
-fuzzing and the full test standard.
+Fuzz targets live under `crates/core/fuzz/` (nightly + `cargo-fuzz`). Everything runs in
+[`.github/workflows/native-ci.yml`](.github/workflows/native-ci.yml); see
+[docs/testing.md](docs/testing.md) for the full test standard and
+[docs/native-rendering.md](docs/native-rendering.md) for the render-shell drawing notes.
 
 ## Releases
 
-Installers are built and attached automatically **when you publish a GitHub
-Release** (`.github/workflows/release.yml`, triggered on `release: published`):
+Installers are built and attached automatically **when you publish a GitHub Release**
+([`.github/workflows/release.yml`](.github/workflows/release.yml), triggered on `release: published`):
 
-1. Bump the version in `Cargo.toml` and `tauri.conf.json`.
-2. On GitHub, **Releases → Draft a new release**, create the tag (e.g. `v0.2.0`),
-   and click **Publish**.
+1. Bump the version in **`Cargo.toml`** (`[workspace.package]`), the metainfo `<release>` entry
+   ([`packaging/linux/io.github.PierreFouquet.NotepadExtra.metainfo.xml`](packaging/linux/io.github.PierreFouquet.NotepadExtra.metainfo.xml))
+   and the man page `.TH` line ([`packaging/linux/notepad-extra.1`](packaging/linux/notepad-extra.1)).
+   A test enforces that all three agree, so none can silently drift.
+2. On GitHub, **Releases → Draft a new release**, create the tag (e.g. `v0.5.0`), and click **Publish**.
 3. CI builds every platform and uploads the bundles onto that release.
 
-> A manual `workflow_dispatch` run is also available; it builds into a fresh draft release instead.
+> A manual `workflow_dispatch` run is also available; it saves the packages as run artifacts instead.
+>
+> Only the current release is supported - older versions receive no further fixes.
 
 Artifacts produced:
 
 | Platform | Files | Covers |
 | --- | --- | --- |
 | Linux x86_64 + aarch64 | `.deb`, `.rpm`, `.AppImage` | Debian/Ubuntu (deb), Fedora/RHEL/openSUSE (rpm), **any distro incl. Arch** (AppImage) |
-| macOS Intel + Apple Silicon | `.dmg` / `.app` | macOS 10.15+ |
+| macOS Intel + Apple Silicon | `.dmg` / `.app` | macOS 14 (Sonoma)+ |
 | Windows x64 + ARM64 | `.msi` / NSIS `.exe` | Windows 10/11 |
 
 > GitHub-hosted ARM runners (`*-arm`) are free for public repositories; on private repos those jobs are billable.
@@ -135,18 +123,15 @@ Artifacts produced:
 ## Project layout
 
 ```text
-Cargo.toml            # Cargo workspace root (still the Tauri app crate)
-build.rs              # Tauri build script
-tauri.conf.json       # Tauri app configuration
-capabilities/         # Tauri v2 capability/permission files
-src/                  # Rust: main.rs (commands) + lib.rs (file I/O)
-src-tauri/dist/       # Frontend (HTML/CSS/JS) + vendored CodeMirror (offline)
-crates/core/          # Native rewrite: pure update core (no window / no GPU)
-crates/iced/          # Native rewrite: thin iced render shell (executes Effects)
-docs/testing.md       # Native rewrite: test standard
-docs/native-rendering.md # Native rewrite: render-shell drawing notes & traps
-scripts/              # Helper scripts (coverage gate, index generation)
-tests/                # Rust integration tests + frontend logic tests
+Cargo.toml               # Cargo workspace root (virtual manifest — shared version & profiles)
+crates/syntax/           # Shared syntect-backed language catalogue
+crates/core/             # Pure update core (State / Message / Effect) — no window, no GPU
+crates/iced/             # Thin iced render shell — builds the `notepad-extra` binary
+packaging/               # Native packaging scripts + Linux desktop/metainfo/man assets
+icons/                   # Application icons (all platforms)
+docs/testing.md          # Test standard
+docs/native-rendering.md # Render-shell drawing notes & traps
+scripts/                 # Helper scripts (coverage gate)
 ```
 
 ## License

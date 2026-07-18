@@ -1,5 +1,5 @@
-//! Filesystem + URL helpers, ported from the Tauri app's `src/lib.rs`. These are
-//! the *executors* the render shell calls when it performs an [`crate::Effect`];
+//! Filesystem + URL helpers. These are the *executors* the render shell calls
+//! when it performs an [`crate::Effect`];
 //! `update` itself never calls them. Return types are plain `Result<_, String>`
 //! (no `serde_json`) now that there is no JS bridge to cross.
 

@@ -6,8 +6,8 @@
 # Usage: packaging/build-linux.sh [deb|rpm|appimage|all]   (default: all)
 #
 # Requires (installed by CI): cargo-deb, cargo-generate-rpm; AppImage also needs
-# curl (fetches linuxdeploy on demand). The binary itself carries no webkit/gtk
-# build deps — the whole point of the native rewrite (#25).
+# curl (fetches linuxdeploy on demand). The binary itself needs no system
+# GUI-toolkit build deps — the whole point of the native rewrite (#25).
 set -euo pipefail
 
 FORMAT="${1:-all}"

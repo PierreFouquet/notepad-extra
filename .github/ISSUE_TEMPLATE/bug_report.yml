@@ -127,7 +127,7 @@ body:
       description: Which bundle did you download?
       options:
         - ".msi (Windows)"
-        - ".exe / NSIS (Windows)"
+        - ".exe portable, no install (Windows)"
         - ".dmg (macOS)"
         - ".app (macOS)"
         - ".deb (Debian/Ubuntu)"

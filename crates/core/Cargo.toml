@@ -41,6 +41,14 @@ serde_json = "1"
 encoding_rs = "0.8"
 chardetng = "1"
 
+# Unicode-correct word segmentation for the status-bar word count (#55) and the
+# grapheme-/word-aware text operations — Title-case word boundaries (#54).
+# `unicode-segmentation` implements UAX #29; pure Rust, no C dependency, no
+# network, and already present in the locked tree (a transitive dep of syntect
+# via `notepad-syntax`), so promoting it to a direct dependency vendors nothing
+# new for #17.
+unicode-segmentation = "1"
+
 [dev-dependencies]
 proptest = "1"
 tempfile = "3.6"

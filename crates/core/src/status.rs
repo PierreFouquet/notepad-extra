@@ -14,6 +14,7 @@
 
 use crate::app::Document;
 use crate::find;
+use unicode_segmentation::UnicodeSegmentation;
 
 /// A snapshot of everything the status bar displays, derived purely from a
 /// document's text and the caret / selection.
@@ -27,6 +28,12 @@ pub struct StatusBar {
     pub selection: usize,
     /// Total number of characters in the document.
     pub chars: usize,
+    /// Total number of words in the document (#55). Counted with Unicode word
+    /// segmentation (UAX #29) rather than whitespace splitting, so it is correct
+    /// for scripts without spaces (each CJK ideograph is a word) and for
+    /// punctuation-joined words (`don't` is one word), matching the module's
+    /// character-based, Unicode-correct counting elsewhere.
+    pub words: usize,
     /// Total number of lines. A trailing newline counts a final empty line,
     /// matching [`find::line_count`] and the editor widget's own line count.
     pub lines: usize,
@@ -54,6 +61,7 @@ pub fn status(doc: &Document, caret: usize, anchor: Option<usize>) -> StatusBar 
         column: column + 1,
         selection: anchor.map_or(0, |a| char_span(text, a, caret)),
         chars: text.chars().count(),
+        words: word_count(text),
         lines: find::line_count(text),
         eol: doc.eol.label(),
         encoding: doc.encoding.label().to_string(),
@@ -72,6 +80,16 @@ fn char_position(text: &str, offset: usize) -> (usize, usize) {
     let line_start = prefix.rfind('\n').map_or(0, |i| i + 1);
     let column = text[line_start..offset].chars().count();
     (line, column)
+}
+
+/// Number of words in `text`, per Unicode word segmentation (UAX #29). This
+/// counts only *word-like* segments — runs of letters/numbers, apostrophe-joined
+/// words like `don't`, and individual CJK ideographs — while whitespace and
+/// standalone punctuation contribute nothing. It therefore differs from a plain
+/// whitespace split (`"a,b,c"` is three words, not one; `"你好"` is two, not one),
+/// which is the more Unicode-correct behaviour this module aims for.
+fn word_count(text: &str) -> usize {
+    text.unicode_words().count()
 }
 
 /// Number of characters in the byte range between `a` and `b` (order doesn't
@@ -165,6 +183,22 @@ mod tests {
     }
 
     #[test]
+    fn word_count_is_unicode_aware() {
+        // Whitespace-separated words across line breaks.
+        assert_eq!(status(&doc("hello world"), 0, None).words, 2);
+        assert_eq!(status(&doc("one\ntwo\nthree"), 0, None).words, 3);
+        // Punctuation splits words (unlike a whitespace split), but an
+        // apostrophe inside a word does not.
+        assert_eq!(status(&doc("a,b,c"), 0, None).words, 3);
+        assert_eq!(status(&doc("don't stop"), 0, None).words, 2);
+        // Leading/trailing/standalone punctuation and whitespace count nothing.
+        assert_eq!(status(&doc("  ...  "), 0, None).words, 0);
+        assert_eq!(status(&doc(""), 0, None).words, 0);
+        // Each CJK ideograph is its own word (no spaces to split on).
+        assert_eq!(status(&doc("你好"), 0, None).words, 2);
+    }
+
+    #[test]
     fn trailing_newline_counts_a_final_empty_line() {
         let text = "a\n";
         let s = status(&doc(text), text.len(), None);
@@ -213,6 +247,9 @@ mod tests {
             prop_assert_eq!(s.lines, find::line_count(&text));
             prop_assert!(s.line <= s.lines);
             prop_assert!(s.selection <= s.chars);
+            // Every word holds at least one character and words never overlap,
+            // so the word count can never exceed the character count.
+            prop_assert!(s.words <= s.chars);
             prop_assert_eq!(s.eol, "LF");
             prop_assert_eq!(s.encoding, "UTF-8");
         }

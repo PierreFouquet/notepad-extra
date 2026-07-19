@@ -25,6 +25,7 @@ pub mod io;
 pub mod prefs;
 pub mod status;
 pub mod text;
+pub mod textops;
 
 pub use app::{Document, Effect, FindOption, FindState, Message, State, TabId, update};
 // Re-exported so the shell can name the theme type through `notepad_core` (#36);
@@ -38,3 +39,4 @@ pub use notepad_syntax::ThemeMode;
 pub use prefs::Preferences;
 pub use status::{StatusBar, status};
 pub use text::EndOfLine;
+pub use textops::TextOp;

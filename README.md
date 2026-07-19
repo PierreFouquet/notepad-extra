@@ -114,9 +114,9 @@ Artifacts produced:
 
 | Platform | Files | Covers |
 | --- | --- | --- |
-| Linux x86_64 + aarch64 | `.deb`, `.rpm`, `.AppImage` | Debian/Ubuntu (deb), Fedora/RHEL/openSUSE (rpm), **any distro incl. Arch** (AppImage) |
+| Linux x86_64 + aarch64 | `.deb`, `.rpm`, `.AppImage` | Debian/Ubuntu (deb), Fedora/RHEL/openSUSE (rpm), **any distro** (AppImage) |
 | macOS Intel + Apple Silicon | `.dmg` / `.app` | macOS 14 (Sonoma)+ |
-| Windows x64 + ARM64 | `.msi` / NSIS `.exe` | Windows 10/11 |
+| Windows x64 + ARM64 | `.msi` (x64) / portable `.exe` (x64 + ARM64) | Windows 10/11; ARM64 has no `.msi` — use the portable `.exe` |
 
 > GitHub-hosted ARM runners (`*-arm`) are free for public repositories; on private repos those jobs are billable.
 

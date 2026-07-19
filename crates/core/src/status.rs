@@ -126,6 +126,8 @@ mod tests {
             history: History::new(),
             saved_content: content.to_string(),
             saved_encoding: FileEncoding::default(),
+            disk_status: crate::app::DiskStatus::InSync,
+            disk: None,
         }
     }
 

@@ -5,13 +5,13 @@
 
 use arbitrary::{Arbitrary, Unstructured};
 use libfuzzer_sys::fuzz_target;
-use notepad_core::{FileEncoding, FindOption, Message, State, TabId, update};
+use notepad_core::{DiskMeta, FileEncoding, FindOption, Message, State, TabId, update};
 use std::path::PathBuf;
 
 // Built here rather than deriving `Arbitrary` on the core types, so the core
 // stays free of the `arbitrary` dependency.
 fn arb_message(u: &mut Unstructured) -> arbitrary::Result<Message> {
-    Ok(match u.int_in_range(0u8..=30)? {
+    Ok(match u.int_in_range(0u8..=34)? {
         0 => Message::NewTab,
         1 => Message::OpenRequested,
         2 => Message::SaveRequested,
@@ -25,6 +25,7 @@ fn arb_message(u: &mut Unstructured) -> arbitrary::Result<Message> {
             path: PathBuf::from(String::arbitrary(u)?),
             content: String::arbitrary(u)?,
             encoding: FileEncoding::default(),
+            disk: None,
         },
         10 => Message::SavePathChosen {
             id: TabId::arbitrary(u)?,
@@ -33,6 +34,7 @@ fn arb_message(u: &mut Unstructured) -> arbitrary::Result<Message> {
         11 => Message::FileSaved {
             id: TabId::arbitrary(u)?,
             path: PathBuf::from(String::arbitrary(u)?),
+            disk: None,
         },
         // Find / Replace / Go-to (#33): exercise the whole bar under fuzzing, so
         // stale-offset regressions (e.g. undo/redo shrinking the buffer) surface.
@@ -68,7 +70,33 @@ fn arb_message(u: &mut Unstructured) -> arbitrary::Result<Message> {
         // unrelated later save, would surface here as a broken invariant.
         28 => Message::QuitRequested,
         29 => Message::QuitDiscardAll,
-        _ => Message::QuitSaveAll,
+        30 => Message::QuitSaveAll,
+        // External-change watch (#51): drive the disk verdict (a fresh fingerprint
+        // or a gone file) and the reload / keep-mine / overwrite answers onto
+        // arbitrary ids, so the state machine and the stale-save guard are stormed
+        // alongside everything else — a `disk_status` that strands, or a buffer an
+        // external change silently rewrote, would surface as a broken invariant.
+        31 => Message::DiskChanged {
+            id: TabId::arbitrary(u)?,
+            meta: if bool::arbitrary(u)? {
+                Some(DiskMeta {
+                    modified: None,
+                    len: u64::arbitrary(u)?,
+                    hash: u64::arbitrary(u)?,
+                })
+            } else {
+                None
+            },
+        },
+        32 => Message::ReloadFromDisk {
+            id: TabId::arbitrary(u)?,
+        },
+        33 => Message::KeepMine {
+            id: TabId::arbitrary(u)?,
+        },
+        _ => Message::OverwriteConfirmed {
+            id: TabId::arbitrary(u)?,
+        },
     })
 }
 

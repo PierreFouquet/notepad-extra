@@ -28,6 +28,7 @@ fn hundreds_of_open_operations_stay_bounded() {
                 path: PathBuf::from(format!("/tmp/file{i}.txt")),
                 content: format!("contents of file {i}\n"),
                 encoding: FileEncoding::default(),
+                disk: None,
             },
         );
         assert!(!s.docs.is_empty());
@@ -156,6 +157,7 @@ fn rapid_tab_switch_storm_stays_consistent() {
                 path: PathBuf::from(format!("/tmp/tab{i}.txt")),
                 content: format!("content {i}\n"),
                 encoding: FileEncoding::default(),
+                disk: None,
             },
         );
     }
@@ -236,6 +238,7 @@ fn save_all_quit_across_many_tabs_exits_exactly_once() {
                 path: PathBuf::from(format!("/tmp/q{i}.txt")),
                 content: format!("base {i}\n"),
                 encoding: FileEncoding::default(),
+                disk: None,
             },
         );
         update(&mut s, Message::Edited(format!("edit {i}"))); // dirties the active tab
@@ -256,6 +259,7 @@ fn save_all_quit_across_many_tabs_exits_exactly_once() {
             Message::FileSaved {
                 id,
                 path: PathBuf::from("/tmp/q.txt"),
+                disk: None,
             },
         );
         assert!(
@@ -269,6 +273,7 @@ fn save_all_quit_across_many_tabs_exits_exactly_once() {
         Message::FileSaved {
             id: *ids.last().unwrap(),
             path: PathBuf::from("/tmp/q.txt"),
+            disk: None,
         },
     );
     assert_eq!(
@@ -293,6 +298,7 @@ fn many_large_tabs_are_retained_then_freed() {
                 path: PathBuf::from(format!("/tmp/big{i}.txt")),
                 content: big.clone(),
                 encoding: FileEncoding::default(),
+                disk: None,
             },
         );
     }
@@ -409,6 +415,7 @@ fn status_on_a_huge_single_line_stays_correct() {
             path: PathBuf::from("/tmp/big.txt"),
             content: huge.clone(),
             encoding: FileEncoding::default(),
+            disk: None,
         },
     );
     let doc = s.active_doc();
@@ -435,6 +442,7 @@ fn status_on_a_million_line_document_stays_correct() {
             path: PathBuf::from("/tmp/lines.txt"),
             content,
             encoding: FileEncoding::default(),
+            disk: None,
         },
     );
     let doc = s.active_doc();

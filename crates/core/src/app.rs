@@ -12,11 +12,61 @@ use crate::prefs::Preferences;
 use crate::text::{self, EndOfLine};
 use notepad_syntax::ThemeMode;
 use std::path::PathBuf;
+use std::time::SystemTime;
 
 /// Stable identifier for an open document, so effects that complete
 /// asynchronously (a save that resolves after the user typed in another tab)
 /// still target the right buffer regardless of reordering.
 pub type TabId = u64;
+
+/// A fingerprint of a file's on-disk state, captured by the shell when it reads
+/// or writes the bytes and stored as a per-document baseline (#51). The pure core
+/// never stats a file itself — it only compares fingerprints the shell hands it —
+/// so `DiskMeta` is a plain value with no I/O.
+///
+/// Change detection is `mtime`+`len` with a `hash` tiebreak, matching mature
+/// editors: a bare `touch` (mtime moves, bytes unchanged) folds to the same
+/// `hash`, so it is not mistaken for a real edit, while a same-size, same-mtime
+/// rewrite is still caught by the `hash`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiskMeta {
+    /// The file's last-modified time, or `None` on a platform / filesystem that
+    /// does not expose one (comparison then falls back to `len` + `hash`).
+    pub modified: Option<SystemTime>,
+    /// The file's length in bytes.
+    pub len: u64,
+    /// A hash of the file's raw bytes (the shell already holds them, so this costs
+    /// no extra read). The authority on whether the *content* actually differs.
+    pub hash: u64,
+}
+
+impl DiskMeta {
+    /// Whether two fingerprints describe the same file *content*. Only the `hash`
+    /// decides this — `mtime`/`len` are the cheap gate the shell uses before it
+    /// bothers to hash, not part of the content identity — so a touched-but-
+    /// unchanged file (new mtime, same bytes) reads as unchanged here.
+    fn same_content(&self, other: &DiskMeta) -> bool {
+        self.hash == other.hash && self.len == other.len
+    }
+}
+
+/// How a document's buffer relates to its file on disk (#51). Drives the
+/// external-change bar the shell shows; `InSync` (the default) shows nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DiskStatus {
+    /// The buffer's baseline matches the file on disk (or the tab has no file).
+    #[default]
+    InSync,
+    /// The file changed on disk since we loaded/saved it. The buffer is kept
+    /// untouched; the shell offers to reload (or resolve a conflict when dirty).
+    /// Carries the *observed* on-disk fingerprint so that "Keep mine"
+    /// ([`Message::KeepMine`]) can adopt it as the new baseline and stop the same
+    /// change re-prompting on the next watch event.
+    Modified(DiskMeta),
+    /// The file was deleted or renamed out from under us. The buffer is kept in
+    /// memory as "unsaved / source gone".
+    Gone,
+}
 
 /// One open document.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +104,14 @@ pub struct Document {
     /// buffer that is otherwise unchanged still marks it dirty (a *convert*), so
     /// the next Save re-encodes it.
     pub(crate) saved_encoding: FileEncoding,
+    /// How the buffer currently relates to the file on disk (#51). Set by the
+    /// external-change watch; `InSync` for a fresh or in-sync tab. Read by the
+    /// shell to raise the reload / conflict / "source gone" bar.
+    pub disk_status: DiskStatus,
+    /// The on-disk fingerprint captured at the last load/save (#51), or `None` for
+    /// a never-saved buffer. The baseline the watch compares fresh stats against
+    /// to tell an external change from our own write.
+    pub(crate) disk: Option<DiskMeta>,
 }
 
 impl Document {
@@ -69,6 +127,8 @@ impl Document {
             history: History::new(),
             saved_content: String::new(),
             saved_encoding: FileEncoding::default(),
+            disk_status: DiskStatus::InSync,
+            disk: None,
         }
     }
 
@@ -83,6 +143,13 @@ impl Document {
     /// whether the current content still matches the last saved baseline.
     pub fn dirty(&self) -> bool {
         self.content != self.saved_content || self.encoding != self.saved_encoding
+    }
+
+    /// The on-disk fingerprint captured at the last load/save (#51), or `None` for
+    /// a never-saved buffer. The shell reads it to do the cheap `mtime`/`len` gate
+    /// before deciding whether to hash the file on a watch event.
+    pub fn disk_meta(&self) -> Option<&DiskMeta> {
+        self.disk.as_ref()
     }
 
     /// The tab / window title: the file name, or `Untitled` for a fresh buffer.
@@ -413,19 +480,26 @@ pub enum Message {
     OpenRequested,
     /// The shell finished reading a file the user chose or dropped. `encoding` is
     /// what the shell auto-detected from the bytes ([`crate::encoding::decode`]).
+    /// `disk` is the file's fingerprint at read time (#51), the baseline the
+    /// external-change watch compares against; `None` if the shell could not stat
+    /// it.
     FileLoaded {
         path: PathBuf,
         content: String,
         encoding: FileEncoding,
+        disk: Option<DiskMeta>,
     },
-    /// The shell re-read an already-open document `id` under a user-chosen
-    /// encoding (a *reopen*, see [`Message::ReopenAs`]). Replaces that tab's
-    /// buffer like a fresh load — re-detects EOL, resets history and the saved
-    /// baseline — but keeps its path and language.
+    /// The shell re-read an already-open document `id` — either a *reopen* under a
+    /// user-chosen encoding (see [`Message::ReopenAs`]) or a *reload* from disk
+    /// after an external change (see [`Message::ReloadFromDisk`]). Replaces that
+    /// tab's buffer like a fresh load — re-detects EOL, resets history and the
+    /// saved baseline, clears any external-change status — but keeps its path and
+    /// language. `disk` is the fresh on-disk fingerprint (#51).
     FileReloaded {
         id: TabId,
         content: String,
         encoding: FileEncoding,
+        disk: Option<DiskMeta>,
     },
     /// The editor's text for the active document changed.
     Edited(String),
@@ -439,8 +513,14 @@ pub enum Message {
     SaveAsRequested,
     /// The shell's save picker returned a destination for document `id`.
     SavePathChosen { id: TabId, path: PathBuf },
-    /// The shell finished writing document `id` to `path`.
-    FileSaved { id: TabId, path: PathBuf },
+    /// The shell finished writing document `id` to `path`. `disk` is the file's
+    /// fingerprint right after the write (#51), which becomes the new baseline so
+    /// the watch does not mistake our own save for an external change.
+    FileSaved {
+        id: TabId,
+        path: PathBuf,
+        disk: Option<DiskMeta>,
+    },
     /// A save for document `id` did not complete — the user cancelled the save
     /// picker, or the write errored. Drops any pending "save before closing" so
     /// the tab is not left primed to close on a later, unrelated save (#31).
@@ -571,6 +651,29 @@ pub enum Message {
     /// mirroring how a lossy save is blocked.
     ReopenAs(String),
 
+    // ---- External-change watch (#51) ----
+    /// The shell's filesystem watch observed a change to document `id`'s file and
+    /// reports the fresh on-disk fingerprint. `meta` is `Some` when the file still
+    /// exists (compared against the stored baseline: an equal fingerprint is our
+    /// own write and a no-op, a touched-but-unchanged file refreshes the baseline
+    /// silently, and a real content change sets [`DiskStatus::Modified`]); `None`
+    /// means the file was deleted or renamed away, setting [`DiskStatus::Gone`].
+    /// The buffer is never touched here — an external change only *marks* the tab.
+    DiskChanged { id: TabId, meta: Option<DiskMeta> },
+    /// The user chose to reload document `id` from disk after an external change,
+    /// discarding any unsaved edits. Emits [`Effect::ReloadFile`], which re-reads
+    /// and reports [`Message::FileReloaded`]; a no-op for a tab with no path.
+    ReloadFromDisk { id: TabId },
+    /// The user chose to keep their in-memory buffer over the external change to
+    /// document `id`. Adopts the observed on-disk fingerprint as the new baseline
+    /// (so the same change stops prompting) and clears the status, leaving the
+    /// buffer — and its dirty state — untouched. A later Save overwrites the file.
+    KeepMine { id: TabId },
+    /// The user confirmed overwriting the changed-on-disk file for document `id`
+    /// at the stale-save guard (see [`Effect::ConfirmOverwrite`]): proceed with the
+    /// write the guard held back, emitting the [`Effect::WriteFile`].
+    OverwriteConfirmed { id: TabId },
+
     // ---- About dialog + external links (#40) ----
     /// Show the About panel.
     AboutOpened,
@@ -597,6 +700,15 @@ pub enum Effect {
     /// decode refuses bytes not valid in `encoding`; the shell then surfaces the
     /// error and leaves the buffer untouched, mirroring a blocked lossy save.
     ReadFileAs {
+        id: TabId,
+        path: PathBuf,
+        encoding: FileEncoding,
+    },
+    /// Re-read document `id`'s `path` and decode it as `encoding` (tolerantly, like
+    /// a normal open — *not* the strict decode [`Effect::ReadFileAs`] uses), then
+    /// report [`Message::FileReloaded`] with a fresh [`DiskMeta`]. Emitted by
+    /// [`Message::ReloadFromDisk`] to reload a file changed on disk (#51).
+    ReloadFile {
         id: TabId,
         path: PathBuf,
         encoding: FileEncoding,
@@ -634,6 +746,12 @@ pub enum Effect {
     /// [`Message::QuitDiscardAll`], or nothing (cancel). The whole-app analogue of
     /// [`Effect::ConfirmClose`]; `dirty` is the count for the prompt's wording.
     ConfirmQuit { dirty: usize },
+    /// A Save would overwrite document `id`'s file, which changed on disk since we
+    /// loaded/saved it (the stale-save guard, #51). The shell must warn before
+    /// clobbering the newer disk copy, replying with [`Message::OverwriteConfirmed`]
+    /// (write anyway), [`Message::SaveAsRequested`] (write elsewhere), or nothing
+    /// (cancel). `title` names the document for the prompt.
+    ConfirmOverwrite { id: TabId, title: String },
     /// It is safe to exit: no unsaved changes remain (or the user chose to discard
     /// them, or every save-before-quit has landed). The shell performs the actual
     /// window close / process exit (#69). The core never exits a process itself —
@@ -668,6 +786,7 @@ pub fn update(state: &mut State, message: Message) -> Vec<Effect> {
             path,
             content,
             encoding,
+            disk,
         } => {
             let eol = EndOfLine::detect(&content);
             let normalized = EndOfLine::to_lf(&content);
@@ -688,6 +807,8 @@ pub fn update(state: &mut State, message: Message) -> Vec<Effect> {
                 doc.history = History::new(); // loaded content is the clean baseline
                 doc.saved_content = normalized.clone();
                 doc.saved_encoding = encoding;
+                doc.disk_status = DiskStatus::InSync;
+                doc.disk = disk;
                 state.active = 0;
             } else {
                 let id = state.alloc_id();
@@ -702,6 +823,8 @@ pub fn update(state: &mut State, message: Message) -> Vec<Effect> {
                     history: History::new(),
                     saved_content: normalized.clone(),
                     saved_encoding: encoding,
+                    disk_status: DiskStatus::InSync,
+                    disk,
                 });
                 state.active = state.docs.len() - 1;
             }
@@ -713,10 +836,12 @@ pub fn update(state: &mut State, message: Message) -> Vec<Effect> {
             id,
             content,
             encoding,
+            disk,
         } => {
-            // A reopen re-decodes the same file under a new encoding: replace the
-            // buffer like a fresh load (re-detect EOL, reset history + baseline),
-            // but keep the path and language — only the encoding changed.
+            // A reopen/reload re-reads the same file: replace the buffer like a
+            // fresh load (re-detect EOL, reset history + baseline, adopt the fresh
+            // on-disk fingerprint and clear any external-change status), but keep
+            // the path and language.
             let eol = EndOfLine::detect(&content);
             let normalized = EndOfLine::to_lf(&content);
             if let Some(doc) = state.doc_mut(id) {
@@ -726,6 +851,8 @@ pub fn update(state: &mut State, message: Message) -> Vec<Effect> {
                 doc.history = History::new();
                 doc.saved_content = normalized;
                 doc.saved_encoding = encoding;
+                doc.disk_status = DiskStatus::InSync;
+                doc.disk = disk;
             }
             resync_find_after_doc_change(state);
             title_effect(state)
@@ -776,12 +903,18 @@ pub fn update(state: &mut State, message: Message) -> Vec<Effect> {
         Message::SaveRequested => {
             let doc = state.active_doc();
             match &doc.path {
-                Some(path) => vec![Effect::WriteFile {
-                    id: doc.id,
-                    path: path.clone(),
-                    content: doc.eol.join(&doc.content),
-                    encoding: doc.encoding,
-                }],
+                // The file changed on disk since we loaded/saved it: warn before
+                // clobbering the newer copy (#51). The live watch keeps
+                // `disk_status` current, so the staleness is already known here —
+                // no stat needed, the guard stays pure. `OverwriteConfirmed` then
+                // proceeds with the same write.
+                Some(_) if doc.disk_status != DiskStatus::InSync => {
+                    vec![Effect::ConfirmOverwrite {
+                        id: doc.id,
+                        title: doc.title().to_string(),
+                    }]
+                }
+                Some(path) => vec![write_effect(doc, path.clone())],
                 None => vec![Effect::PickSavePath { id: doc.id }],
             }
         }
@@ -790,17 +923,15 @@ pub fn update(state: &mut State, message: Message) -> Vec<Effect> {
             id: state.active_doc().id,
         }],
 
+        // Save-As to a freshly-picked path: no stale-save guard — the native save
+        // picker already confirmed any overwrite, and the tab's `disk_status`
+        // refers to the *old* file, not this new destination.
         Message::SavePathChosen { id, path } => match state.doc_mut(id) {
-            Some(doc) => vec![Effect::WriteFile {
-                id,
-                path,
-                content: doc.eol.join(&doc.content),
-                encoding: doc.encoding,
-            }],
+            Some(doc) => vec![write_effect(doc, path)],
             None => vec![],
         },
 
-        Message::FileSaved { id, path } => {
+        Message::FileSaved { id, path, disk } => {
             if let Some(doc) = state.doc_mut(id) {
                 // Re-detect from the (possibly new, on Save As) path, but leave any
                 // manual language override untouched — saving must not clobber it.
@@ -812,6 +943,11 @@ pub fn update(state: &mut State, message: Message) -> Vec<Effect> {
                 // set (mirrors `saved_content`).
                 doc.saved_encoding = doc.encoding;
                 doc.history.mark_saved();
+                // Our own write is now the on-disk truth: adopt its fingerprint as
+                // the new baseline and clear any external-change status, so the
+                // watch event this save triggers reads as a no-op (#51).
+                doc.disk_status = DiskStatus::InSync;
+                doc.disk = disk;
             }
             // A "save before closing" was waiting on this write (#31): now that it
             // landed, close the tab and repoint find at the new active document.
@@ -1132,6 +1268,88 @@ pub fn update(state: &mut State, message: Message) -> Vec<Effect> {
             }
         }
 
+        // ---- External-change watch (#51) ----
+        // The watch reports a fresh on-disk fingerprint (or `None` for a deleted /
+        // renamed file). Compare it to the stored baseline and only *mark* the tab
+        // — never touch the buffer. The decision is pure and total, so the whole
+        // reload/conflict flow is driven from tests as synthetic message streams.
+        Message::DiskChanged { id, meta } => {
+            let Some(doc) = state.doc_mut(id) else {
+                return vec![]; // the tab was closed before the event arrived
+            };
+            match meta {
+                // The file is gone (deleted / renamed away). Keep the buffer in
+                // memory as "unsaved / source gone"; the shell offers Save As.
+                None => doc.disk_status = DiskStatus::Gone,
+                Some(fresh) => match doc.disk {
+                    // No baseline was captured at load (a rare stat failure): adopt
+                    // this fingerprint rather than cry wolf — without a baseline we
+                    // can't prove the content changed.
+                    None => {
+                        doc.disk = Some(fresh);
+                        doc.disk_status = DiskStatus::InSync;
+                    }
+                    // Exactly our baseline (our own write, or the identical file
+                    // restored after a delete): in sync, clear any prior status.
+                    Some(base) if fresh == base => doc.disk_status = DiskStatus::InSync,
+                    // Same content, only the mtime moved (a `touch`): refresh the
+                    // baseline so the shell's cheap gate matches next time, and
+                    // don't nag about a non-change.
+                    Some(base) if fresh.same_content(&base) => {
+                        doc.disk = Some(fresh);
+                        doc.disk_status = DiskStatus::InSync;
+                    }
+                    // A real content change on disk. Mark it (carrying the observed
+                    // fingerprint for "Keep mine"); the buffer is untouched, so a
+                    // dirty buffer keeps its unsaved edits and the shell shows the
+                    // reload-vs-conflict bar — never clobbering.
+                    Some(_) => doc.disk_status = DiskStatus::Modified(fresh),
+                },
+            }
+            vec![] // the bar is derived from `disk_status` in the shell's view
+        }
+
+        // Reload the file from disk, discarding unsaved edits. Re-reads via
+        // `ReloadFile`, which reports `FileReloaded` (buffer replaced, baseline
+        // reset, status cleared). A tab with no path has nothing to reload.
+        Message::ReloadFromDisk { id } => match state.doc_mut(id) {
+            Some(doc) => match &doc.path {
+                Some(path) => vec![Effect::ReloadFile {
+                    id,
+                    path: path.clone(),
+                    encoding: doc.encoding,
+                }],
+                None => vec![],
+            },
+            None => vec![],
+        },
+
+        // Keep the in-memory buffer over the external change: adopt the observed
+        // fingerprint as the new baseline (so the same change stops prompting on
+        // the next watch event) and clear the status. The buffer — and its dirty
+        // state — is left as-is, so the next Save overwrites the file (its guard is
+        // now satisfied). A `Gone`/`InSync` dismiss simply clears the status.
+        Message::KeepMine { id } => {
+            if let Some(doc) = state.doc_mut(id) {
+                if let DiskStatus::Modified(fresh) = doc.disk_status {
+                    doc.disk = Some(fresh);
+                }
+                doc.disk_status = DiskStatus::InSync;
+            }
+            vec![]
+        }
+
+        // The user confirmed the stale-save overwrite (#51): proceed with the
+        // write the guard held back. `FileSaved` then refreshes the baseline and
+        // clears the status.
+        Message::OverwriteConfirmed { id } => match state.doc_mut(id) {
+            Some(doc) => match &doc.path {
+                Some(path) => vec![write_effect(doc, path.clone())],
+                None => vec![],
+            },
+            None => vec![],
+        },
+
         // ---- About dialog + external links (#40) ----
         // Opening/closing the panel is a pure UI flag with no side effect. A link
         // click becomes an `OpenUrl` effect only when the URL is a safe `https`
@@ -1161,6 +1379,18 @@ fn title_effect(state: &State) -> Vec<Effect> {
         title: doc.title().to_string(),
         dirty: doc.dirty(),
     }]
+}
+
+/// The [`Effect::WriteFile`] that saves `doc` to `path` with its current EOL and
+/// encoding. The single place the save payload is built, so the direct save and
+/// the post-`OverwriteConfirmed` save (#51) stay identical.
+fn write_effect(doc: &Document, path: PathBuf) -> Effect {
+    Effect::WriteFile {
+        id: doc.id,
+        path,
+        content: doc.eol.join(&doc.content),
+        encoding: doc.encoding,
+    }
 }
 
 /// Remove the document at `index`, preserving the two core invariants: the list
@@ -1401,8 +1631,19 @@ mod tests {
                 path: PathBuf::from(path),
                 content: content.to_string(),
                 encoding: FileEncoding::default(),
+                disk: None,
             },
         )
+    }
+
+    /// A synthetic on-disk fingerprint for the external-change tests (#51). The
+    /// hash stands in for the shell's byte hash; `len`/`modified` round it out.
+    fn meta(hash: u64, len: u64) -> DiskMeta {
+        DiskMeta {
+            modified: Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(hash)),
+            len,
+            hash,
+        }
     }
 
     #[test]
@@ -1568,6 +1809,7 @@ mod tests {
             Message::FileSaved {
                 id,
                 path: PathBuf::from("/tmp/new.py"),
+                disk: None,
             },
         );
         assert!(!s.active_doc().dirty());
@@ -1674,6 +1916,7 @@ mod tests {
             Message::FileSaved {
                 id: 9999,
                 path: PathBuf::from("/tmp/x.rs"),
+                disk: None,
             },
         );
         assert_eq!(
@@ -1792,6 +2035,7 @@ mod tests {
             Message::FileSaved {
                 id,
                 path: PathBuf::from("/tmp/notes.md"),
+                disk: None,
             },
         );
         assert_eq!(
@@ -1827,6 +2071,7 @@ mod tests {
                 path: PathBuf::from("/t/legacy.txt"),
                 content: "café".to_string(),
                 encoding: enc("Windows-1252"),
+                disk: None,
             },
         );
         assert_eq!(s.active_doc().encoding, enc("Windows-1252"));
@@ -1938,6 +2183,7 @@ mod tests {
                 id,
                 content: "x\r\ny\r\nz".to_string(), // now CRLF
                 encoding: enc("Windows-1252"),
+                disk: None,
             },
         );
         assert_eq!(s.active_doc().content, "x\ny\nz"); // stored canonical LF
@@ -1967,6 +2213,7 @@ mod tests {
             Message::FileSaved {
                 id,
                 path: PathBuf::from("/t/doc.txt"),
+                disk: None,
             },
         );
         assert!(
@@ -2171,6 +2418,7 @@ mod tests {
             Message::FileSaved {
                 id,
                 path: PathBuf::from("/t/close.txt"),
+                disk: None,
             },
         );
         assert_eq!(s.docs.len(), 1, "the write landed → the tab closed");
@@ -2210,6 +2458,7 @@ mod tests {
             Message::FileSaved {
                 id,
                 path: PathBuf::from("/t/s.txt"),
+                disk: None,
             },
         );
         assert_eq!(s.docs.len(), 1);
@@ -2238,6 +2487,7 @@ mod tests {
             Message::FileSaved {
                 id,
                 path: PathBuf::from("/t/later.txt"),
+                disk: None,
             },
         );
         assert_eq!(s.docs.len(), 1);
@@ -2366,6 +2616,7 @@ mod tests {
             Message::FileSaved {
                 id: id0,
                 path: PathBuf::from("/t/a.txt"),
+                disk: None,
             },
         );
         assert!(!has_quit(&fx0), "one save still outstanding");
@@ -2377,6 +2628,7 @@ mod tests {
             Message::FileSaved {
                 id: id1,
                 path: PathBuf::from("/t/b.txt"),
+                disk: None,
             },
         );
         assert!(has_quit(&fx1), "every save landed → quit");
@@ -2410,6 +2662,7 @@ mod tests {
             Message::FileSaved {
                 id,
                 path: PathBuf::from("/t/s.txt"),
+                disk: None,
             },
         );
         assert!(has_quit(&done));
@@ -2471,6 +2724,7 @@ mod tests {
             Message::FileSaved {
                 id: id0,
                 path: PathBuf::from("/t/a.txt"),
+                disk: None,
             },
         );
         assert!(
@@ -2691,6 +2945,7 @@ mod tests {
             Message::FileSaved {
                 id,
                 path: PathBuf::from("/t/x.txt"),
+                disk: None,
             },
         );
         find_for(&mut s, "zzz");
@@ -2710,6 +2965,7 @@ mod tests {
             Message::FileSaved {
                 id,
                 path: PathBuf::from("/t/x.txt"),
+                disk: None,
             },
         );
         assert!(!s.active_doc().dirty());
@@ -2779,6 +3035,7 @@ mod tests {
             Message::FileSaved {
                 id,
                 path: PathBuf::from("/t/x.txt"),
+                disk: None,
             },
         );
         find_for(&mut s, "zzz");
@@ -3236,6 +3493,351 @@ mod tests {
         }
     }
 
+    // ---- External-change watch (#51) ----
+
+    /// Load `content` at `path` with an explicit on-disk fingerprint baseline, so
+    /// the watch tests start from a known `disk`.
+    fn load_with_meta(state: &mut State, path: &str, content: &str, disk: DiskMeta) {
+        update(
+            state,
+            Message::FileLoaded {
+                path: PathBuf::from(path),
+                content: content.to_string(),
+                encoding: FileEncoding::default(),
+                disk: Some(disk),
+            },
+        );
+    }
+
+    #[test]
+    fn file_loaded_captures_the_disk_baseline() {
+        let mut s = State::default();
+        let m = meta(7, 3);
+        load_with_meta(&mut s, "/t/a.txt", "abc", m);
+        assert_eq!(s.active_doc().disk_meta(), Some(&m));
+        assert_eq!(s.active_doc().disk_status, DiskStatus::InSync);
+    }
+
+    #[test]
+    fn external_change_while_clean_marks_modified_without_touching_the_buffer() {
+        let mut s = State::default();
+        load_with_meta(&mut s, "/t/a.txt", "abc", meta(1, 3));
+        let id = s.active_doc().id;
+        let fx = update(
+            &mut s,
+            Message::DiskChanged {
+                id,
+                meta: Some(meta(2, 4)), // different content
+            },
+        );
+        assert!(
+            fx.is_empty(),
+            "marking is pure state — the bar is derived in view"
+        );
+        assert_eq!(s.active_doc().disk_status, DiskStatus::Modified(meta(2, 4)));
+        assert_eq!(s.active_doc().content, "abc", "the buffer is never touched");
+    }
+
+    #[test]
+    fn external_change_while_dirty_preserves_unsaved_edits() {
+        // The data-loss case the whole feature exists to prevent: an external
+        // change must never discard the user's in-memory edits.
+        let mut s = State::default();
+        load_with_meta(&mut s, "/t/a.txt", "abc", meta(1, 3));
+        update(&mut s, Message::Edited("abc + mine".into()));
+        assert!(s.active_doc().dirty());
+        let id = s.active_doc().id;
+        update(
+            &mut s,
+            Message::DiskChanged {
+                id,
+                meta: Some(meta(2, 9)),
+            },
+        );
+        assert_eq!(s.active_doc().disk_status, DiskStatus::Modified(meta(2, 9)));
+        assert_eq!(
+            s.active_doc().content,
+            "abc + mine",
+            "unsaved edits survive"
+        );
+        assert!(s.active_doc().dirty(), "and the tab stays dirty");
+    }
+
+    #[test]
+    fn our_own_write_is_not_seen_as_an_external_change() {
+        let mut s = State::default();
+        load_with_meta(&mut s, "/t/a.txt", "abc", meta(1, 3));
+        let id = s.active_doc().id;
+        // A save lands with a fresh baseline (the shell re-stats after writing)…
+        update(
+            &mut s,
+            Message::FileSaved {
+                id,
+                path: PathBuf::from("/t/a.txt"),
+                disk: Some(meta(5, 3)),
+            },
+        );
+        // …then the watch event our own write triggered reports that same
+        // fingerprint: it must fold to a no-op, not raise a bar.
+        update(
+            &mut s,
+            Message::DiskChanged {
+                id,
+                meta: Some(meta(5, 3)),
+            },
+        );
+        assert_eq!(s.active_doc().disk_status, DiskStatus::InSync);
+    }
+
+    #[test]
+    fn a_touch_with_no_content_change_does_not_prompt() {
+        let mut s = State::default();
+        // Baseline mtime is UNIX_EPOCH+1s (from `meta(1, 3)`).
+        load_with_meta(&mut s, "/t/a.txt", "abc", meta(1, 3));
+        let id = s.active_doc().id;
+        // Same hash + len (content unchanged), only a newer mtime — a bare `touch`.
+        let touched = DiskMeta {
+            modified: Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(99)),
+            len: 3,
+            hash: 1,
+        };
+        update(
+            &mut s,
+            Message::DiskChanged {
+                id,
+                meta: Some(touched),
+            },
+        );
+        assert_eq!(
+            s.active_doc().disk_status,
+            DiskStatus::InSync,
+            "no false alarm"
+        );
+        assert_eq!(
+            s.active_doc().disk_meta(),
+            Some(&touched),
+            "the baseline mtime is refreshed so we don't re-hash next time"
+        );
+    }
+
+    #[test]
+    fn a_deleted_file_is_marked_gone_and_keeps_the_buffer() {
+        let mut s = State::default();
+        load_with_meta(&mut s, "/t/a.txt", "abc", meta(1, 3));
+        let id = s.active_doc().id;
+        update(&mut s, Message::DiskChanged { id, meta: None });
+        assert_eq!(s.active_doc().disk_status, DiskStatus::Gone);
+        assert_eq!(
+            s.active_doc().content,
+            "abc",
+            "the buffer is kept in memory"
+        );
+    }
+
+    #[test]
+    fn reload_from_disk_emits_a_reload_then_replaces_the_buffer() {
+        let mut s = State::default();
+        load_with_meta(&mut s, "/t/a.txt", "old", meta(1, 3));
+        let id = s.active_doc().id;
+        update(
+            &mut s,
+            Message::DiskChanged {
+                id,
+                meta: Some(meta(2, 3)),
+            },
+        );
+        // The user clicks Reload: the core asks the shell to re-read the file.
+        let fx = update(&mut s, Message::ReloadFromDisk { id });
+        assert_eq!(
+            fx,
+            vec![Effect::ReloadFile {
+                id,
+                path: PathBuf::from("/t/a.txt"),
+                encoding: FileEncoding::default(),
+            }]
+        );
+        // The shell reports the fresh bytes + fingerprint back.
+        update(
+            &mut s,
+            Message::FileReloaded {
+                id,
+                content: "new from disk".into(),
+                encoding: FileEncoding::default(),
+                disk: Some(meta(2, 3)),
+            },
+        );
+        assert_eq!(s.active_doc().content, "new from disk");
+        assert_eq!(s.active_doc().disk_status, DiskStatus::InSync);
+        assert_eq!(s.active_doc().disk_meta(), Some(&meta(2, 3)));
+        assert!(
+            !s.active_doc().dirty(),
+            "a reload is a fresh clean baseline"
+        );
+    }
+
+    #[test]
+    fn reload_from_disk_without_a_path_is_a_noop() {
+        let mut s = State::default();
+        // A fresh untitled tab has no path.
+        let id = s.active_doc().id;
+        assert!(update(&mut s, Message::ReloadFromDisk { id }).is_empty());
+    }
+
+    #[test]
+    fn keep_mine_adopts_the_disk_baseline_and_stops_re_prompting() {
+        let mut s = State::default();
+        load_with_meta(&mut s, "/t/a.txt", "abc", meta(1, 3));
+        update(&mut s, Message::Edited("mine".into()));
+        let id = s.active_doc().id;
+        let fresh = meta(2, 9);
+        update(
+            &mut s,
+            Message::DiskChanged {
+                id,
+                meta: Some(fresh),
+            },
+        );
+        assert_eq!(s.active_doc().disk_status, DiskStatus::Modified(fresh));
+
+        update(&mut s, Message::KeepMine { id });
+        assert_eq!(s.active_doc().disk_status, DiskStatus::InSync);
+        assert_eq!(s.active_doc().content, "mine", "the buffer is kept");
+        assert!(s.active_doc().dirty(), "and stays dirty for the next save");
+        assert_eq!(s.active_doc().disk_meta(), Some(&fresh), "baseline adopted");
+
+        // A second watch event for that same on-disk state must not re-prompt.
+        update(
+            &mut s,
+            Message::DiskChanged {
+                id,
+                meta: Some(fresh),
+            },
+        );
+        assert_eq!(s.active_doc().disk_status, DiskStatus::InSync);
+    }
+
+    #[test]
+    fn stale_save_guard_prompts_before_overwriting_a_changed_file() {
+        let mut s = State::default();
+        load_with_meta(&mut s, "/t/a.txt", "abc", meta(1, 3));
+        update(&mut s, Message::Edited("mine".into()));
+        let id = s.active_doc().id;
+        update(
+            &mut s,
+            Message::DiskChanged {
+                id,
+                meta: Some(meta(2, 9)),
+            },
+        );
+
+        let fx = update(&mut s, Message::SaveRequested);
+        assert_eq!(
+            fx,
+            vec![Effect::ConfirmOverwrite {
+                id,
+                title: "a.txt".into(),
+            }],
+            "a stale save warns instead of writing straight over the newer copy"
+        );
+
+        // Confirming the overwrite proceeds with the write.
+        let fx = update(&mut s, Message::OverwriteConfirmed { id });
+        assert!(
+            matches!(fx.as_slice(), [Effect::WriteFile { id: w, .. }] if *w == id),
+            "got {fx:?}"
+        );
+    }
+
+    #[test]
+    fn an_in_sync_save_writes_directly_without_a_prompt() {
+        // Regression guard on the untouched happy path.
+        let mut s = State::default();
+        load_with_meta(&mut s, "/t/a.txt", "abc", meta(1, 3));
+        update(&mut s, Message::Edited("mine".into()));
+        let fx = update(&mut s, Message::SaveRequested);
+        assert!(
+            matches!(fx.as_slice(), [Effect::WriteFile { .. }]),
+            "an in-sync save must not prompt: {fx:?}"
+        );
+    }
+
+    #[test]
+    fn save_as_to_a_new_path_ignores_a_stale_status() {
+        // Save-As picks a fresh destination the native dialog already confirmed;
+        // the tab's stale status refers to the *old* file, so no overwrite guard.
+        let mut s = State::default();
+        load_with_meta(&mut s, "/t/a.txt", "abc", meta(1, 3));
+        let id = s.active_doc().id;
+        update(
+            &mut s,
+            Message::DiskChanged {
+                id,
+                meta: Some(meta(2, 9)),
+            },
+        );
+        let fx = update(
+            &mut s,
+            Message::SavePathChosen {
+                id,
+                path: PathBuf::from("/t/elsewhere.txt"),
+            },
+        );
+        assert!(
+            matches!(fx.as_slice(), [Effect::WriteFile { .. }]),
+            "Save-As writes to the new path without a stale-save prompt: {fx:?}"
+        );
+    }
+
+    #[test]
+    fn disk_changed_for_an_unknown_id_is_a_noop() {
+        let mut s = State::default();
+        load_with_meta(&mut s, "/t/a.txt", "abc", meta(1, 3));
+        assert!(
+            update(
+                &mut s,
+                Message::DiskChanged {
+                    id: 9999,
+                    meta: None
+                }
+            )
+            .is_empty()
+        );
+        assert_eq!(s.active_doc().disk_status, DiskStatus::InSync);
+    }
+
+    proptest! {
+        /// No stream of external-change verdicts (`DiskChanged`) or "keep mine"
+        /// dismissals may ever alter a document's buffer — an external change only
+        /// marks a tab, it never edits it. This is the no-data-loss guarantee.
+        #[test]
+        fn watch_verdicts_never_touch_the_buffer(
+            content in ".{0,80}",
+            verdicts in prop::collection::vec(
+                prop_oneof![
+                    Just(None),
+                    (any::<u64>(), 0u64..128).prop_map(|(h, l)| Some((h, l))),
+                ],
+                0..40,
+            ),
+        ) {
+            let mut s = State::default();
+            load_with_meta(&mut s, "/t/a.txt", &content, meta(0, content.len() as u64));
+            let id = s.active_doc().id;
+            for v in verdicts {
+                let msg = match v {
+                    None => Message::DiskChanged { id, meta: None },
+                    Some((h, l)) => Message::DiskChanged {
+                        id,
+                        meta: Some(DiskMeta { modified: None, len: l, hash: h }),
+                    },
+                };
+                update(&mut s, msg);
+                update(&mut s, Message::KeepMine { id });
+                prop_assert_eq!(&s.active_doc().content, &content, "buffer must be untouched");
+            }
+        }
+    }
+
     // ---- Property-based invariants (epic #25 Definition of Done) ----
 
     fn arb_message() -> impl Strategy<Value = Message> {
@@ -3257,11 +3859,13 @@ mod tests {
             ("[a-z]{1,6}", 0u64..8).prop_map(|(n, id)| Message::FileSaved {
                 id,
                 path: PathBuf::from(format!("/t/{n}.txt")),
+                disk: None,
             }),
             ("[a-z]{1,6}", any::<String>()).prop_map(|(n, c)| Message::FileLoaded {
                 path: PathBuf::from(format!("/t/{n}.txt")),
                 content: c,
                 encoding: FileEncoding::default(),
+                disk: None,
             }),
             // Find / Replace / Go-to (#33): include regex metacharacters so
             // invalid patterns and catastrophic-looking ones exercise the guard.
@@ -3331,7 +3935,29 @@ mod tests {
                 id,
                 content: c,
                 encoding: FileEncoding::default(),
+                disk: None,
             }),
+            // External-change watch (#51): drive the disk verdict onto small ids
+            // (some real, some stale), a mix of "gone" and a fresh fingerprint, plus
+            // the reload / keep-mine / overwrite answers, so the state machine and
+            // the stale-save guard are exercised under long random streams and the
+            // invariants below prove they never corrupt the model.
+            prop_oneof![
+                (0u64..8).prop_map(|id| Message::DiskChanged { id, meta: None }),
+                (0u64..8, any::<u64>(), 0u64..64).prop_map(|(id, hash, len)| {
+                    Message::DiskChanged {
+                        id,
+                        meta: Some(DiskMeta {
+                            modified: None,
+                            len,
+                            hash,
+                        }),
+                    }
+                }),
+                (0u64..8).prop_map(|id| Message::ReloadFromDisk { id }),
+                (0u64..8).prop_map(|id| Message::KeepMine { id }),
+                (0u64..8).prop_map(|id| Message::OverwriteConfirmed { id }),
+            ],
         ]
     }
 

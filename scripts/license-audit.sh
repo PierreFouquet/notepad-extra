@@ -57,7 +57,8 @@ OUT="packaging/CRATE-LICENSES.md"
 ALLOWED='{
   "MIT":1,"Apache-2.0":1,"Apache-2.0 WITH LLVM-exception":1,
   "BSD-2-Clause":1,"BSD-3-Clause":1,"ISC":1,
-  "Zlib":1,"0BSD":1,"Unlicense":1,"Unicode-3.0":1
+  "Zlib":1,"0BSD":1,"Unlicense":1,"Unicode-3.0":1,
+  "CC0-1.0":1
 }'
 
 command -v jq >/dev/null || { echo "error: jq is required" >&2; exit 2; }

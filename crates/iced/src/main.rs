@@ -26,7 +26,7 @@ use iced::widget::{
 };
 use iced::{Element, Fill, Length, Point, Subscription, Task};
 use notepad_core as core;
-use notepad_core::{Effect, FindOption, TabId};
+use notepad_core::{DiskMeta, DiskStatus, Effect, FindOption, TabId};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -52,6 +52,12 @@ use highlight::SyntectHighlighter;
 // The whole modernisation is a `view`-layer change — `notepad_core` and every
 // `Message`/`Effect` are untouched.
 mod theme;
+
+// External-change watch (#51): the `notify` filesystem watcher bridged to a
+// debounced stream of `Message::DiskEvent`s. The reload/conflict *decision* logic
+// lives in `notepad_core`; this module is only the edge that reports which watched
+// files changed on disk.
+mod watch;
 
 /// The Linux Wayland app-id / X11 `WM_CLASS`, matching the basename of
 /// `packaging/linux/io.github.PierreFouquet.NotepadExtra.desktop` and its
@@ -299,6 +305,44 @@ fn on_event(
     }
 }
 
+/// The external-change watch subscription worker (#51): bridge the `notify`
+/// filesystem watcher (via [`watch::spawn_watch`]) to a stream of debounced
+/// [`Message::DiskEvent`] batches. A plain `fn` with no captures, as
+/// `Subscription::run_with` requires — the watched set arrives through `files`,
+/// which also keys the subscription's identity.
+// `run_with` demands `fn(&D)`, so the param must be `&Vec<_>`; and its `S` must be
+// a single type, so the returned stream is boxed rather than an `impl Stream` that
+// (under the 2024 capture rules) would borrow the `&Vec` lifetime.
+#[allow(clippy::ptr_arg)]
+fn watch_worker(
+    files: &Vec<PathBuf>,
+) -> std::pin::Pin<Box<dyn iced::futures::Stream<Item = Message> + Send>> {
+    use iced::futures::channel::mpsc::Sender;
+    use iced::futures::{SinkExt, StreamExt};
+    let files = files.clone();
+    Box::pin(iced::stream::channel(
+        16,
+        move |mut output: Sender<Message>| async move {
+            let Some((mut batches, watcher)) = watch::spawn_watch(files) else {
+                // A watcher could not be created: idle forever rather than ending
+                // the stream (iced would treat an ended stream as done and not
+                // restart it until the watched set — the key — changes).
+                std::future::pending::<()>().await;
+                return;
+            };
+            while let Some(paths) = batches.next().await {
+                if output.send(Message::DiskEvent(paths)).await.is_err() {
+                    break; // the application side went away
+                }
+            }
+            // Keep the watcher alive for the whole loop; drop it here (and on
+            // stream cancellation), stopping the watch and letting its debounce
+            // thread exit.
+            drop(watcher);
+        },
+    ))
+}
+
 /// The window / taskbar icon, decoded from the embedded `icons/icon.png` (#66).
 ///
 /// The PNG travels *inside* the binary via `include_bytes!`, so the icon needs
@@ -399,8 +443,48 @@ enum Message {
     Saved {
         id: TabId,
         path: PathBuf,
-        result: Result<(), String>,
+        /// `Ok` carries the fingerprint of the bytes just written (#51), which
+        /// becomes the tab's new on-disk baseline; `Err` is the write failure.
+        result: Result<DiskMeta, String>,
     },
+
+    // ---- External-change watch (#51) ----
+    /// The filesystem watch ([`watch`]) reported that these watched paths changed
+    /// on disk — debounced and filtered to open files. Each is checked against its
+    /// tab's baseline; unchanged ones are dropped, real changes become a
+    /// [`core::Message::DiskChanged`].
+    DiskEvent(Vec<PathBuf>),
+    /// The off-thread stat + hash of a changed file finished: `meta` is its fresh
+    /// fingerprint, or `None` if it is gone / unreadable. Fed straight to the core,
+    /// which decides whether it is our own write, a touch, or a real change.
+    DiskChangeObserved {
+        id: TabId,
+        meta: Option<DiskMeta>,
+    },
+    /// Document `id` was re-read for a *reload from disk* after an external change
+    /// ([`Effect::ReloadFile`]). Unlike the strict [`Message::FileReloaded`] reopen,
+    /// the bytes are decoded *tolerantly* under the tab's encoding
+    /// ([`core::encoding::decode_with`]) — a reload reopens the file as-is, it must
+    /// not fail on bytes that don't fit. A read error is surfaced in the banner.
+    DiskReloaded {
+        id: TabId,
+        encoding: core::FileEncoding,
+        result: Result<Vec<u8>, String>,
+    },
+    /// The disk-changed bar's "Reload" button (#51): reload the active tab from
+    /// disk, discarding unsaved edits.
+    ReloadChangedFile,
+    /// The disk-changed bar's "Keep mine" / "Keep in editor" button (#51): keep the
+    /// active tab's buffer and dismiss the bar, adopting the disk state as the new
+    /// baseline so the same change stops prompting.
+    KeepMyChanges,
+    /// The stale-save bar's "Overwrite" button (#51): write over the newer disk
+    /// copy after all.
+    OverwriteConfirmed,
+    /// The stale-save bar's "Cancel" button (#51): abandon the write, leaving both
+    /// the buffer and the disk file untouched.
+    OverwriteCancelled,
+
     /// Dismiss the read/save error banner (#97 item 7), so the status row
     /// (Ln/Col, …) it hid comes back without waiting for a later operation. The
     /// next real edit clears it too; this is the `×` for when there's no edit.
@@ -624,6 +708,19 @@ struct PendingLargeOpen {
     encoding: core::FileEncoding,
     /// The measured line count, shown in the prompt so the user knows the scale.
     lines: usize,
+    /// The file's fingerprint at read time (#51), threaded through so accepting the
+    /// large open records the same external-change baseline a normal open would.
+    disk: Option<DiskMeta>,
+}
+
+/// A document whose Save is waiting on the stale-save overwrite prompt (#51): the
+/// file changed on disk since we loaded/saved it, so the core raised
+/// [`Effect::ConfirmOverwrite`] rather than clobbering the newer copy. Rendered as
+/// an in-app bar, like [`PendingClose`].
+#[derive(Debug, Clone)]
+struct PendingOverwrite {
+    id: TabId,
+    title: String,
 }
 
 /// Measure a freshly decoded buffer against the large-file thresholds (#102) in
@@ -669,6 +766,10 @@ struct Shell {
     /// drives the in-app large-file confirm bar in [`Shell::view`]. `Some` holds
     /// the already-decoded buffer so accepting loads it without re-reading disk.
     confirm_large_open: Option<PendingLargeOpen>,
+    /// A Save awaiting the stale-save overwrite prompt (#51), if any; drives the
+    /// in-app overwrite bar in [`Shell::view`]. `Some` means the file changed on
+    /// disk and the core raised [`Effect::ConfirmOverwrite`] instead of writing.
+    confirm_overwrite: Option<PendingOverwrite>,
     /// Whether a file drag is currently hovering over the window (#42); drives the
     /// "drop to open" overlay in [`Shell::view`].
     drag_hover: bool,
@@ -799,6 +900,7 @@ impl Shell {
                 confirm_close: None,
                 confirm_quit: None,
                 confirm_large_open: None,
+                confirm_overwrite: None,
                 drag_hover: false,
                 context_menu: None,
                 cursor_in_editor: Point::ORIGIN,
@@ -914,7 +1016,12 @@ impl Shell {
             Message::NewTab => self.apply_core(core::Message::NewTab, true),
             Message::Open => self.apply_core(core::Message::OpenRequested, false),
             Message::Save => self.apply_core(core::Message::SaveRequested, false),
-            Message::SaveAs => self.apply_core(core::Message::SaveAsRequested, false),
+            Message::SaveAs => {
+                // A Save-As writes to a freshly-picked path, so any pending
+                // stale-save overwrite prompt for the old file is moot (#51).
+                self.confirm_overwrite = None;
+                self.apply_core(core::Message::SaveAsRequested, false)
+            }
             // Undo/redo rewrite the buffer in the core, so resync the editor from
             // it. Reached from the toolbar and the Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y
             // accelerators (#39).
@@ -1010,6 +1117,10 @@ impl Shell {
                     // Auto-detect the encoding from the raw bytes (#50); a binary
                     // or non-UTF-8 file decodes lossily rather than erroring (#59).
                     let (content, encoding) = core::encoding::decode(&bytes);
+                    // Fingerprint the file now, while we hold its bytes, so the
+                    // external-change watch has a baseline from the moment the tab
+                    // opens (#51) — no second read.
+                    let disk = Some(watch::fingerprint(&path, &bytes));
                     // Large-file guard (#102): the vendored editor shapes every
                     // line up front, so a huge file is slow to open. Stash the
                     // decoded buffer and ask before loading rather than freezing
@@ -1020,6 +1131,7 @@ impl Shell {
                             content,
                             encoding,
                             lines,
+                            disk,
                         });
                         return Task::none();
                     }
@@ -1028,6 +1140,7 @@ impl Shell {
                             path,
                             content,
                             encoding,
+                            disk,
                         },
                         true,
                     )
@@ -1046,6 +1159,7 @@ impl Shell {
                         path: pending.path,
                         content: pending.content,
                         encoding: pending.encoding,
+                        disk: pending.disk,
                     },
                     true,
                 ),
@@ -1066,14 +1180,53 @@ impl Shell {
                 id,
                 encoding,
                 result,
-            } => match result.and_then(|bytes| core::encoding::decode_strict(&bytes, encoding)) {
-                Ok((content, encoding)) => {
+            } => match result {
+                // Keep the raw bytes so we can both strictly re-decode them *and*
+                // fingerprint the file for the external-change baseline (#51).
+                Ok(bytes) => match core::encoding::decode_strict(&bytes, encoding) {
+                    Ok((content, encoding)) => {
+                        self.error = None;
+                        let disk = self.disk_fingerprint(id, &bytes);
+                        self.apply_core(
+                            core::Message::FileReloaded {
+                                id,
+                                content,
+                                encoding,
+                                disk,
+                            },
+                            true,
+                        )
+                    }
+                    Err(e) => {
+                        self.error = Some(e);
+                        Task::none()
+                    }
+                },
+                Err(e) => {
+                    self.error = Some(e);
+                    Task::none()
+                }
+            },
+
+            // A reload from disk after an external change (#51): decode the bytes
+            // *tolerantly* under the tab's encoding (a reload reopens the file as
+            // it now is, so it must never fail the way a strict reopen can) and
+            // fingerprint the fresh file as the new baseline.
+            Message::DiskReloaded {
+                id,
+                encoding,
+                result,
+            } => match result {
+                Ok(bytes) => {
                     self.error = None;
+                    let (content, encoding) = core::encoding::decode_with(&bytes, encoding);
+                    let disk = self.disk_fingerprint(id, &bytes);
                     self.apply_core(
                         core::Message::FileReloaded {
                             id,
                             content,
                             encoding,
+                            disk,
                         },
                         true,
                     )
@@ -1095,9 +1248,19 @@ impl Shell {
             }
 
             Message::Saved { id, path, result } => match result {
-                Ok(()) => {
+                // The write's own task fingerprinted the bytes it wrote (#51), so
+                // this becomes the new baseline and our own save is never mistaken
+                // for an external change.
+                Ok(disk) => {
                     self.error = None;
-                    self.apply_core(core::Message::FileSaved { id, path }, false)
+                    self.apply_core(
+                        core::Message::FileSaved {
+                            id,
+                            path,
+                            disk: Some(disk),
+                        },
+                        false,
+                    )
                 }
                 Err(e) => {
                     self.error = Some(e);
@@ -1105,6 +1268,86 @@ impl Shell {
                     self.apply_core(core::Message::SaveAbandoned { id }, false)
                 }
             },
+
+            // ---- External-change watch (#51) ----
+            // The watch reported changes to these open files. For each, do the
+            // cheap stat gate against the tab's baseline; a real change (or a gone
+            // file) turns into a `core::Message::DiskChanged`.
+            Message::DiskEvent(paths) => {
+                eprintln!(
+                    "[watch] DiskEvent {paths:?}; open paths={:?}",
+                    self.core.docs.iter().map(|d| &d.path).collect::<Vec<_>>()
+                );
+                // Resolve the affected tabs first, copying out id + baseline so we
+                // no longer borrow `self.core` when we call `apply_core` below.
+                let targets: Vec<(TabId, Option<DiskMeta>, PathBuf)> = paths
+                    .into_iter()
+                    .filter_map(|path| {
+                        self.core
+                            .docs
+                            .iter()
+                            .find(|d| d.path.as_deref() == Some(path.as_path()))
+                            .map(|d| (d.id, d.disk_meta().copied(), path))
+                    })
+                    .collect();
+                let mut tasks = Vec::new();
+                for (id, baseline, path) in targets {
+                    match std::fs::metadata(&path) {
+                        // Gone / unreadable — report it at once (no bytes to hash).
+                        Err(_) => tasks.push(
+                            self.apply_core(core::Message::DiskChanged { id, meta: None }, false),
+                        ),
+                        Ok(md) => {
+                            let len = md.len();
+                            let modified = md.modified().ok();
+                            // Cheap gate: an unchanged mtime+len is no content
+                            // change to report — skip the (possibly large) re-read.
+                            if baseline.is_some_and(|b| b.len == len && b.modified == modified) {
+                                continue;
+                            }
+                            // Changed (or no baseline): hash off-thread, then report.
+                            let p = path.clone();
+                            tasks.push(Task::perform(
+                                async move {
+                                    std::fs::read(&p).ok().map(|bytes| DiskMeta {
+                                        modified,
+                                        len,
+                                        hash: watch::hash_bytes(&bytes),
+                                    })
+                                },
+                                move |meta| Message::DiskChangeObserved { id, meta },
+                            ));
+                        }
+                    }
+                }
+                Task::batch(tasks)
+            }
+            Message::DiskChangeObserved { id, meta } => {
+                self.apply_core(core::Message::DiskChanged { id, meta }, false)
+            }
+            // The disk-changed bar's "Reload" (discard my edits, take the disk copy).
+            Message::ReloadChangedFile => {
+                let id = self.core.active_doc().id;
+                self.apply_core(core::Message::ReloadFromDisk { id }, false)
+            }
+            // The disk-changed bar's "Keep mine" / "Keep in editor" (dismiss, adopt
+            // the disk state as baseline, keep the buffer).
+            Message::KeepMyChanges => {
+                let id = self.core.active_doc().id;
+                self.apply_core(core::Message::KeepMine { id }, false)
+            }
+            // The stale-save bar's "Overwrite" — proceed with the held-back write.
+            Message::OverwriteConfirmed => match self.confirm_overwrite.take() {
+                Some(pending) => {
+                    self.apply_core(core::Message::OverwriteConfirmed { id: pending.id }, false)
+                }
+                None => Task::none(),
+            },
+            // The stale-save bar's "Cancel" — abandon the write, touch nothing.
+            Message::OverwriteCancelled => {
+                self.confirm_overwrite = None;
+                Task::none()
+            }
 
             // Clear the error banner on demand (#97 item 7). No core round-trip:
             // the error slot is shell-only chrome, so dropping it just re-reveals
@@ -1370,21 +1613,63 @@ impl Shell {
     }
 
     /// Passive subscriptions: global keyboard shortcuts (#39) and drag-and-drop
-    /// file opening (#42), both surfaced as raw runtime events and mapped to shell
-    /// messages by [`on_event`] (which fans out to [`on_key`] / [`on_window_event`]).
+    /// file opening (#42), surfaced as raw runtime events and mapped to shell
+    /// messages by [`on_event`] (which fans out to [`on_key`] / [`on_window_event`]),
+    /// plus the external-change filesystem watch (#51).
     fn subscription(&self) -> Subscription<Message> {
-        let events = iced::event::listen_with(on_event);
+        let mut subs = vec![
+            iced::event::listen_with(on_event),
+            self.watch_subscription(),
+        ];
         // While settling after a scroll, tick every frame so each one forces a
         // full repaint (see `scroll_settle`); once the counter hits 0 this
         // subscription drops and the app goes back to redrawing only on demand.
         if self.scroll_settle > 0 {
-            Subscription::batch([
-                events,
-                iced::window::frames().map(|_| Message::ScrollSettle),
-            ])
-        } else {
-            events
+            subs.push(iced::window::frames().map(|_| Message::ScrollSettle));
         }
+        Subscription::batch(subs)
+    }
+
+    /// A filesystem watch over every titled tab's file (#51). Keyed by the sorted
+    /// set of watched files, so opening, closing, saving-as or renaming a tab
+    /// re-keys the subscription and iced tears down the old watcher and builds a
+    /// new one — which is what keeps watch handles from leaking across tab churn.
+    /// An empty set (only untitled tabs) runs no watcher at all.
+    fn watch_subscription(&self) -> Subscription<Message> {
+        let files = self.watched_files();
+        if files.is_empty() {
+            Subscription::none()
+        } else {
+            Subscription::run_with(files, watch_worker)
+        }
+    }
+
+    /// The sorted, de-duplicated set of files the watch covers — every titled
+    /// tab's path (#51). This *is* the subscription's identity key: when it
+    /// changes (a tab opened, closed, or saved-as), iced rebuilds the watcher over
+    /// the new set, so the watch always tracks exactly the open files and no watch
+    /// outlives its tab.
+    fn watched_files(&self) -> Vec<PathBuf> {
+        let mut files: Vec<PathBuf> = self
+            .core
+            .docs
+            .iter()
+            .filter_map(|d| d.path.clone())
+            .collect();
+        files.sort();
+        files.dedup();
+        files
+    }
+
+    /// Fingerprint document `id`'s file from `bytes` already in hand (#51). `None`
+    /// if the tab has no path — nothing on disk to baseline against.
+    fn disk_fingerprint(&self, id: TabId, bytes: &[u8]) -> Option<DiskMeta> {
+        self.core
+            .docs
+            .iter()
+            .find(|d| d.id == id)
+            .and_then(|d| d.path.as_ref())
+            .map(|path| watch::fingerprint(path, bytes))
     }
 
     /// Feed one message through the pure core, run every [`Effect`] it returns,
@@ -1495,6 +1780,16 @@ impl Shell {
                     result,
                 },
             ),
+            // Reload a file changed on disk (#51): re-read its bytes off-thread;
+            // `Message::DiskReloaded` decodes them tolerantly and replaces the tab.
+            Effect::ReloadFile { id, path, encoding } => Task::perform(
+                async move { core::io::read_file_bytes(&path) },
+                move |result| Message::DiskReloaded {
+                    id,
+                    encoding,
+                    result,
+                },
+            ),
             Effect::PickSavePath { id } => {
                 Task::perform(pick_save(), move |path| Message::SavePicked { id, path })
             }
@@ -1514,7 +1809,11 @@ impl Shell {
                     // exactly as chosen.
                     async move {
                         let bytes = core::encoding::encode_for_save(&content, encoding)?;
-                        core::io::write_file_bytes(&path, &bytes)
+                        core::io::write_file_bytes(&path, &bytes)?;
+                        // Fingerprint what we just wrote (#51): this is the new
+                        // on-disk baseline, so the watch event our own write
+                        // triggers reads as a no-op rather than a false change.
+                        Ok(watch::fingerprint(&path, &bytes))
                     },
                     move |result| Message::Saved {
                         id,
@@ -1566,6 +1865,13 @@ impl Shell {
             // offline and headlessly testable.
             Effect::ConfirmQuit { dirty } => {
                 self.confirm_quit = Some(dirty);
+                Task::none()
+            }
+            // Surface the stale-save prompt as the in-app overwrite bar (#51): the
+            // file changed on disk since we loaded/saved it, so warn before
+            // clobbering the newer copy. Same in-app-bar rationale as `ConfirmClose`.
+            Effect::ConfirmOverwrite { id, title } => {
+                self.confirm_overwrite = Some(PendingOverwrite { id, title });
                 Task::none()
             }
             // The core says it is safe to exit (#69): close the sole window, which
@@ -2289,6 +2595,15 @@ impl Shell {
         if self.confirm_large_open.is_some() {
             layout = layout.push(self.large_open_confirm_bar());
         }
+        // External-change bars (#51). The stale-save overwrite prompt (raised by a
+        // Save onto a changed file) takes precedence over the standing
+        // disk-changed bar for the active tab — they concern the same file, so
+        // showing both would just double up.
+        if self.confirm_overwrite.is_some() {
+            layout = layout.push(self.overwrite_confirm_bar());
+        } else if self.core.active_doc().disk_status != DiskStatus::InSync {
+            layout = layout.push(self.disk_change_bar());
+        }
         if self.core.find.open {
             layout = layout.push(self.find_bar());
         }
@@ -2440,6 +2755,101 @@ impl Shell {
                 button(text("Cancel").font(ui))
                     .style(theme::ghost(t))
                     .on_press(Message::LargeOpenCancelled),
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center),
+        )
+        .padding(10)
+        .style(theme::card(t))
+        .into()
+    }
+
+    /// The in-app "this file changed on disk" bar (#51), derived from the *active*
+    /// tab's [`DiskStatus`]. Three shapes: a clean buffer offers Reload / Keep
+    /// mine; a dirty buffer (a real conflict) makes Reload the destructive choice
+    /// and adds Save As; a deleted/renamed file keeps the buffer and offers Save
+    /// As / Keep. Rendered as an in-app bar for the same reasons as
+    /// [`Shell::confirm_bar`]. Never lets a disk change silently discard edits.
+    fn disk_change_bar(&self) -> Element<'_, Message> {
+        let doc = self.core.active_doc();
+        let ui = self.ui_font();
+        let t = self.tokens();
+        let name = doc.title();
+        let inner = match doc.disk_status {
+            // Not rendered unless changed; empty as a guard (view gates on this).
+            DiskStatus::InSync => return row![].into(),
+            DiskStatus::Gone => row![
+                text(format!(
+                    "\u{201c}{name}\u{201d} was deleted or moved on disk. Your text is kept here."
+                ))
+                .font(ui),
+                button(text("Save As\u{2026}").font(ui))
+                    .style(theme::accent(t))
+                    .on_press(Message::SaveAs),
+                button(text("Keep in editor").font(ui))
+                    .style(theme::ghost(t))
+                    .on_press(Message::KeepMyChanges),
+            ],
+            // A real conflict: the buffer has unsaved edits, so Reload is the
+            // destructive choice (danger) and Save As is offered as the way out.
+            DiskStatus::Modified(_) if doc.dirty() => row![
+                text(format!(
+                    "\u{201c}{name}\u{201d} changed on disk, and you have unsaved edits."
+                ))
+                .font(ui),
+                button(text("Reload").font(ui))
+                    .style(theme::danger(t))
+                    .on_press(Message::ReloadChangedFile),
+                button(text("Keep mine").font(ui))
+                    .style(theme::accent(t))
+                    .on_press(Message::KeepMyChanges),
+                button(text("Save As\u{2026}").font(ui))
+                    .style(theme::ghost(t))
+                    .on_press(Message::SaveAs),
+            ],
+            // Clean buffer: reloading loses nothing, so Reload is the safe accent.
+            DiskStatus::Modified(_) => row![
+                text(format!("\u{201c}{name}\u{201d} changed on disk.")).font(ui),
+                button(text("Reload").font(ui))
+                    .style(theme::accent(t))
+                    .on_press(Message::ReloadChangedFile),
+                button(text("Keep mine").font(ui))
+                    .style(theme::ghost(t))
+                    .on_press(Message::KeepMyChanges),
+            ],
+        };
+        container(inner.spacing(8).align_y(iced::Alignment::Center))
+            .padding(10)
+            .style(theme::card(t))
+            .into()
+    }
+
+    /// The in-app stale-save overwrite bar (#51): the file changed on disk since
+    /// we loaded/saved it and the user hit Save, so warn before clobbering the
+    /// newer copy. Overwrite writes anyway; Save As writes elsewhere; Cancel
+    /// abandons the write. Same in-app-bar rationale as [`Shell::confirm_bar`].
+    fn overwrite_confirm_bar(&self) -> Element<'_, Message> {
+        let Some(pending) = &self.confirm_overwrite else {
+            return row![].into(); // never rendered unless set; empty as a guard
+        };
+        let ui = self.ui_font();
+        let t = self.tokens();
+        let prompt = format!(
+            "\u{201c}{}\u{201d} changed on disk since you opened it. Overwrite it?",
+            pending.title
+        );
+        container(
+            row![
+                text(prompt).font(ui),
+                button(text("Overwrite").font(ui))
+                    .style(theme::danger(t))
+                    .on_press(Message::OverwriteConfirmed),
+                button(text("Save As\u{2026}").font(ui))
+                    .style(theme::accent(t))
+                    .on_press(Message::SaveAs),
+                button(text("Cancel").font(ui))
+                    .style(theme::ghost(t))
+                    .on_press(Message::OverwriteCancelled),
             ]
             .spacing(8)
             .align_y(iced::Alignment::Center),
@@ -3187,7 +3597,11 @@ mod tests {
         let _ = shell.update(Message::Saved {
             id,
             path: PathBuf::from("/tmp/new.py"),
-            result: Ok(()),
+            result: Ok(DiskMeta {
+                modified: None,
+                len: 0,
+                hash: 0,
+            }),
         });
         assert_eq!(shell.title, "new.py — Notepad Extra");
 
@@ -3595,7 +4009,11 @@ mod tests {
         let _ = shell.update(Message::Saved {
             id,
             path: PathBuf::from("/tmp/new.py"),
-            result: Ok(()),
+            result: Ok(DiskMeta {
+                modified: None,
+                len: 0,
+                hash: 0,
+            }),
         });
         assert!(!shell.core.active_doc().dirty());
         assert_eq!(shell.core.active_doc().language(), "Python");
@@ -3769,7 +4187,11 @@ mod tests {
         let _ = shell.update(Message::Saved {
             id,
             path: PathBuf::from("/tmp/doc.txt"),
-            result: Ok(()),
+            result: Ok(DiskMeta {
+                modified: None,
+                len: 0,
+                hash: 0,
+            }),
         });
         assert_eq!(shell.core.docs.len(), 1);
         // The editor resynced onto the surviving second tab.
@@ -3792,7 +4214,11 @@ mod tests {
         let _ = shell.update(Message::Saved {
             id,
             path: PathBuf::from("/tmp/x.txt"),
-            result: Ok(()),
+            result: Ok(DiskMeta {
+                modified: None,
+                len: 0,
+                hash: 0,
+            }),
         });
         assert_eq!(shell.core.docs.len(), 1);
     }
@@ -3869,6 +4295,7 @@ mod tests {
             content: "loaded at last".to_string(),
             encoding: core::FileEncoding::default(),
             lines: LARGE_FILE_LINES,
+            disk: None,
         });
         let _ = shell.update(Message::LargeOpenConfirmed);
         assert!(
@@ -3886,6 +4313,7 @@ mod tests {
             content: "never loaded".to_string(),
             encoding: core::FileEncoding::default(),
             lines: LARGE_FILE_LINES,
+            disk: None,
         });
         let _ = shell.update(Message::LargeOpenCancelled);
         assert!(
@@ -4037,7 +4465,11 @@ mod tests {
         let _ = shell.update(Message::Saved {
             id,
             path: PathBuf::from("/tmp/doc.txt"),
-            result: Ok(()),
+            result: Ok(DiskMeta {
+                modified: None,
+                len: 0,
+                hash: 0,
+            }),
         });
         assert!(
             !shell.core.active_doc().dirty(),
@@ -4061,7 +4493,11 @@ mod tests {
         let _ = shell.update(Message::Saved {
             id,
             path: PathBuf::from("/tmp/x.txt"),
-            result: Ok(()),
+            result: Ok(DiskMeta {
+                modified: None,
+                len: 0,
+                hash: 0,
+            }),
         });
         assert_eq!(shell.core.docs.len(), 1);
     }
@@ -5323,6 +5759,172 @@ mod tests {
         assert_eq!(path.file_name().unwrap(), "preferences.json");
         assert_eq!(path.parent().unwrap().file_name().unwrap(), "notepad-extra");
     }
+
+    // ---- External-change watch (#51) ----
+
+    /// Open a titled tab from bytes, exactly as the runtime's `FileRead` arm does,
+    /// so the tab carries an on-disk fingerprint baseline the watch compares to.
+    fn open_file(shell: &mut Shell, path: &str, content: &str) -> TabId {
+        let _ = shell.update(Message::FileRead {
+            path: PathBuf::from(path),
+            result: Ok(content.as_bytes().to_vec()),
+        });
+        shell.core.active_doc().id
+    }
+
+    /// A fingerprint standing in for the async stat+hash result of a real external
+    /// change — deliberately unlike anything [`open_file`] records.
+    fn changed_meta() -> DiskMeta {
+        DiskMeta {
+            modified: None,
+            len: 4242,
+            hash: 0xDEAD_BEEF,
+        }
+    }
+
+    #[test]
+    fn a_disk_change_arms_the_reload_bar_for_a_clean_tab() {
+        let (mut shell, _) = Shell::new();
+        let id = open_file(&mut shell, "/tmp/note.txt", "hello");
+        assert_eq!(shell.core.active_doc().disk_status, DiskStatus::InSync);
+        // The async stat+hash lands as `DiskChangeObserved`.
+        let _ = shell.update(Message::DiskChangeObserved {
+            id,
+            meta: Some(changed_meta()),
+        });
+        assert!(matches!(
+            shell.core.active_doc().disk_status,
+            DiskStatus::Modified(_)
+        ));
+        let _ = shell.view(); // the disk-changed bar builds without panicking
+    }
+
+    #[test]
+    fn a_deleted_file_marks_the_tab_gone_and_keeps_the_text() {
+        let (mut shell, _) = Shell::new();
+        let id = open_file(&mut shell, "/tmp/note.txt", "hello");
+        let _ = shell.update(Message::DiskChangeObserved { id, meta: None });
+        assert_eq!(shell.core.active_doc().disk_status, DiskStatus::Gone);
+        assert_eq!(
+            shell.active_editor().text().trim_end(),
+            "hello",
+            "the buffer is kept in memory when the source file is gone"
+        );
+        let _ = shell.view(); // the "source gone" bar builds
+    }
+
+    #[test]
+    fn keep_mine_dismisses_the_disk_changed_bar() {
+        let (mut shell, _) = Shell::new();
+        let id = open_file(&mut shell, "/tmp/note.txt", "hello");
+        let _ = shell.update(Message::DiskChangeObserved {
+            id,
+            meta: Some(changed_meta()),
+        });
+        let _ = shell.update(Message::KeepMyChanges);
+        assert_eq!(shell.core.active_doc().disk_status, DiskStatus::InSync);
+    }
+
+    #[test]
+    fn our_own_save_is_not_mistaken_for_an_external_change() {
+        let (mut shell, _) = Shell::new();
+        let id = open_file(&mut shell, "/tmp/note.txt", "hello");
+        // The write lands with a fresh fingerprint (as the WriteFile task reports)…
+        let saved = DiskMeta {
+            modified: None,
+            len: 5,
+            hash: 777,
+        };
+        let _ = shell.update(Message::Saved {
+            id,
+            path: PathBuf::from("/tmp/note.txt"),
+            result: Ok(saved),
+        });
+        // …then the watch event our own write triggered arrives with that same
+        // fingerprint: it must fold to a no-op, not raise a bar.
+        let _ = shell.update(Message::DiskChangeObserved {
+            id,
+            meta: Some(saved),
+        });
+        assert_eq!(shell.core.active_doc().disk_status, DiskStatus::InSync);
+    }
+
+    #[test]
+    fn saving_over_a_changed_file_raises_then_cancels_the_overwrite_bar() {
+        let (mut shell, _) = Shell::new();
+        let id = open_file(&mut shell, "/tmp/note.txt", "hello");
+        // Local edits, then the file changes on disk underneath us.
+        let _ = shell.update(Message::Edit(paste(" world")));
+        assert!(shell.core.active_doc().dirty());
+        let _ = shell.update(Message::DiskChangeObserved {
+            id,
+            meta: Some(changed_meta()),
+        });
+        // Ctrl+S now warns instead of clobbering the newer disk copy.
+        let _ = shell.update(Message::Save);
+        assert!(
+            shell.confirm_overwrite.is_some(),
+            "a stale save arms the overwrite bar rather than writing"
+        );
+        let _ = shell.view();
+        // Cancelling abandons the write, leaving both buffer and disk untouched.
+        let _ = shell.update(Message::OverwriteCancelled);
+        assert!(shell.confirm_overwrite.is_none());
+        assert!(
+            shell.core.active_doc().dirty(),
+            "the buffer keeps its unsaved edits"
+        );
+    }
+
+    #[test]
+    fn confirming_the_overwrite_clears_the_bar() {
+        let (mut shell, _) = Shell::new();
+        let id = open_file(&mut shell, "/tmp/note.txt", "hello");
+        let _ = shell.update(Message::Edit(paste("!")));
+        let _ = shell.update(Message::DiskChangeObserved {
+            id,
+            meta: Some(changed_meta()),
+        });
+        let _ = shell.update(Message::Save);
+        assert!(shell.confirm_overwrite.is_some());
+        let _ = shell.update(Message::OverwriteConfirmed);
+        assert!(
+            shell.confirm_overwrite.is_none(),
+            "confirming clears the bar and issues the write"
+        );
+    }
+
+    #[test]
+    fn an_in_sync_save_never_raises_the_overwrite_bar() {
+        // Regression guard on the untouched save path.
+        let (mut shell, _) = Shell::new();
+        open_file(&mut shell, "/tmp/note.txt", "hello");
+        let _ = shell.update(Message::Edit(paste("!")));
+        let _ = shell.update(Message::Save);
+        assert!(
+            shell.confirm_overwrite.is_none(),
+            "a normal save writes straight through"
+        );
+    }
+
+    #[test]
+    fn the_watch_set_tracks_open_titled_tabs() {
+        let (mut shell, _) = Shell::new();
+        // A fresh untitled tab has nothing to watch — no watcher runs.
+        assert!(shell.watched_files().is_empty());
+        open_file(&mut shell, "/tmp/a.txt", "a");
+        assert_eq!(shell.watched_files(), vec![PathBuf::from("/tmp/a.txt")]);
+        // A second file grows the watched set (the subscription key), so iced
+        // rebuilds the watcher over both — no watch outlives its tab.
+        let _ = shell.update(Message::FileRead {
+            path: PathBuf::from("/tmp/b.txt"),
+            result: Ok(b"b".to_vec()),
+        });
+        assert_eq!(
+            shell.watched_files(),
+            vec![PathBuf::from("/tmp/a.txt"), PathBuf::from("/tmp/b.txt")]
+        );
+    }
 }
 
 /// Headless widget-tree interaction tests (#70) — the "Playwright equivalent" the
@@ -5521,6 +6123,115 @@ mod ui_tests {
             shell.active_editor().text().trim_end().len(),
             LARGE_FILE_LINE_BYTES,
             "Open anyway loaded the whole line into the editor"
+        );
+    }
+
+    // ---- External-change watch (#51) ----
+
+    /// Open a titled tab from bytes, then mark it changed on disk, so `view`
+    /// renders the disk-changed bar with real, clickable buttons.
+    fn shell_with_disk_change() -> (Shell, TabId) {
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::FileRead {
+            path: PathBuf::from("/tmp/note.txt"),
+            result: Ok(b"hello".to_vec()),
+        });
+        let id = shell.core.active_doc().id;
+        let _ = shell.update(Message::DiskChangeObserved {
+            id,
+            meta: Some(DiskMeta {
+                modified: None,
+                len: 9,
+                hash: 9,
+            }),
+        });
+        (shell, id)
+    }
+
+    #[test]
+    fn disk_changed_bar_keep_mine_button_dismisses_it() {
+        let (mut shell, _) = shell_with_disk_change();
+        assert!(matches!(
+            shell.core.active_doc().disk_status,
+            DiskStatus::Modified(_)
+        ));
+
+        let mut ui = simulator(shell.view());
+        // The bar must actually be present with both choices.
+        assert!(
+            ui.find("Reload").is_ok(),
+            "the disk-changed bar offers Reload"
+        );
+        ui.click("Keep mine").expect("the Keep mine button");
+        for message in ui.into_messages() {
+            let _ = shell.update(message);
+        }
+        assert_eq!(
+            shell.core.active_doc().disk_status,
+            DiskStatus::InSync,
+            "Keep mine dismissed the bar"
+        );
+    }
+
+    #[test]
+    fn disk_changed_bar_reload_button_is_wired() {
+        // The clean-buffer bar's Reload issues a reload of the active tab. The
+        // actual re-read is async (off-thread), so we assert the button is present
+        // and produces the reload message rather than the reloaded content.
+        let (shell, _) = shell_with_disk_change();
+        let mut ui = simulator(shell.view());
+        ui.click("Reload").expect("the Reload button");
+        let messages: Vec<Message> = ui.into_messages().collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| matches!(m, Message::ReloadChangedFile)),
+            "Reload emits ReloadChangedFile, got {messages:?}"
+        );
+    }
+
+    #[test]
+    fn overwrite_bar_cancel_button_abandons_the_write() {
+        let (mut shell, _) = Shell::new();
+        let id = shell.core.active_doc().id;
+        // Arm the overwrite bar directly (as `Effect::ConfirmOverwrite` would).
+        shell.confirm_overwrite = Some(PendingOverwrite {
+            id,
+            title: "note.txt".into(),
+        });
+
+        let mut ui = simulator(shell.view());
+        assert!(
+            ui.find("Overwrite").is_ok(),
+            "the stale-save bar offers Overwrite"
+        );
+        ui.click("Cancel").expect("the overwrite Cancel button");
+        for message in ui.into_messages() {
+            let _ = shell.update(message);
+        }
+        assert!(
+            shell.confirm_overwrite.is_none(),
+            "Cancel abandoned the write and cleared the bar"
+        );
+    }
+
+    #[test]
+    fn overwrite_bar_overwrite_button_clears_the_bar() {
+        let (mut shell, _) = Shell::new();
+        let id = shell.core.active_doc().id;
+        shell.confirm_overwrite = Some(PendingOverwrite {
+            id,
+            title: "note.txt".into(),
+        });
+
+        let mut ui = simulator(shell.view());
+        ui.click("Overwrite").expect("the Overwrite button");
+        for message in ui.into_messages() {
+            let _ = shell.update(message);
+        }
+        assert!(
+            shell.confirm_overwrite.is_none(),
+            "Overwrite issued the write and cleared the bar"
         );
     }
 }

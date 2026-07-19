@@ -27,7 +27,9 @@ pub mod status;
 pub mod text;
 pub mod textops;
 
-pub use app::{Document, Effect, FindOption, FindState, Message, State, TabId, update};
+pub use app::{
+    DiskMeta, DiskStatus, Document, Effect, FindOption, FindState, Message, State, TabId, update,
+};
 // Re-exported so the shell can name the theme type through `notepad_core` (#36);
 // it originates in `notepad-syntax`, which also owns the light/dark → syntect
 // highlight-theme pairing.

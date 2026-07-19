@@ -505,6 +505,16 @@ pub enum Message {
     /// Move the caret to 1-based `line`, clamped into range.
     GoToLine(usize),
 
+    // ---- Line & text operations (#54) ----
+    /// Apply a line/text operation to the active document in one undo-able step.
+    /// `selection` is the editor's live selection as a byte range; `None` or an
+    /// empty range scopes the op to the whole document. The shell reads the
+    /// selection from its widget and passes it here (the core has no widget).
+    TextOperation {
+        op: crate::textops::TextOp,
+        selection: Option<(usize, usize)>,
+    },
+
     // ---- Editor zoom / font size (#35) ----
     /// Enlarge the editor font by one step (Ctrl+ +), clamped to the maximum.
     ZoomIn,
@@ -1006,6 +1016,8 @@ pub fn update(state: &mut State, message: Message) -> Vec<Effect> {
             }]
         }
 
+        Message::TextOperation { op, selection } => text_operation(state, op, selection),
+
         // ---- Editor zoom / font size (#35) ----
         // Zoom only changes the app-wide font size, which the shell reads from
         // `font_size()` when it renders — no buffer or title change. It is a
@@ -1349,6 +1361,31 @@ fn replace_all_matches(state: &mut State) -> Vec<Effect> {
     state.find.ordinal = 0;
     // The replacement may re-introduce the pattern, so recount on the new text.
     state.find.count = matcher.count(&state.docs[state.active].content);
+    fx
+}
+
+/// Apply a line/text operation (#54) to the active document as one undo-able
+/// edit. `selection` is the editor's live byte range (`None`/empty = whole
+/// document). A no-op transform records nothing and returns no effects, so it
+/// never adds an empty undo step. When the user had a real selection, the
+/// transformed span is re-selected so the shell can keep their working set
+/// highlighted; a whole-document op leaves the caret to the shell's resync.
+fn text_operation(
+    state: &mut State,
+    op: crate::textops::TextOp,
+    selection: Option<(usize, usize)>,
+) -> Vec<Effect> {
+    let content = &state.docs[state.active].content;
+    let applied = crate::textops::apply_to(content, op, selection);
+    if applied.content == *content {
+        return vec![];
+    }
+    let had_selection = selection.is_some_and(|(a, b)| a != b);
+    let (start, end) = applied.selection;
+    let mut fx = apply_edit(state, applied.content);
+    if had_selection {
+        fx.push(Effect::RevealRange { start, end });
+    }
     fx
 }
 
@@ -3450,5 +3487,87 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ---- Line & text operations (#54) ----
+
+    /// Sort the whole active document (no selection) with the given op.
+    fn text_op(state: &mut State, op: crate::textops::TextOp) -> Vec<Effect> {
+        update(
+            state,
+            Message::TextOperation {
+                op,
+                selection: None,
+            },
+        )
+    }
+
+    const SORT_ASC: crate::textops::TextOp = crate::textops::TextOp::SortLines {
+        descending: false,
+        case_insensitive: false,
+    };
+
+    #[test]
+    fn text_operation_rewrites_the_whole_document_and_marks_it_dirty() {
+        let mut s = State::default();
+        update(&mut s, Message::Edited("banana\napple\ncherry".into()));
+        s.docs[s.active].saved_content = s.docs[s.active].content.clone();
+        assert!(!s.active_doc().dirty());
+
+        text_op(&mut s, SORT_ASC);
+        assert_eq!(s.active_doc().content, "apple\nbanana\ncherry");
+        assert!(s.active_doc().dirty());
+    }
+
+    #[test]
+    fn text_operation_is_a_single_undo_step_that_restores_exactly() {
+        let mut s = State::default();
+        update(&mut s, Message::Edited("banana\napple\ncherry".into()));
+        text_op(&mut s, SORT_ASC);
+        assert_eq!(s.active_doc().content, "apple\nbanana\ncherry");
+        // One undo restores the pre-sort buffer verbatim.
+        update(&mut s, Message::Undo);
+        assert_eq!(s.active_doc().content, "banana\napple\ncherry");
+    }
+
+    #[test]
+    fn a_no_op_text_operation_records_nothing() {
+        let mut s = State::default();
+        update(&mut s, Message::Edited("apple\nbanana".into()));
+        s.docs[s.active].saved_content = s.docs[s.active].content.clone();
+        // Already sorted: the op changes nothing, so no dirty flip and no effects.
+        let fx = text_op(&mut s, SORT_ASC);
+        assert!(fx.is_empty());
+        assert!(!s.active_doc().dirty());
+        // The no-op added no undo step, so the one available Undo reverts the
+        // earlier edit (back to the blank buffer) rather than a phantom step.
+        update(&mut s, Message::Undo);
+        assert_eq!(s.active_doc().content, "");
+    }
+
+    #[test]
+    fn text_operation_on_a_selection_reveals_the_transformed_span() {
+        let mut s = State::default();
+        update(&mut s, Message::Edited("hello world".into()));
+        // Upper-case just "world" (bytes 6..11).
+        let fx = update(
+            &mut s,
+            Message::TextOperation {
+                op: crate::textops::TextOp::Uppercase,
+                selection: Some((6, 11)),
+            },
+        );
+        assert_eq!(s.active_doc().content, "hello WORLD");
+        // The transformed span is re-selected so the shell keeps it highlighted.
+        assert_eq!(reveal(&fx), Some((6, 11)));
+    }
+
+    #[test]
+    fn whole_document_text_operation_does_not_reveal_a_selection() {
+        let mut s = State::default();
+        update(&mut s, Message::Edited("banana\napple".into()));
+        let fx = text_op(&mut s, SORT_ASC);
+        // No user selection -> no RevealRange (the shell resyncs to the top).
+        assert!(reveal(&fx).is_none());
     }
 }

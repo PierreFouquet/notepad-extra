@@ -21,8 +21,8 @@
 
 use iced::widget::text::Wrapping;
 use iced::widget::{
-    Space, button, column, container, mouse_area, pick_list, row, scrollable, stack, text,
-    text_input,
+    Column, Row, Space, button, column, container, mouse_area, pick_list, row, scrollable, stack,
+    text, text_input,
 };
 use iced::{Element, Fill, Length, Point, Subscription, Task};
 use notepad_core as core;
@@ -414,6 +414,11 @@ enum Message {
     /// stale, "bunched" duplicate rows behind — the font / language dropdown
     /// symptom. See [`Shell::repaint_nudge`] for the underlying iced limitation.
     ScrollNudge,
+    /// A per-frame tick, live only for the few frames after a scroll (see
+    /// [`Shell::scroll_settle`]). Each one flips the repaint nudge so a guaranteed
+    /// full repaint lands right after the gesture — clearing the last scroll
+    /// step's stale frame — then the counter decays and the tick stops.
+    ScrollSettle,
 
     /// The window was resized; remember the new width so the tab strip knows how
     /// much room it has and can collapse overflowing tabs into the `▾` dropdown
@@ -515,6 +520,13 @@ enum Message {
     /// to the core's "clear override" (`None`); a group-header separator is inert
     /// (mapped to no change); anything else pins that syntax on the active tab.
     SetLanguage(String),
+
+    // ---- Line & text operations (#54) ----
+    /// The line/text-ops picker chose an entry. The label maps to a
+    /// [`core::TextOp`] via [`textop_from_label`]; a group-header separator (or
+    /// any unknown label) is inert. The op runs on the editor's live selection,
+    /// else the whole document, in one undo-able step.
+    SelectTextOp(String),
 
     // ---- Character encoding selection (#50/#59/#103) ----
     /// The status-bar encoding picker chose a label — always a *convert*
@@ -699,6 +711,15 @@ struct Shell {
     /// for this app's small window) for correctness. Same class of bug as the
     /// vendored `text_editor`'s repaint gotcha.
     repaint_nudge: bool,
+    /// Frames still owed a forced full repaint after a scroll. The nudge above
+    /// only fires on an `update`, so the *last* wheel step of a gesture — with no
+    /// message behind it — can leave the software renderer's stale partial-damage
+    /// frame on screen until the next unrelated event ("clears, but not right
+    /// away"). While this is non-zero, [`Shell::subscription`] drives a
+    /// `window::frames` tick that emits [`Message::ScrollSettle`], so a couple of
+    /// guaranteed full repaints land right after the gesture; it then decays to 0
+    /// and the per-frame subscription drops, keeping the app idle-quiet.
+    scroll_settle: u8,
     /// The current window width in logical pixels (#70), tracked from
     /// `window::Event::Resized`. The tab strip reads it to decide when the tabs
     /// overflow their strip and collapse the extras into a `▾` dropdown — `view`
@@ -784,6 +805,7 @@ impl Shell {
                 prefs_writing: false,
                 pending_prefs: None,
                 repaint_nudge: false,
+                scroll_settle: 0,
                 // iced's default window is 1024×768; the first `Resized` event
                 // corrects this to the real width almost immediately (#70).
                 window_width: 1024.0,
@@ -1092,10 +1114,20 @@ impl Shell {
                 Task::none()
             }
 
-            // Rendering-only: exists so `update` flips the repaint nudge for a
-            // scroll and forces a full redraw (see the variant + `repaint_nudge`
-            // docs). No state to touch.
-            Message::ScrollNudge => Task::none(),
+            // Rendering-only: `update` flips the repaint nudge for this frame, and
+            // arming the settle counter keeps a couple more full repaints coming
+            // right after the gesture so the last scroll step can't strand a stale
+            // frame (see `scroll_settle`). No state to touch beyond that.
+            Message::ScrollNudge => {
+                self.scroll_settle = 3;
+                Task::none()
+            }
+            // A settle-window frame tick: `update` already flipped the nudge for a
+            // full repaint; here we just count the window down toward idle.
+            Message::ScrollSettle => {
+                self.scroll_settle = self.scroll_settle.saturating_sub(1);
+                Task::none()
+            }
 
             // Record the window width for the tab strip's overflow decision (#70).
             // Pure geometry, no core round-trip and no repaint nudge (see the
@@ -1250,6 +1282,21 @@ impl Shell {
                 }
             }
 
+            // Line & text operations (#54): map the picked label to a `TextOp`
+            // (a header / unknown label is inert), read the editor's live
+            // selection, and dispatch. It rewrites the buffer, so resync=true;
+            // the core re-selects the transformed span for a real selection.
+            Message::SelectTextOp(label) => match textop_from_label(&label) {
+                Some(op) => self.apply_core(
+                    core::Message::TextOperation {
+                        op,
+                        selection: self.selection_range(),
+                    },
+                    true,
+                ),
+                None => Task::none(),
+            },
+
             // Encoding selection (#50/#59/#103): always a *convert* — set the tab's
             // save encoding, mark it dirty, and re-encode on the next Save (a lossy
             // save is blocked). The core ignores an unknown label.
@@ -1326,7 +1373,18 @@ impl Shell {
     /// file opening (#42), both surfaced as raw runtime events and mapped to shell
     /// messages by [`on_event`] (which fans out to [`on_key`] / [`on_window_event`]).
     fn subscription(&self) -> Subscription<Message> {
-        iced::event::listen_with(on_event)
+        let events = iced::event::listen_with(on_event);
+        // While settling after a scroll, tick every frame so each one forces a
+        // full repaint (see `scroll_settle`); once the counter hits 0 this
+        // subscription drops and the app goes back to redrawing only on demand.
+        if self.scroll_settle > 0 {
+            Subscription::batch([
+                events,
+                iced::window::frames().map(|_| Message::ScrollSettle),
+            ])
+        } else {
+            events
+        }
     }
 
     /// Feed one message through the pure core, run every [`Effect`] it returns,
@@ -1545,6 +1603,20 @@ impl Shell {
             .selection
             .map(|a| core::find::offset_at(&doc.content, a.line, a.column));
         core::status(doc, caret, anchor)
+    }
+
+    /// The editor's live selection as a byte range `[start, end)`, or `None`
+    /// when nothing is selected. Mirrors [`Shell::status`]'s caret/anchor read
+    /// (no renderer needed, so it stays headless-testable) and is what a line/
+    /// text operation (#54) is scoped to — the core widens or clamps it.
+    fn selection_range(&self) -> Option<(usize, usize)> {
+        let content = &self.core.active_doc().content;
+        let cursor = self.active_editor().cursor();
+        let caret = core::find::offset_at(content, cursor.position.line, cursor.position.column);
+        let anchor = cursor
+            .selection
+            .map(|a| core::find::offset_at(content, a.line, a.column))?;
+        Some((anchor, caret))
     }
 
     /// The bracket pair to highlight for the active document (#41), derived from
@@ -1800,47 +1872,116 @@ impl Shell {
                 .height(Length::Fixed(20.0))
                 .style(theme::bar(t.divider))
         };
-        let toolbar = container(
-            row![
-                tb("New").on_press(Message::NewTab),
-                tb("Open").on_press(Message::Open),
-                tb("Save").on_press(Message::Save),
-                gh("Save As").on_press(Message::SaveAs),
-                sep(),
-                tb("Undo").on_press(Message::Undo),
-                tb("Redo").on_press(Message::Redo),
+        // The toolbar is two logical groups: the file/edit actions and the view
+        // toggles. Each control is paired with an estimated width (the tab strip's
+        // `GLYPH_W`-per-glyph style) so the bar can decide its layout: on a wide
+        // window the classic single row with the view group pushed right; on a
+        // narrow one, every control greedily wraps onto extra rows rather than
+        // clipping off the edge — a smaller screen reflows automatically.
+        const GLYPH_W: f32 = 9.5;
+        const BTN_CHROME: f32 = 28.0;
+        const SEP_W: f32 = 13.0;
+        const ZOOM_W: f32 = 168.0; // the three-button "A− 16 pt A+" group
+        const PICKER_CHROME: f32 = 46.0; // pick_list padding + the dropdown caret
+        const SPACING: f32 = 6.0;
+        let bw = |chars: usize| chars as f32 * GLYPH_W + BTN_CHROME;
+        // The pick_list sizes to its widest option, not the placeholder.
+        let picker_w = textop_options()
+            .iter()
+            .map(|s| s.chars().count())
+            .max()
+            .unwrap_or(0) as f32
+            * GLYPH_W
+            + PICKER_CHROME;
+        let edit_items: Vec<(f32, Element<'_, Message>)> = vec![
+            (bw(3), tb("New").on_press(Message::NewTab).into()),
+            (bw(4), tb("Open").on_press(Message::Open).into()),
+            (bw(4), tb("Save").on_press(Message::Save).into()),
+            (bw(7), gh("Save As").on_press(Message::SaveAs).into()),
+            (SEP_W, sep().into()),
+            (bw(4), tb("Undo").on_press(Message::Undo).into()),
+            (bw(4), tb("Redo").on_press(Message::Redo).into()),
+            (
                 // Find toggle (#33): accent "on" while the find bar is open.
+                bw(4),
                 button(text("Find").font(ui))
                     .style(theme::toggle(t, self.core.find.open))
-                    .on_press(Message::ToggleFind),
-                // Push the View group to the right — iced has no flex spacer, so a
-                // fill-width `Space` absorbs the slack.
-                Space::new().width(Fill),
-                // Zoom group (#35): shrink / reset-to-size / enlarge, as one control.
-                self.zoom_group(ui, t),
+                    .on_press(Message::ToggleFind)
+                    .into(),
+            ),
+            (
+                // Line & text operations (#54): a placeholder-only picker (every
+                // entry is an action) that runs the chosen op on the editor's
+                // selection, else the whole document.
+                picker_w,
+                pick_list(textop_options(), None::<String>, Message::SelectTextOp)
+                    .placeholder(TEXT_OPS_PLACEHOLDER)
+                    .style(theme::picker(t))
+                    .menu_style(theme::picker_menu(t))
+                    .font(ui)
+                    .text_size(14)
+                    .into(),
+            ),
+        ];
+        let view_items: Vec<(f32, Element<'_, Message>)> = vec![
+            // Zoom group (#35): shrink / reset-to-size / enlarge, as one control.
+            (ZOOM_W, self.zoom_group(ui, t)),
+            (
                 // Word wrap toggle (#34): accent "on" while wrapping.
+                bw(4),
                 button(text("Wrap").font(ui))
                     .style(theme::toggle(t, self.core.word_wrap()))
-                    .on_press(Message::ToggleWordWrap),
+                    .on_press(Message::ToggleWordWrap)
+                    .into(),
+            ),
+            (
                 // Line-number gutter toggle (#41): accent "on" while the gutter shows.
+                bw(1),
                 button(text("#").font(ui))
                     .style(theme::toggle(t, self.core.show_line_numbers()))
-                    .on_press(Message::ToggleLineNumbers),
-                // Theme toggle (#36): a plain ghost action whose label names the
-                // theme you'll switch *to* (☾ Dark / ☀ Light).
-                gh(theme_label).on_press(Message::ToggleTheme),
+                    .on_press(Message::ToggleLineNumbers)
+                    .into(),
+            ),
+            (
+                // Theme toggle (#36): label names the theme you'll switch *to*.
+                bw(theme_label.chars().count()),
+                gh(theme_label).on_press(Message::ToggleTheme).into(),
+            ),
+            (
                 // About panel toggle (#40): accent "on" while the panel shows.
+                bw(5),
                 button(text("About").font(ui))
                     .style(theme::toggle(t, self.core.about_open()))
-                    .on_press(Message::ToggleAbout),
-            ]
-            .spacing(6)
-            .align_y(iced::Alignment::Center)
-            .padding([6, 8])
-            .width(Fill),
-        )
-        .style(theme::bar(t.toolbar_bg))
-        .width(Fill);
+                    .on_press(Message::ToggleAbout)
+                    .into(),
+            ),
+        ];
+        // Total on-one-line width of a group, including its inter-item spacing.
+        let group_w = |items: &[(f32, Element<'_, Message>)]| -> f32 {
+            items.iter().map(|(w, _)| *w).sum::<f32>()
+                + SPACING * items.len().saturating_sub(1) as f32
+        };
+        // Fits on one line? Leave a little slack so it wraps just before it clips.
+        let one_row = group_w(&edit_items) + SPACING + group_w(&view_items) + 20.0
+            <= self.window_width.max(1.0);
+        let toolbar_rows: Element<'_, Message> = if one_row {
+            let edit = Row::with_children(edit_items.into_iter().map(|(_, e)| e))
+                .spacing(SPACING)
+                .align_y(iced::Alignment::Center);
+            let view = Row::with_children(view_items.into_iter().map(|(_, e)| e))
+                .spacing(SPACING)
+                .align_y(iced::Alignment::Center);
+            row![edit, Space::new().width(Fill), view]
+                .align_y(iced::Alignment::Center)
+                .into()
+        } else {
+            let mut all = edit_items;
+            all.extend(view_items);
+            wrap_items(all, self.window_width.max(1.0) - 20.0, SPACING)
+        };
+        let toolbar = container(container(toolbar_rows).padding([6, 8]).width(Fill))
+            .style(theme::bar(t.toolbar_bg))
+            .width(Fill);
 
         let tabs = self.tab_strip(ui, t);
 
@@ -1960,14 +2101,19 @@ impl Shell {
                 // and hiding the cell at 0 keeps the row quiet when nothing is
                 // picked. `core::status` guarantees `selection == 0` for
                 // an empty selection, which is exactly what this `> 0` gate relies on.
-                let mut left =
-                    row![text(format!("Ln {}, Col {}", s.line, s.column)).font(ui)].spacing(16);
+                let mut cells: Vec<String> = vec![format!("Ln {}, Col {}", s.line, s.column)];
                 if s.selection > 0 {
-                    left = left.push(text(format!("Sel {}", s.selection)).font(ui));
+                    cells.push(format!("Sel {}", s.selection));
                 }
-                left = left
-                    .push(text(format!("{} chars", s.chars)).font(ui))
-                    .push(text(format!("{} lines", s.lines)).font(ui));
+                cells.push(format!("{} chars", s.chars));
+                cells.push(format!("{} words", s.words));
+                cells.push(format!("{} lines", s.lines));
+                let left_chars: usize = cells.iter().map(|c| c.chars().count()).sum();
+                let left_cells = cells.len();
+                let mut left = row![].spacing(16);
+                for c in cells {
+                    left = left.push(text(c).font(ui));
+                }
                 // Right group: the language as a Mode pill,
                 // the EOL, then the two encoding controls (#50). The first shows the
                 // active document's encoding and *converts* to whatever the user
@@ -1980,10 +2126,7 @@ impl Shell {
                 let mode = container(text(s.language).font(ui).size(11))
                     .padding([1, 9])
                     .style(theme::pill(t));
-                row![
-                    left,
-                    // Push the right group to the far edge.
-                    Space::new().width(Fill),
+                let right = row![
                     mode,
                     text(s.eol).font(ui),
                     pick_list(encoding_options(), Some(s.encoding), Message::SetEncoding)
@@ -1999,8 +2142,27 @@ impl Shell {
                         .text_size(14),
                 ]
                 .spacing(16)
-                .align_y(iced::Alignment::Center)
-                .into()
+                .align_y(iced::Alignment::Center);
+                // Estimate both groups' widths to decide the layout: on a wide bar
+                // they share one row with the right group pushed to the far edge;
+                // when the window is too narrow, the right group (the encoding /
+                // "Reopen as…" pickers) wraps onto its own line rather than clipping
+                // off the edge. The status bar has ~24px of its own padding.
+                let est_left = left_chars as f32 * 7.0 + 16.0 * left_cells.saturating_sub(1) as f32;
+                let est_right =
+                    s.language.chars().count() as f32 * 6.0 + 20.0 + 34.0 + 130.0 + 150.0 + 48.0;
+                if est_left + est_right + 24.0 <= self.window_width.max(1.0) {
+                    row![left, Space::new().width(Fill), right]
+                        .align_y(iced::Alignment::Center)
+                        .into()
+                } else {
+                    column![
+                        left,
+                        row![Space::new().width(Fill), right].align_y(iced::Alignment::Center),
+                    ]
+                    .spacing(4)
+                    .into()
+                }
             }
         };
 
@@ -2020,41 +2182,78 @@ impl Shell {
         // so the tabs sit directly on top of the editor and the active tab can
         // fold into it (Phase C). Each picker is styled to match the chrome
         // (`theme::picker`) and opens a matching menu (`theme::picker_menu`).
+        // Each "label + picker" is one wrappable unit so a label never separates
+        // from its dropdown; the bar reflows onto extra rows on a narrow window
+        // (the same greedy wrap the toolbar uses) rather than clipping a picker.
+        // The leading width is a rough per-unit estimate — pickers size to their
+        // widest option, so a generous constant keeps a wrap ahead of a clip.
+        let controls_items: Vec<(f32, Element<'_, Message>)> = vec![
+            (
+                310.0,
+                row![
+                    text("Editor font:").font(ui),
+                    pick_list(
+                        families,
+                        Some(self.core.editor_font().to_string()),
+                        Message::SetEditorFont,
+                    )
+                    .style(theme::picker(t))
+                    .menu_style(theme::picker_menu(t))
+                    .font(ui)
+                    .text_size(14)
+                    // Bound the width so a long system-font name can't balloon the
+                    // picker and crowd the bar; the selected name still shows and
+                    // the dropdown lists the full set.
+                    .width(Length::Fixed(200.0)),
+                ]
+                .spacing(6)
+                .align_y(iced::Alignment::Center)
+                .into(),
+            ),
+            (
+                280.0,
+                row![
+                    text("UI font:").font(ui),
+                    pick_list(
+                        families,
+                        Some(self.core.ui_font().to_string()),
+                        Message::SetUiFont,
+                    )
+                    .style(theme::picker(t))
+                    .menu_style(theme::picker_menu(t))
+                    .font(ui)
+                    .text_size(14)
+                    .width(Length::Fixed(200.0)),
+                ]
+                .spacing(6)
+                .align_y(iced::Alignment::Center)
+                .into(),
+            ),
+            (
+                240.0,
+                row![
+                    text("Language:").font(ui),
+                    pick_list(
+                        language_options(),
+                        Some(language_selection),
+                        Message::SetLanguage
+                    )
+                    .style(theme::picker(t))
+                    .menu_style(theme::picker_menu(t))
+                    .font(ui)
+                    .text_size(14),
+                ]
+                .spacing(6)
+                .align_y(iced::Alignment::Center)
+                .into(),
+            ),
+        ];
         let controls = container(
-            row![
-                text("Editor font:").font(ui),
-                pick_list(
-                    families,
-                    Some(self.core.editor_font().to_string()),
-                    Message::SetEditorFont,
-                )
-                .style(theme::picker(t))
-                .menu_style(theme::picker_menu(t))
-                .font(ui)
-                .text_size(14),
-                text("UI font:").font(ui),
-                pick_list(
-                    families,
-                    Some(self.core.ui_font().to_string()),
-                    Message::SetUiFont,
-                )
-                .style(theme::picker(t))
-                .menu_style(theme::picker_menu(t))
-                .font(ui)
-                .text_size(14),
-                text("Language:").font(ui),
-                pick_list(
-                    language_options(),
-                    Some(language_selection),
-                    Message::SetLanguage,
-                )
-                .style(theme::picker(t))
-                .menu_style(theme::picker_menu(t))
-                .font(ui)
-                .text_size(14),
-            ]
-            .spacing(6)
-            .align_y(iced::Alignment::Center)
+            container(wrap_items(
+                controls_items,
+                self.window_width.max(1.0) - 16.0,
+                6.0,
+            ))
             .padding([4, 8])
             .width(Fill),
         )
@@ -2554,6 +2753,124 @@ fn encoding_options() -> &'static [String] {
             .iter()
             .map(|s| (*s).to_string())
             .collect()
+    })
+}
+
+/// Greedily pack width-tagged chrome items into as many left-aligned rows as the
+/// `available` width needs, so a toolbar reflows onto extra lines instead of
+/// clipping controls off a narrow window (a smaller screen adjusts automatically).
+/// Each item carries an *estimated* width — padded a little by the caller, the
+/// same `GLYPH_W` style the tab strip uses — so a wrap lands just before a real
+/// clip would. Everything fitting yields a single row.
+fn wrap_items<'a>(
+    items: Vec<(f32, Element<'a, Message>)>,
+    available: f32,
+    spacing: f32,
+) -> Element<'a, Message> {
+    let mut rows: Vec<Element<'a, Message>> = Vec::new();
+    let mut current: Vec<Element<'a, Message>> = Vec::new();
+    let mut used = 0.0f32;
+    for (w, el) in items {
+        let extra = if current.is_empty() { w } else { spacing + w };
+        if !current.is_empty() && used + extra > available {
+            rows.push(
+                Row::with_children(std::mem::take(&mut current))
+                    .spacing(spacing)
+                    .align_y(iced::Alignment::Center)
+                    .into(),
+            );
+            used = w;
+            current.push(el);
+        } else {
+            used += extra;
+            current.push(el);
+        }
+    }
+    if !current.is_empty() {
+        rows.push(
+            Row::with_children(current)
+                .spacing(spacing)
+                .align_y(iced::Alignment::Center)
+                .into(),
+        );
+    }
+    Column::with_children(rows).spacing(spacing).into()
+}
+
+// ---- Line & text operations picker (#54) ----
+
+/// The placeholder shown on the line/text-ops picker: it holds no persistent
+/// selection (every entry is an action), so it reads as a menu, not a setting.
+/// Kept short — the picker sizes to this text, and the toolbar is width-tight.
+const TEXT_OPS_PLACEHOLDER: &str = "Text ops…";
+
+/// The flat line/text-ops picker entries: inert group headers (rendered like the
+/// language picker's, via [`group_header`]) interleaved with the action labels
+/// [`textop_from_label`] recognises. Built once; `pick_list` wants owned
+/// `String`s.
+fn textop_options() -> &'static [String] {
+    static OPTS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    OPTS.get_or_init(|| {
+        [
+            &group_header("Sort") as &str,
+            "Sort Lines A→Z",
+            "Sort Lines Z→A",
+            "Sort Lines A→Z (ignore case)",
+            "Sort Lines Z→A (ignore case)",
+            &group_header("Lines"),
+            "Reverse Lines",
+            "Remove Duplicate Lines",
+            "Remove Blank Lines",
+            &group_header("Case"),
+            "UPPERCASE",
+            "lowercase",
+            "Title Case",
+            "tOGGLE cASE",
+            &group_header("Whitespace"),
+            "Trim Trailing Whitespace",
+            "Tabs → Spaces",
+            "Spaces → Tabs",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+    })
+}
+
+/// Map a line/text-ops picker label to its [`core::TextOp`]. Returns `None` for
+/// a group-header separator or any unrecognised label, so an inert row does
+/// nothing. Kept next to [`textop_options`] so the two never drift.
+fn textop_from_label(label: &str) -> Option<core::TextOp> {
+    use core::TextOp::*;
+    let width = core::textops::DEFAULT_TAB_WIDTH;
+    Some(match label {
+        "Sort Lines A→Z" => SortLines {
+            descending: false,
+            case_insensitive: false,
+        },
+        "Sort Lines Z→A" => SortLines {
+            descending: true,
+            case_insensitive: false,
+        },
+        "Sort Lines A→Z (ignore case)" => SortLines {
+            descending: false,
+            case_insensitive: true,
+        },
+        "Sort Lines Z→A (ignore case)" => SortLines {
+            descending: true,
+            case_insensitive: true,
+        },
+        "Reverse Lines" => ReverseLines,
+        "Remove Duplicate Lines" => RemoveDuplicateLines,
+        "Remove Blank Lines" => RemoveBlankLines,
+        "UPPERCASE" => Uppercase,
+        "lowercase" => Lowercase,
+        "Title Case" => TitleCase,
+        "tOGGLE cASE" => ToggleCase,
+        "Trim Trailing Whitespace" => TrimTrailingWhitespace,
+        "Tabs → Spaces" => TabsToSpaces { width },
+        "Spaces → Tabs" => SpacesToTabs { width },
+        _ => return None,
     })
 }
 
@@ -4208,6 +4525,35 @@ mod tests {
     }
 
     #[test]
+    fn every_textop_label_maps_and_headers_stay_inert() {
+        // The picker and the label→op map must never drift: every non-header
+        // entry resolves to a `TextOp`, and every header resolves to `None`.
+        for label in textop_options() {
+            if is_group_header(label) {
+                assert!(
+                    textop_from_label(label).is_none(),
+                    "header should be inert: {label:?}"
+                );
+            } else {
+                assert!(
+                    textop_from_label(label).is_some(),
+                    "action label has no op: {label:?}"
+                );
+            }
+        }
+        // An unknown label is inert rather than a panic.
+        assert!(textop_from_label("not a real op").is_none());
+        // A representative label resolves to the expected op.
+        assert_eq!(
+            textop_from_label("Sort Lines A→Z"),
+            Some(core::TextOp::SortLines {
+                descending: false,
+                case_insensitive: false,
+            })
+        );
+    }
+
+    #[test]
     fn zoom_messages_change_the_core_font_size_without_touching_the_buffer() {
         // The shell wires the zoom buttons straight through to the core (#35) and
         // must not resync/clear the editor: typed text survives a zoom.
@@ -4777,6 +5123,22 @@ mod tests {
         let before = shell.repaint_nudge;
         let _ = shell.update(Message::ScrollNudge);
         assert_ne!(shell.repaint_nudge, before);
+        // It also arms the settle window so a few more full repaints follow the
+        // gesture (while armed, `subscription` drives a per-frame `ScrollSettle`).
+        assert!(shell.scroll_settle > 0, "scroll arms the settle window");
+        // Each settle tick flips the nudge (another full repaint) and counts down;
+        // draining it returns the app to redraw-on-demand.
+        let mut guard = 0;
+        while shell.scroll_settle > 0 {
+            let prev = shell.repaint_nudge;
+            let _ = shell.update(Message::ScrollSettle);
+            assert_ne!(
+                shell.repaint_nudge, prev,
+                "each settle tick forces a repaint"
+            );
+            guard += 1;
+            assert!(guard < 10, "settle window must drain, not loop forever");
+        }
     }
 
     #[test]

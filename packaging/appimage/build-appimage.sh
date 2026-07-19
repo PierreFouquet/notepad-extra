@@ -10,6 +10,8 @@ cd "$ROOT"
 export APPIMAGE_EXTRACT_AND_RUN=1
 
 ARCH="$(uname -m)"
+VERSION="$(sed -n 's/^version = "\([^"]*\)"$/\1/p' Cargo.toml | head -n 1)"
+[ -n "$VERSION" ] || { echo "workspace version missing from Cargo.toml" >&2; exit 1; }
 APPID="io.github.PierreFouquet.NotepadExtra"
 BIN="$ROOT/target/release/notepad-extra"
 [ -x "$BIN" ] || { echo "release binary missing — run 'cargo build --release -p notepad-iced' first" >&2; exit 1; }
@@ -39,6 +41,7 @@ fi
 # --- build (linuxdeploy writes the AppImage into the CWD) ---
 cd "$ROOT/target/appimage"
 rm -f ./*.AppImage
+export OUTPUT="notepad-extra-$VERSION-$ARCH.AppImage"
 "$LD" --appdir "$APPDIR" \
   -d "$APPDIR/usr/share/applications/$APPID.desktop" \
   -i "$APPDIR/usr/share/icons/hicolor/256x256/apps/$APPID.png" \

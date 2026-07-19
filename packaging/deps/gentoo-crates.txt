@@ -121,6 +121,8 @@ icu_provider@2.2.0
 idna@1.1.0
 idna_adapter@1.2.2
 indexmap@2.14.0
+inotify@0.11.4
+inotify-sys@0.1.8
 itoa@1.0.18
 jobserver@0.1.35
 kurbo@0.10.4
@@ -137,7 +139,10 @@ log@0.4.33
 memchr@2.8.3
 memmap2@0.9.11
 miniz_oxide@0.8.9
+mio@1.2.2
 nom@8.0.0
+notify@8.2.0
+notify-types@2.1.0
 num-conv@0.2.2
 num-traits@0.2.19
 once_cell@1.21.4

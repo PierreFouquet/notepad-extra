@@ -8,7 +8,7 @@ Gentoo #13) and the umbrella dependency strategy (#17). Regenerate with
 
 - **Resolved for target:** `x86_64-unknown-linux-gnu` (the Linux source distros' build target;
   Windows/macOS-only crates are excluded).
-- **External crates:** 286 (the three workspace crates are ours, GPL-3.0-or-later).
+- **External crates:** 291 (the three workspace crates are ours, GPL-3.0-or-later).
 - **Vendored code + font** (iced `text_editor` fork, DejaVu Sans Mono) are not
   crates — see [THIRD-PARTY.md](../THIRD-PARTY.md) (#77).
 - **Per-distro dependency lists** (Gentoo `CRATES=`, RPM bundled `Provides:`)
@@ -22,8 +22,8 @@ shipped under their permissive branch.
 
 | SPDX expression | Crates |
 | --- | ---: |
-| MIT OR Apache-2.0 | 112 |
-| MIT | 73 |
+| MIT OR Apache-2.0 | 113 |
+| MIT | 74 |
 | Apache-2.0 OR MIT | 35 |
 | Unicode-3.0 | 18 |
 | MIT/Apache-2.0 | 9 |
@@ -31,6 +31,7 @@ shipped under their permissive branch.
 | MIT OR Apache-2.0 OR Zlib | 5 |
 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | 4 |
 | Zlib OR Apache-2.0 OR MIT | 3 |
+| ISC | 3 |
 | Unlicense/MIT | 2 |
 | Unlicense OR MIT | 2 |
 | BSD-3-Clause | 2 |
@@ -38,7 +39,7 @@ shipped under their permissive branch.
 | Apache-2.0/MIT | 2 |
 | Zlib | 1 |
 | MIT OR Zlib OR Apache-2.0 | 1 |
-| ISC | 1 |
+| CC0-1.0 | 1 |
 | BSD-2-Clause | 1 |
 | Apache-2.0 OR GPL-2.0-only | 1 |
 | Apache-2.0 AND MIT | 1 |
@@ -171,6 +172,8 @@ shipped under their permissive branch.
 | idna | 1.1.0 | MIT OR Apache-2.0 |
 | idna_adapter | 1.2.2 | Apache-2.0 OR MIT |
 | indexmap | 2.14.0 | Apache-2.0 OR MIT |
+| inotify | 0.11.4 | ISC |
+| inotify-sys | 0.1.8 | ISC |
 | itoa | 1.0.18 | MIT OR Apache-2.0 |
 | jobserver | 0.1.35 | MIT OR Apache-2.0 |
 | kurbo | 0.10.4 | MIT OR Apache-2.0 |
@@ -187,7 +190,10 @@ shipped under their permissive branch.
 | memchr | 2.8.3 | Unlicense OR MIT |
 | memmap2 | 0.9.11 | MIT OR Apache-2.0 |
 | miniz_oxide | 0.8.9 | MIT OR Zlib OR Apache-2.0 |
+| mio | 1.2.2 | MIT |
 | nom | 8.0.0 | MIT |
+| notify | 8.2.0 | CC0-1.0 |
+| notify-types | 2.1.0 | MIT OR Apache-2.0 |
 | num-conv | 0.2.2 | MIT OR Apache-2.0 |
 | num-traits | 0.2.19 | MIT OR Apache-2.0 |
 | once_cell | 1.21.4 | MIT OR Apache-2.0 |

@@ -2,4 +2,13 @@ target/
 corpus/
 artifacts/
 coverage/
-Cargo.lock
+
+# `Cargo.lock` is deliberately NOT ignored (#129). This crate is a detached
+# workspace, so the root lockfile does not cover it, and `cargo fuzz` accepts no
+# `--locked` flag — leaving its dependency set free to drift silently on every
+# run. Tracking the lockfile lets CI assert it instead, with
+# `cargo metadata --locked` ahead of the fuzz build.
+#
+# Cost of this: changing a dependency of `notepad-core` or `notepad-syntax` also
+# makes *this* lockfile stale, and CI will say so. Regenerate it with:
+#   cargo generate-lockfile --manifest-path crates/core/fuzz/Cargo.toml

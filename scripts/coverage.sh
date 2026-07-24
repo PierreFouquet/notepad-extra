@@ -29,9 +29,15 @@ PKGS=(--package notepad-core --package notepad-syntax)
 COV_JSON="$(mktemp)"
 trap 'rm -f "$COV_JSON"' EXIT
 
+# Resolve strictly against the committed Cargo.lock, mirroring the `--locked` on
+# the workflow's clippy/build/test steps (#129). Without it this gate would
+# silently update the lockfile mid-run and measure a dependency set that is not
+# the one the rest of CI just tested.
+LOCKED=(--locked)
+
 # 1. Run both suites once under instrumentation, keeping the raw profile data so
 #    the reports below don't re-run the tests.
-cargo llvm-cov --no-report "${PKGS[@]}"
+cargo llvm-cov --no-report "${LOCKED[@]}" "${PKGS[@]}"
 
 # 2. Forward any passthrough flags (e.g. --html) to a human report. `--summary-only`
 #    (the CI default) is dropped: it can't combine with a plain text report, and
@@ -41,11 +47,11 @@ for arg in "$@"; do
     [[ "$arg" == "--summary-only" ]] || report_args+=("$arg")
 done
 if [[ ${#report_args[@]} -gt 0 ]]; then
-    cargo llvm-cov report "${PKGS[@]}" "${report_args[@]}"
+    cargo llvm-cov report "${LOCKED[@]}" "${PKGS[@]}" "${report_args[@]}"
 fi
 
 # 3. Export the coverage data once as JSON; both gates are enforced from it.
-cargo llvm-cov report "${PKGS[@]}" --json --output-path "$COV_JSON"
+cargo llvm-cov report "${LOCKED[@]}" "${PKGS[@]}" --json --output-path "$COV_JSON"
 
 # 4. Print a compact per-file line-coverage table for the log.
 jq -r '.data[0]

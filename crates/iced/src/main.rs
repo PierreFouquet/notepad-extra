@@ -213,8 +213,9 @@ fn on_key(key: iced::keyboard::Key, modifiers: iced::keyboard::Modifiers) -> Opt
 ///
 /// * **Ctrl/Cmd+N / O / S** — new / open / save (**+Shift** on `S` = save as).
 /// * **Ctrl/Cmd+Z / Ctrl/Cmd+Shift+Z / Ctrl/Cmd+Y** — undo / redo.
-/// * **Ctrl/Cmd+F / H / G** — open the find bar (its find, replace and go-to
-///   fields share one bar, so all three simply open it).
+/// * **Ctrl/Cmd+F / H / G** — open the find bar and focus its find, replace or
+///   go-to-line field respectively (#128). The three fields share one bar, so the
+///   accelerators differ only in which one they put the caret in.
 /// * **Ctrl/Cmd+ = / + / - / _ / 0** — zoom in / out / reset.
 /// * **Ctrl/Cmd+Q** — quit through the unsaved-changes guard (#69).
 ///
@@ -249,7 +250,9 @@ fn command_shortcut(
             Message::Undo
         }),
         "y" => Some(Message::Redo),
-        "f" | "h" | "g" => Some(Message::OpenFind),
+        "f" => Some(Message::OpenFind(FindField::Find)),
+        "h" => Some(Message::OpenFind(FindField::Replace)),
+        "g" => Some(Message::OpenFind(FindField::GoTo)),
         "=" | "+" => Some(Message::ZoomIn),
         "-" | "_" => Some(Message::ZoomOut),
         "0" => Some(Message::ZoomReset),
@@ -546,11 +549,15 @@ enum Message {
     // ---- Find / Replace / Go-to-line (#33) ----
     /// Show or hide the find / replace bar.
     ToggleFind,
-    /// Open the find / replace bar (idempotent — a no-op if already open). The
-    /// Ctrl+F / Ctrl+H / Ctrl+G accelerators (#39) all route here: the native bar
-    /// shows the find, replace and go-to fields together, so one "open" serves
-    /// all three.
-    OpenFind,
+    /// Open the find / replace bar and focus one of its fields (#39, #128). The
+    /// Ctrl+F / Ctrl+H / Ctrl+G accelerators all route here — the bar shows the
+    /// find, replace and go-to fields together, so one "open" serves all three —
+    /// and the [`FindField`] says which one takes the caret.
+    ///
+    /// Opening is idempotent (a repeated Ctrl+F never toggles the bar shut), but
+    /// the *focus* applies every time, so Ctrl+H on an already-open bar still
+    /// moves the caret to the replacement field.
+    OpenFind(FindField),
     /// Close the find / replace bar.
     CloseFind,
     /// The search pattern input changed.
@@ -650,6 +657,35 @@ enum Message {
     /// the existing intents (New, Save, Undo, …); only Escape needs the current
     /// state to decide what it means, so only it gets its own message.
     Escape,
+}
+
+/// Which field of the find bar an "open find" targets (#128).
+///
+/// `Ctrl+F` / `Ctrl+H` / `Ctrl+G` all reveal the *same* bar — it shows find,
+/// replace and go-to-line together — so they differ only in which field ends up
+/// focused. Without that focus the shortcut opens a bar you then have to click
+/// into before you can type, which is what made the accelerators feel broken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FindField {
+    /// The search pattern field (`Ctrl+F`, and the toolbar's **Find** button).
+    Find,
+    /// The replacement field (`Ctrl+H`).
+    Replace,
+    /// The go-to-line field (`Ctrl+G`).
+    GoTo,
+}
+
+impl FindField {
+    /// This field's stable widget id. Used twice: to tag the `text_input` in
+    /// [`Shell::find_bar`], and to aim a focus operation at it from `dispatch`.
+    /// Both sides go through here so a renamed id can't desync them.
+    fn id(self) -> iced::advanced::widget::Id {
+        iced::advanced::widget::Id::new(match self {
+            FindField::Find => "find-query",
+            FindField::Replace => "find-replacement",
+            FindField::GoTo => "find-goto",
+        })
+    }
 }
 
 /// The user's answer to the close-with-unsaved prompt (#31).
@@ -1274,10 +1310,6 @@ impl Shell {
             // cheap stat gate against the tab's baseline; a real change (or a gone
             // file) turns into a `core::Message::DiskChanged`.
             Message::DiskEvent(paths) => {
-                eprintln!(
-                    "[watch] DiskEvent {paths:?}; open paths={:?}",
-                    self.core.docs.iter().map(|d| &d.path).collect::<Vec<_>>()
-                );
                 // Resolve the affected tabs first, copying out id + baseline so we
                 // no longer borrow `self.core` when we call `apply_core` below.
                 let targets: Vec<(TabId, Option<DiskMeta>, PathBuf)> = paths
@@ -1454,21 +1486,31 @@ impl Shell {
             }
 
             // ---- Find / Replace / Go-to-line (#33) ----
+            // The toolbar button toggles rather than opens, but the *opening* half
+            // focuses the query field just as Ctrl+F does (#128) — clicking "Find"
+            // and still having to click the box would be the same papercut.
             Message::ToggleFind => {
                 if self.core.find.open {
                     self.apply_core(core::Message::FindClosed, false)
                 } else {
-                    self.open_find()
+                    Task::batch([
+                        self.open_find(),
+                        iced::widget::operation::focus(FindField::Find.id()),
+                    ])
                 }
             }
             // Idempotent open (#39): only ask the core to open if it isn't already,
-            // so a repeated Ctrl+F never toggles the bar shut.
-            Message::OpenFind => {
-                if self.core.find.open {
+            // so a repeated Ctrl+F never toggles the bar shut. The focus (#128) is
+            // unconditional, though — Ctrl+H on an already-open bar should still
+            // move the caret to the replacement field — and is chained *after* the
+            // open so the widget exists to receive it.
+            Message::OpenFind(field) => {
+                let open = if self.core.find.open {
                     Task::none()
                 } else {
                     self.open_find()
-                }
+                };
+                Task::batch([open, iced::widget::operation::focus(field.id())])
             }
             Message::CloseFind => self.apply_core(core::Message::FindClosed, false),
             Message::FindQueryChanged(q) => {
@@ -2991,6 +3033,7 @@ impl Shell {
 
         let find_row = row![
             text_input("Find", &find.query)
+                .id(FindField::Find.id())
                 .font(ui)
                 .style(theme::input(t))
                 .on_input(Message::FindQueryChanged)
@@ -3021,6 +3064,7 @@ impl Shell {
 
         let replace_row = row![
             text_input("Replace with", &find.replacement)
+                .id(FindField::Replace.id())
                 .font(ui)
                 .style(theme::input(t))
                 .on_input(Message::ReplaceQueryChanged)
@@ -3034,6 +3078,7 @@ impl Shell {
                 .on_press(Message::ReplaceAll),
             text("Go to line:").font(ui),
             text_input("n", &self.goto_input)
+                .id(FindField::GoTo.id())
                 .font(ui)
                 .style(theme::input(t))
                 .on_input(Message::GoToInputChanged)
@@ -5296,12 +5341,20 @@ mod tests {
         assert!(matches!(on_key(ch("s"), cmd()), Some(Message::Save)));
         assert!(matches!(on_key(ch("z"), cmd()), Some(Message::Undo)));
         assert!(matches!(on_key(ch("y"), cmd()), Some(Message::Redo)));
-        // Find / Replace / Go-to all open the one shared bar.
-        for c in ["f", "h", "g"] {
-            assert!(
-                matches!(on_key(ch(c), cmd()), Some(Message::OpenFind)),
-                "Ctrl+{c} should open the find bar"
-            );
+        // Find / Replace / Go-to all open the one shared bar, but each aims at its
+        // own field (#128) — asserting the *field* too, so a regression that
+        // collapsed all three back onto one target would fail here.
+        for (c, want) in [
+            ("f", FindField::Find),
+            ("h", FindField::Replace),
+            ("g", FindField::GoTo),
+        ] {
+            match on_key(ch(c), cmd()) {
+                Some(Message::OpenFind(got)) => {
+                    assert_eq!(got, want, "Ctrl+{c} should focus {want:?}, not {got:?}")
+                }
+                other => panic!("Ctrl+{c} should open the find bar, got {other:?}"),
+            }
         }
     }
 
@@ -5465,10 +5518,14 @@ mod tests {
         // the toolbar's ToggleFind), so repeated accelerators keep it open.
         let (mut shell, _) = Shell::new();
         assert!(!shell.core.find.open);
-        let _ = shell.update(Message::OpenFind);
+        let _ = shell.update(Message::OpenFind(FindField::Find));
         assert!(shell.core.find.open);
-        let _ = shell.update(Message::OpenFind);
+        let _ = shell.update(Message::OpenFind(FindField::Find));
         assert!(shell.core.find.open, "a second open keeps the bar up");
+        // A different field's accelerator on an already-open bar likewise leaves
+        // it open (it only re-aims the focus).
+        let _ = shell.update(Message::OpenFind(FindField::Replace));
+        assert!(shell.core.find.open, "Ctrl+H keeps the open bar up");
     }
 
     #[test]
@@ -5480,7 +5537,7 @@ mod tests {
         assert!(!shell.core.about_open() && !shell.core.find.open);
 
         // With both open, Escape closes About first (About takes priority)…
-        let _ = shell.update(Message::OpenFind);
+        let _ = shell.update(Message::OpenFind(FindField::Find));
         let _ = shell.update(Message::ToggleAbout);
         assert!(shell.core.about_open() && shell.core.find.open);
         let _ = shell.update(Message::Escape);
@@ -6000,6 +6057,41 @@ mod ui_tests {
             ui.find("Replace").is_ok(),
             "the find/replace bar should be visible once open"
         );
+    }
+
+    /// The find bar's three inputs must carry the exact ids the Ctrl+F / Ctrl+H /
+    /// Ctrl+G focus tasks aim at (#128). `Message::OpenFind` focuses by id, so a
+    /// renamed or dropped `.id(...)` would silently leave the accelerator opening
+    /// a bar with the caret still in the editor — the very bug this fixes, and one
+    /// that produces no error anywhere. Resolving each id against the real widget
+    /// tree pins both halves of the wiring together.
+    #[test]
+    fn find_bar_inputs_carry_the_ids_the_accelerators_focus() {
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::OpenFind(FindField::Find));
+        assert!(shell.core.find.open, "Ctrl+F opened the bar");
+
+        let mut ui = simulator(shell.view());
+        for field in [FindField::Find, FindField::Replace, FindField::GoTo] {
+            assert!(
+                ui.find(iced_test::selector::id(field.id())).is_ok(),
+                "no widget carries {field:?}'s id — its accelerator cannot focus it"
+            );
+        }
+    }
+
+    /// The three fields must be *distinct* targets. A copy-paste slip that gave
+    /// two fields the same id would still pass the lookup above (both resolve),
+    /// while collapsing Ctrl+H or Ctrl+G onto the wrong box.
+    #[test]
+    fn each_find_field_has_its_own_id() {
+        let ids = [
+            FindField::Find.id(),
+            FindField::Replace.id(),
+            FindField::GoTo.id(),
+        ];
+        let unique: HashSet<_> = ids.iter().cloned().collect();
+        assert_eq!(unique.len(), ids.len(), "find-bar ids must be distinct");
     }
 
     #[test]

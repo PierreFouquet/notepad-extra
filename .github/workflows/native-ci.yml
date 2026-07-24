@@ -10,6 +10,12 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  # Weekly, for the `audit` job only (every other job is gated off `schedule`
+  # below). A new advisory can land against an unchanged `Cargo.lock`, so a
+  # vulnerability gate that only runs on PRs can stay green for months while the
+  # tree is quietly affected (#129).
+  schedule:
+    - cron: "0 7 * * 1" # Mondays, 07:00 UTC
 
 env:
   CARGO_TERM_COLOR: always
@@ -17,6 +23,8 @@ env:
 jobs:
   core:
     name: "core — fmt · clippy · test"
+    # The weekly `schedule` run exists for the `audit` job alone (#129).
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -29,9 +37,9 @@ jobs:
       - name: rustfmt
         run: cargo fmt --package notepad-core --package notepad-syntax -- --check
       - name: clippy (deny warnings)
-        run: cargo clippy --package notepad-core --package notepad-syntax --all-targets -- -D warnings
+        run: cargo clippy --locked --package notepad-core --package notepad-syntax --all-targets -- -D warnings
       - name: test (unit + proptest + stress)
-        run: cargo test --package notepad-core --package notepad-syntax --all-targets --verbose
+        run: cargo test --locked --package notepad-core --package notepad-syntax --all-targets --verbose
 
   shell:
     # Windows & macOS are first-class for this epic (#25), so the shell is built
@@ -43,6 +51,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
+    if: github.event_name != 'schedule'
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -65,14 +74,14 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo fmt --package notepad-iced -- --check
       - name: clippy (deny warnings)
-        run: cargo clippy --package notepad-iced --all-targets -- -D warnings
+        run: cargo clippy --locked --package notepad-iced --all-targets -- -D warnings
       - name: build
-        run: cargo build --package notepad-iced
+        run: cargo build --locked --package notepad-iced
       - name: test (headless shell wiring + UI simulator)
         # `--all-targets` runs the `ui_tests` module too — iced_test's Simulator
         # drives the real widget tree with no window / GPU (#70), so it needs no
         # xvfb and runs identically on all three matrix OSes.
-        run: cargo test --package notepad-iced --all-targets --verbose
+        run: cargo test --locked --package notepad-iced --all-targets --verbose
       - name: windowed smoke (xvfb, software renderer)
         if: runner.os == 'Linux'
         run: |
@@ -92,6 +101,7 @@ jobs:
 
   coverage:
     name: "core + syntax — coverage gate"
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -107,6 +117,7 @@ jobs:
 
   fuzz:
     name: "core — fuzz targets"
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -115,6 +126,15 @@ jobs:
       - uses: taiki-e/install-action@v1
         with:
           tool: cargo-fuzz
+      # The `--locked` the other jobs pass cannot be used here: `cargo fuzz` has
+      # no such flag and forwards nothing to cargo, and this crate is a detached
+      # workspace so the root lockfile does not cover it. Assert the same property
+      # with a tool that *does* support it — `cargo metadata --locked` fails if
+      # `crates/core/fuzz/Cargo.lock` is stale — and run it before the build,
+      # which would otherwise quietly update the lockfile and fuzz a dependency
+      # set nobody reviewed.
+      - name: verify the fuzz lockfile is in sync
+        run: cargo metadata --locked --format-version 1 --manifest-path crates/core/fuzz/Cargo.toml > /dev/null
       # Pin the gnu target: cargo-fuzz otherwise defaults to musl on this runner,
       # whose statically linked libc is incompatible with the sanitizer (and its
       # std isn't installed) — `error: sanitizer is incompatible with statically
@@ -133,8 +153,38 @@ jobs:
             echo "::endgroup::"
           done
 
+  audit:
+    name: "dependency vulnerability audit (#129)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+      # Built from source rather than fetched via `taiki-e/install-action`: that
+      # action has no cargo-audit recipe and falls back to a pinned, old
+      # `cargo-binstall` which cannot parse cargo-audit's manifest (it inherits
+      # `package.edition` from its workspace), so the install fails outright.
+      # `cargo install` is slower on a cold cache but has no such dependency, and
+      # rust-cache keeps `~/.cargo/bin` warm afterwards. It is also exactly what a
+      # developer runs locally, so CI and local results cannot diverge.
+      - name: install cargo-audit
+        run: cargo install cargo-audit --locked
+      # Checks the committed Cargo.lock against the RustSec advisory database, so
+      # a dependency that picks up a published CVE fails here rather than at a
+      # distro reviewer's desk (#7/#8/#9/#12/#13 all lead to someone running this).
+      #
+      # Known, assessed advisories are ignored in `.cargo/audit.toml`, each with a
+      # written rationale and the condition that would let us drop it — without
+      # that list the job would be red from day one on advisories we cannot fix
+      # from this repo (they sit behind `wayland-scanner`, a build-time proc-macro
+      # pinned to an old `quick-xml`), and a permanently-red gate gets ignored.
+      # New advisories are still caught: the ignores name specific IDs.
+      - name: cargo audit
+        run: cargo audit
+
   licenses:
     name: "dependency licence audit (#17)"
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

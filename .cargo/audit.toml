@@ -1,0 +1,69 @@
+# cargo-audit configuration — the RustSec advisory gate (#129).
+#
+# CI runs `cargo audit` against the committed `Cargo.lock` (see the `audit` job in
+# .github/workflows/native-ci.yml). A *new* advisory affecting the tree fails the
+# build; the advisories listed below are known, assessed, and deliberately
+# accepted, each with the condition that would let us drop it again.
+#
+# Rules for this file:
+#   * Every ignore carries a rationale and a removal condition. An entry nobody
+#     can justify should be removed, not renewed.
+#   * Only ignore what we cannot fix from this repository. A transitive advisory
+#     we *can* lift by bumping a direct dependency gets bumped instead.
+#   * Re-check the list whenever `Cargo.lock` is regenerated — an upstream release
+#     may have made an entry obsolete, and a stale ignore is a blind spot.
+
+[advisories]
+ignore = [
+    # --- quick-xml 0.39.4, reached only through the `wayland-scanner` proc-macro ---
+    #
+    # RUSTSEC-2026-0194 — quadratic run time when checking a start tag for
+    #   duplicate attribute names.
+    # RUSTSEC-2026-0195 — unbounded namespace-declaration allocation in `NsReader`
+    #   enables memory-exhaustion denial of service.
+    #
+    # Both are rated 7.5 (high) and both are fixed in quick-xml >= 0.41.0.
+    #
+    # Why accepted:
+    #   * `wayland-scanner` is a **proc-macro**. It parses Wayland protocol XML at
+    #     **build time**, from files vendored inside the `wayland-protocols` crates.
+    #     Notepad Extra never feeds it input, and the crate is not present at
+    #     runtime at all — neither advisory is reachable from the shipped binary.
+    #   * The app is fully offline and opens no XML of its own, so there is no path
+    #     by which a user's file could reach this parser.
+    #
+    # Why not simply fixed:
+    #   * `wayland-scanner 0.31.10` requires `quick-xml = "^0.39"`, so
+    #     `cargo update -p quick-xml@0.39.4 --precise 0.41.0` fails to resolve. It
+    #     needs a new `wayland-scanner` release; the path is
+    #     rfd -> ashpd -> wayland-client -> wayland-scanner, and separately
+    #     iced -> winit -> smithay-client-toolkit -> wayland-scanner.
+    #   * quick-xml 0.41.0 is *already* in the tree for another dependency, so only
+    #     the `wayland-scanner` path is affected.
+    #
+    # Drop when: a `wayland-scanner` release relaxes the `^0.39` bound and the
+    # updated crate reaches us through `winit` / `ashpd`.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+
+    # --- unmaintained crates, all transitive through iced / syntect ---
+    #
+    # These are maintenance-status warnings, not vulnerabilities: no advisory
+    # describes an exploitable defect. None is a direct dependency, so none can be
+    # swapped out from here — each needs its parent to migrate first.
+    #
+    # RUSTSEC-2025-0141 — bincode 1.3.3 is unmaintained.
+    #   Via `syntect`, which uses it to load the compiled syntax/theme dumps we
+    #   embed at build time. Drop when syntect moves to bincode 2.
+    "RUSTSEC-2025-0141",
+
+    # RUSTSEC-2026-0192 — ttf-parser 0.25.1 is unmaintained.
+    #   Via fontdb -> cosmic-text -> iced, i.e. the text stack itself.
+    #   Drop when cosmic-text moves to a maintained parser.
+    "RUSTSEC-2026-0192",
+
+    # RUSTSEC-2024-0320 — yaml-rust 0.4.5 is unmaintained.
+    #   Via `syntect`, which parses `.sublime-syntax` (YAML) grammars with it.
+    #   Drop when syntect moves to yaml-rust2 or another maintained crate.
+    "RUSTSEC-2024-0320",
+]

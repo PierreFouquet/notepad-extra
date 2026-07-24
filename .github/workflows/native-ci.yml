@@ -10,6 +10,12 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  # Weekly, for the `audit` job only (every other job is gated off `schedule`
+  # below). A new advisory can land against an unchanged `Cargo.lock`, so a
+  # vulnerability gate that only runs on PRs can stay green for months while the
+  # tree is quietly affected (#129).
+  schedule:
+    - cron: "0 7 * * 1" # Mondays, 07:00 UTC
 
 env:
   CARGO_TERM_COLOR: always
@@ -17,6 +23,8 @@ env:
 jobs:
   core:
     name: "core — fmt · clippy · test"
+    # The weekly `schedule` run exists for the `audit` job alone (#129).
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -43,6 +51,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
+    if: github.event_name != 'schedule'
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -92,6 +101,7 @@ jobs:
 
   coverage:
     name: "core + syntax — coverage gate"
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -107,6 +117,7 @@ jobs:
 
   fuzz:
     name: "core — fuzz targets"
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -133,8 +144,32 @@ jobs:
             echo "::endgroup::"
           done
 
+  audit:
+    name: "dependency vulnerability audit (#129)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v1
+        with:
+          tool: cargo-audit
+      # Checks the committed Cargo.lock against the RustSec advisory database, so
+      # a dependency that picks up a published CVE fails here rather than at a
+      # distro reviewer's desk (#7/#8/#9/#12/#13 all lead to someone running this).
+      #
+      # Known, assessed advisories are ignored in `.cargo/audit.toml`, each with a
+      # written rationale and the condition that would let us drop it — without
+      # that list the job would be red from day one on advisories we cannot fix
+      # from this repo (they sit behind `wayland-scanner`, a build-time proc-macro
+      # pinned to an old `quick-xml`), and a permanently-red gate gets ignored.
+      # New advisories are still caught: the ignores name specific IDs.
+      - name: cargo audit
+        run: cargo audit
+
   licenses:
     name: "dependency licence audit (#17)"
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

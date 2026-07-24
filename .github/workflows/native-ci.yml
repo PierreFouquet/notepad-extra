@@ -37,9 +37,9 @@ jobs:
       - name: rustfmt
         run: cargo fmt --package notepad-core --package notepad-syntax -- --check
       - name: clippy (deny warnings)
-        run: cargo clippy --package notepad-core --package notepad-syntax --all-targets -- -D warnings
+        run: cargo clippy --locked --package notepad-core --package notepad-syntax --all-targets -- -D warnings
       - name: test (unit + proptest + stress)
-        run: cargo test --package notepad-core --package notepad-syntax --all-targets --verbose
+        run: cargo test --locked --package notepad-core --package notepad-syntax --all-targets --verbose
 
   shell:
     # Windows & macOS are first-class for this epic (#25), so the shell is built
@@ -74,14 +74,14 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo fmt --package notepad-iced -- --check
       - name: clippy (deny warnings)
-        run: cargo clippy --package notepad-iced --all-targets -- -D warnings
+        run: cargo clippy --locked --package notepad-iced --all-targets -- -D warnings
       - name: build
-        run: cargo build --package notepad-iced
+        run: cargo build --locked --package notepad-iced
       - name: test (headless shell wiring + UI simulator)
         # `--all-targets` runs the `ui_tests` module too — iced_test's Simulator
         # drives the real widget tree with no window / GPU (#70), so it needs no
         # xvfb and runs identically on all three matrix OSes.
-        run: cargo test --package notepad-iced --all-targets --verbose
+        run: cargo test --locked --package notepad-iced --all-targets --verbose
       - name: windowed smoke (xvfb, software renderer)
         if: runner.os == 'Linux'
         run: |
@@ -151,9 +151,15 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@v1
-        with:
-          tool: cargo-audit
+      # Built from source rather than fetched via `taiki-e/install-action`: that
+      # action has no cargo-audit recipe and falls back to a pinned, old
+      # `cargo-binstall` which cannot parse cargo-audit's manifest (it inherits
+      # `package.edition` from its workspace), so the install fails outright.
+      # `cargo install` is slower on a cold cache but has no such dependency, and
+      # rust-cache keeps `~/.cargo/bin` warm afterwards. It is also exactly what a
+      # developer runs locally, so CI and local results cannot diverge.
+      - name: install cargo-audit
+        run: cargo install cargo-audit --locked
       # Checks the committed Cargo.lock against the RustSec advisory database, so
       # a dependency that picks up a published CVE fails here rather than at a
       # distro reviewer's desk (#7/#8/#9/#12/#13 all lead to someone running this).

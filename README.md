@@ -49,6 +49,9 @@ Everything stays offline and pure-Rust (fancy-regex, no oniguruma C dependency).
 | Replace | `Ctrl/Cmd + H` |
 | Find next / previous | `F3` / `Shift + F3` |
 | Go to line | `Ctrl/Cmd + G` |
+
+> Find, Replace and Go-to-line share one bar; each shortcut opens it with that
+> field focused, so you can type straight away.
 | Zoom in / out / reset | `Ctrl/Cmd + +` / `-` / `0` |
 | Close find bar / About panel | `Esc` |
 

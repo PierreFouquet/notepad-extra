@@ -1274,10 +1274,6 @@ impl Shell {
             // cheap stat gate against the tab's baseline; a real change (or a gone
             // file) turns into a `core::Message::DiskChanged`.
             Message::DiskEvent(paths) => {
-                eprintln!(
-                    "[watch] DiskEvent {paths:?}; open paths={:?}",
-                    self.core.docs.iter().map(|d| &d.path).collect::<Vec<_>>()
-                );
                 // Resolve the affected tabs first, copying out id + baseline so we
                 // no longer borrow `self.core` when we call `apply_core` below.
                 let targets: Vec<(TabId, Option<DiskMeta>, PathBuf)> = paths

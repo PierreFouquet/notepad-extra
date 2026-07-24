@@ -126,6 +126,15 @@ jobs:
       - uses: taiki-e/install-action@v1
         with:
           tool: cargo-fuzz
+      # The `--locked` the other jobs pass cannot be used here: `cargo fuzz` has
+      # no such flag and forwards nothing to cargo, and this crate is a detached
+      # workspace so the root lockfile does not cover it. Assert the same property
+      # with a tool that *does* support it — `cargo metadata --locked` fails if
+      # `crates/core/fuzz/Cargo.lock` is stale — and run it before the build,
+      # which would otherwise quietly update the lockfile and fuzz a dependency
+      # set nobody reviewed.
+      - name: verify the fuzz lockfile is in sync
+        run: cargo metadata --locked --format-version 1 --manifest-path crates/core/fuzz/Cargo.toml > /dev/null
       # Pin the gnu target: cargo-fuzz otherwise defaults to musl on this runner,
       # whose statically linked libc is incompatible with the sanitizer (and its
       # std isn't installed) — `error: sanitizer is incompatible with statically

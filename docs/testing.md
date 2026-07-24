@@ -52,6 +52,19 @@ cargo fuzz run --fuzz-dir crates/core/fuzz text_helpers
 The core stays dependency-free; the fuzz crate is a **detached** workspace so it
 is never pulled into `cargo test`.
 
+Being detached, it carries its **own committed `Cargo.lock`** — the root one does
+not cover it. `cargo fuzz` accepts no `--locked` flag and forwards nothing to
+cargo, so CI asserts the lockfile separately, with
+`cargo metadata --locked --manifest-path crates/core/fuzz/Cargo.toml` ahead of the
+build; without that the fuzz job would silently re-resolve its dependencies on
+every run. Because `notepad-core` and `notepad-syntax` are path dependencies here,
+changing *their* dependencies makes this lockfile stale too, and CI will fail
+until it is regenerated:
+
+```sh
+cargo generate-lockfile --manifest-path crates/core/fuzz/Cargo.toml
+```
+
 ## Coverage gate
 
 ```sh

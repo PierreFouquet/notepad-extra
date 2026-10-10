@@ -27,6 +27,7 @@ use iced::widget::{
 use iced::{Element, Fill, Length, Point, Subscription, Task};
 use notepad_core as core;
 use notepad_core::{DiskMeta, DiskStatus, Effect, FindOption, TabId};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -825,6 +826,22 @@ impl Readouts {
             }),
         }
     }
+}
+
+/// One frame's tab-strip layout (#70): each tab's display name and the split of
+/// tab indices into those shown inline and those collapsed behind `▾ N more`.
+/// Computed once per [`Shell::view`] and handed to both [`Shell::tab_strip`] and
+/// [`Shell::tabs_overflow_menu`], which used to build their own copies — with a
+/// third in `view` for the overflow check, so every tab name was allocated three
+/// times per frame (#126). A clean tab's name borrows the document's title; only
+/// a dirty tab, whose name carries the "•" marker, allocates.
+struct TabSplit<'a> {
+    /// Each tab's display name, by tab index.
+    names: Vec<Cow<'a, str>>,
+    /// The tabs shown inline on the strip, in order.
+    visible: Vec<usize>,
+    /// The tabs collapsed into the overflow menu, in order.
+    overflow: Vec<usize>,
 }
 
 /// The whole shell: the pure core plus the per-tab editor buffers, window title,
@@ -2097,15 +2114,15 @@ impl Shell {
     /// the whole tab to `Fill` — making every tab stretch to an equal share of the
     /// window (and squeezing the `×` off narrow tabs). Back at `Shrink`, tabs size
     /// to `label + ×` and pack left, while the strip still spans each tab's width
-    /// via the flex cross-axis pass.
-    fn tab_widget(
-        &self,
+    /// via the flex cross-axis pass. `name` comes from the frame's [`TabSplit`]: a
+    /// borrowed title for a clean tab, so the label costs no allocation (#126).
+    fn tab_widget<'a>(
         i: usize,
-        name: String,
+        name: Cow<'a, str>,
         active: bool,
         ui: iced::Font,
         t: theme::Tokens,
-    ) -> Element<'_, Message> {
+    ) -> Element<'a, Message> {
         let fg = if active { t.tab_active_fg } else { t.tab_fg };
         let strip = container(Space::new())
             .width(Fill)
@@ -2128,23 +2145,25 @@ impl Shell {
         column![strip, body].width(Length::Shrink).into()
     }
 
-    /// Each tab's display name plus the split into `(names, inline, overflow)`
-    /// index lists (#70). `view` can't measure text, so the widths are estimated
-    /// from iced's default ~16px chrome text; the constants cover the body padding,
-    /// both buttons' own padding, the `×`, and the row spacing, and are generous on
-    /// purpose so the overflow control appears *before* a tab would clip. Shared by
-    /// [`Shell::tab_strip`] and [`Shell::tabs_overflow_menu`] so both agree on which
-    /// tabs are collapsed.
-    fn tab_split(&self) -> (Vec<String>, Vec<usize>, Vec<usize>) {
-        let names: Vec<String> = self
+    /// Each tab's display name plus the split into inline and overflow index
+    /// lists, as one [`TabSplit`] (#70). `view` can't measure text, so the widths
+    /// are estimated from iced's default ~16px chrome text; the constants cover
+    /// the body padding, both buttons' own padding, the `×`, and the row spacing,
+    /// and are generous on purpose so the overflow control appears *before* a tab
+    /// would clip. Computed once per frame by [`Shell::view`] and shared with
+    /// [`Shell::tab_strip`] and [`Shell::tabs_overflow_menu`] so both agree on
+    /// which tabs are collapsed (#126).
+    fn tab_split(&self) -> TabSplit<'_> {
+        let names: Vec<Cow<'_, str>> = self
             .core
             .docs
             .iter()
             .map(|doc| {
+                // `dirty()` is an O(1) flag read (#126); only the marker allocates.
                 if doc.dirty() {
-                    format!("{} \u{2022}", doc.title())
+                    Cow::Owned(format!("{} \u{2022}", doc.title()))
                 } else {
-                    doc.title().to_string()
+                    Cow::Borrowed(doc.title())
                 }
             })
             .collect();
@@ -2158,7 +2177,11 @@ impl Shell {
             .collect();
         let (visible, overflow) =
             split_tabs_for_width(&widths, self.window_width, OVERFLOW_W, self.core.active);
-        (names, visible, overflow)
+        TabSplit {
+            names,
+            visible,
+            overflow,
+        }
     }
 
     /// The Chrome-style tab strip (#70): content-sized tabs packed from the left,
@@ -2166,17 +2189,29 @@ impl Shell {
     /// (rather than a scrollbar) that toggles [`Shell::tabs_overflow_menu`]. The
     /// active tab is always kept inline so it stays visible. The bar spans the full
     /// width in `tabs_bg`, which the active tab (`app_bg`) sits proud of.
-    fn tab_strip(&self, ui: iced::Font, t: theme::Tokens) -> Element<'_, Message> {
+    fn tab_strip<'a>(
+        &'a self,
+        ui: iced::Font,
+        t: theme::Tokens,
+        split: &TabSplit<'a>,
+    ) -> Element<'a, Message> {
         let active = self.core.active;
-        let (names, visible, overflow) = self.tab_split();
         let mut tabs = row![].spacing(0);
-        for &i in &visible {
-            tabs = tabs.push(self.tab_widget(i, names[i].clone(), i == active, ui, t));
+        for &i in &split.visible {
+            // Cloning a borrowed (clean) name is a pointer copy; only a dirty
+            // tab's marked name is a real `String` clone (#126).
+            tabs = tabs.push(Self::tab_widget(
+                i,
+                split.names[i].clone(),
+                i == active,
+                ui,
+                t,
+            ));
         }
-        if !overflow.is_empty() {
+        if !split.overflow.is_empty() {
             // Accent "on" look while the menu is open, matching the toolbar toggles.
             tabs = tabs.push(
-                button(text(format!("\u{25be} {} more", overflow.len())).font(ui))
+                button(text(format!("\u{25be} {} more", split.overflow.len())).font(ui))
                     .style(theme::toggle(t, self.tabs_menu_open))
                     .padding([6, 10])
                     .on_press(Message::ToggleTabsMenu),
@@ -2195,16 +2230,20 @@ impl Shell {
     /// readable width and clips over-long names. Returns an empty element when
     /// nothing has overflowed, so a stale open flag (e.g. after the window was
     /// widened) renders nothing.
-    fn tabs_overflow_menu(&self, ui: iced::Font, t: theme::Tokens) -> Element<'_, Message> {
-        let (names, _visible, overflow) = self.tab_split();
-        if overflow.is_empty() {
+    fn tabs_overflow_menu<'a>(
+        &'a self,
+        ui: iced::Font,
+        t: theme::Tokens,
+        split: &TabSplit<'a>,
+    ) -> Element<'a, Message> {
+        if split.overflow.is_empty() {
             return Space::new().into();
         }
         let mut list = column![].spacing(2);
-        for &i in &overflow {
+        for &i in &split.overflow {
             list = list.push(
                 row![
-                    button(text(names[i].clone()).font(ui))
+                    button(text(split.names[i].clone()).font(ui))
                         .style(theme::ghost(t))
                         .width(Fill)
                         .on_press(Message::TabSelected(i)),
@@ -2222,7 +2261,7 @@ impl Shell {
         // per-row height estimate; the cap is what actually bounds the card.
         const ROW_H: f32 = 34.0;
         const MAX_H: f32 = 360.0;
-        let list_h = (overflow.len() as f32 * ROW_H).min(MAX_H);
+        let list_h = (split.overflow.len() as f32 * ROW_H).min(MAX_H);
         let card = container(scrollable(list).height(Length::Fixed(list_h)))
             .padding(6)
             .width(Length::Fixed(260.0))
@@ -2290,13 +2329,7 @@ impl Shell {
         const SPACING: f32 = 6.0;
         let bw = |chars: usize| chars as f32 * GLYPH_W + BTN_CHROME;
         // The pick_list sizes to its widest option, not the placeholder.
-        let picker_w = textop_options()
-            .iter()
-            .map(|s| s.chars().count())
-            .max()
-            .unwrap_or(0) as f32
-            * GLYPH_W
-            + PICKER_CHROME;
+        let picker_w = textop_widest_label() as f32 * GLYPH_W + PICKER_CHROME;
         let edit_items: Vec<(f32, Element<'_, Message>)> = vec![
             (bw(3), tb("New").on_press(Message::NewTab).into()),
             (bw(4), tb("Open").on_press(Message::Open).into()),
@@ -2387,7 +2420,10 @@ impl Shell {
             .style(theme::bar(t.toolbar_bg))
             .width(Fill);
 
-        let tabs = self.tab_strip(ui, t);
+        // The tab names and the inline/overflow split, once per frame (#126):
+        // shared by the strip, the overflow menu and its open check below.
+        let split = self.tab_split();
+        let tabs = self.tab_strip(ui, t, &split);
 
         let editor = text_editor(self.active_editor())
             .on_action(Message::Edit)
@@ -2467,14 +2503,13 @@ impl Shell {
         // corner is right below the `▾ N more` button — floating here needs no
         // absolute offset. A full-area transparent backdrop dismisses on any
         // off-menu click (toggling the flag back off), like the context menu.
-        let (_, _, overflow) = self.tab_split();
-        let editor: Element<'_, Message> = if self.tabs_menu_open && !overflow.is_empty() {
+        let editor: Element<'_, Message> = if self.tabs_menu_open && !split.overflow.is_empty() {
             stack![
                 editor,
                 mouse_area(container(text("")).width(Fill).height(Fill))
                     .on_press(Message::ToggleTabsMenu)
                     .on_right_press(Message::ToggleTabsMenu),
-                self.tabs_overflow_menu(ui, t),
+                self.tabs_overflow_menu(ui, t, &split),
             ]
             .into()
         } else {
@@ -3348,6 +3383,20 @@ fn textop_options() -> &'static [String] {
     })
 }
 
+/// The widest [`textop_options`] label, in characters — what sizes the text-ops
+/// `pick_list`, which grows to its widest option rather than its placeholder.
+/// Counted once: `view` used to re-walk every label on every frame (#126).
+fn textop_widest_label() -> usize {
+    static WIDEST: OnceLock<usize> = OnceLock::new();
+    *WIDEST.get_or_init(|| {
+        textop_options()
+            .iter()
+            .map(|s| s.chars().count())
+            .max()
+            .unwrap_or(0)
+    })
+}
+
 /// Map a line/text-ops picker label to its [`core::TextOp`]. Returns `None` for
 /// a group-header separator or any unrecognised label, so an inert row does
 /// nothing. Kept next to [`textop_options`] so the two never drift.
@@ -3902,6 +3951,49 @@ mod tests {
         let (visible, overflow) = split_tabs_for_width(&widths, 10_000.0, 40.0, 3);
         assert_eq!(visible, vec![0, 1, 2, 3, 4]);
         assert!(overflow.is_empty(), "no dropdown when the tabs all fit");
+    }
+
+    #[test]
+    fn tab_names_borrow_clean_titles_and_allocate_only_the_dirty_marker() {
+        // `tab_split` runs once per frame (#126): a clean tab's name must be the
+        // document's own title, borrowed, and only a dirty tab's "•"-marked name
+        // may allocate — pinned through the `Cow` variants.
+        let (mut shell, _) = Shell::new();
+        open_file(&mut shell, "/tmp/clean.txt", "clean");
+        let _ = shell.update(Message::NewTab);
+        let _ = shell.update(Message::Edit(paste("x")));
+        let split = shell.tab_split();
+        assert_eq!(split.names.len(), 2);
+        assert!(
+            matches!(split.names[0], Cow::Borrowed("clean.txt")),
+            "a clean tab borrows its title: {:?}",
+            split.names[0]
+        );
+        assert!(
+            matches!(&split.names[1], Cow::Owned(name) if name == "Untitled \u{2022}"),
+            "a dirty tab owns its marked name: {:?}",
+            split.names[1]
+        );
+        // Both fit the default width: all inline, nothing collapsed.
+        assert_eq!(split.visible, vec![0, 1]);
+        assert!(split.overflow.is_empty());
+    }
+
+    #[test]
+    fn the_widest_textop_label_matches_the_options() {
+        // The toolbar sizes the text-ops picker from this once-counted width
+        // (#126); it must be the real maximum over the picker's own options.
+        let expected = textop_options()
+            .iter()
+            .map(|s| s.chars().count())
+            .max()
+            .expect("the picker has options");
+        assert_eq!(textop_widest_label(), expected);
+        assert_eq!(
+            textop_widest_label(),
+            "Sort Lines A\u{2192}Z (ignore case)".chars().count(),
+            "the widest entry today"
+        );
     }
 
     #[test]

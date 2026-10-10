@@ -167,27 +167,51 @@ pub fn options() -> &'static [&'static str] {
 ///    filling with U+FFFD).
 ///
 /// Malformed sequences under the chosen encoding decode to U+FFFD.
+///
+/// Borrowing form of [`decode_owned`]: it copies the input once (the copy the
+/// returned `String` must own anyway). A caller that already holds the file's
+/// `Vec<u8>` — the shell's read path — should hand it to `decode_owned`, which
+/// turns valid UTF-8 into the `String` with no copy at all (#126).
 pub fn decode(bytes: &[u8]) -> (String, FileEncoding) {
-    if let Some((enc, bom_len)) = Encoding::for_bom(bytes) {
+    decode_owned(bytes.to_vec())
+}
+
+/// [`decode`] taking the bytes by value (#126). Same detection policy and the
+/// same text, byte for byte, but the dominant case — valid UTF-8, no BOM —
+/// is `String::from_utf8` on the buffer itself: one validation pass and **no
+/// copy**, where `decode` validated and then copied. A UTF-8 BOM is stripped
+/// with a `drain` (an in-place shift, still no second buffer). The other
+/// encodings must transcode, so they allocate the output exactly as before.
+pub fn decode_owned(bytes: Vec<u8>) -> (String, FileEncoding) {
+    if let Some((enc, bom_len)) = Encoding::for_bom(&bytes) {
+        let detected = FileEncoding { enc, bom: true };
+        if enc == UTF_8 {
+            return (utf8_lossy_owned(bytes, bom_len), detected);
+        }
         let (text, _) = enc.decode_without_bom_handling(&bytes[bom_len..]);
-        return (text.into_owned(), FileEncoding { enc, bom: true });
+        return (text.into_owned(), detected);
     }
-    if let Ok(text) = std::str::from_utf8(bytes) {
-        return (
-            text.to_owned(),
-            FileEncoding {
-                enc: UTF_8,
-                bom: false,
-            },
-        );
-    }
+    let bytes = match String::from_utf8(bytes) {
+        Ok(text) => {
+            return (
+                text,
+                FileEncoding {
+                    enc: UTF_8,
+                    bom: false,
+                },
+            );
+        }
+        // Hand the buffer back untouched for the detector; `from_utf8` moved
+        // it, it did not copy it.
+        Err(err) => err.into_bytes(),
+    };
     // We decode trusted local files, not scriptable web content, so both
     // ISO-2022-JP and UTF-8 are allowed guesses (the UTF-8 case is already
     // handled above, so `Allow` only affects mixed/edge byte streams).
     let mut detector = EncodingDetector::new(Iso2022JpDetection::Allow);
-    detector.feed(bytes, true);
+    detector.feed(&bytes, true);
     let enc = detector.guess(None, Utf8Detection::Allow);
-    let (text, _) = enc.decode_without_bom_handling(bytes);
+    let (text, _) = enc.decode_without_bom_handling(&bytes);
     (text.into_owned(), FileEncoding { enc, bom: false })
 }
 
@@ -195,13 +219,23 @@ pub fn decode(bytes: &[u8]) -> (String, FileEncoding) {
 /// specific encoding for a clean tab to fix a wrong auto-detect. A leading BOM
 /// matching `want`'s family is stripped (so U+FEFF never leaks into the buffer)
 /// and reflected in the returned `bom`; otherwise all bytes are decoded.
+///
+/// Borrowing form of [`decode_with_owned`] (one copy of the input; see
+/// [`decode`] for why the shell should prefer the owned form) (#126).
 pub fn decode_with(bytes: &[u8], want: FileEncoding) -> (String, FileEncoding) {
-    let (body, bom) = match Encoding::for_bom(bytes) {
-        Some((bom_enc, bom_len)) if bom_enc == want.enc => (&bytes[bom_len..], true),
-        _ => (bytes, false),
-    };
-    let (text, _) = want.enc.decode_without_bom_handling(body);
-    (text.into_owned(), FileEncoding { enc: want.enc, bom })
+    decode_with_owned(bytes.to_vec(), want)
+}
+
+/// [`decode_with`] taking the bytes by value (#126): identical text, but a
+/// UTF-8 target that validates is the buffer itself with no copy.
+pub fn decode_with_owned(bytes: Vec<u8>, want: FileEncoding) -> (String, FileEncoding) {
+    let (strip, bom) = matching_bom(&bytes, want);
+    let decoded = FileEncoding { enc: want.enc, bom };
+    if want.enc == UTF_8 {
+        return (utf8_lossy_owned(bytes, strip), decoded);
+    }
+    let (text, _) = want.enc.decode_without_bom_handling(&bytes[strip..]);
+    (text.into_owned(), decoded)
 }
 
 /// Strictly decode `bytes` as `want` for an explicit *reopen* ("Reopen as…").
@@ -214,26 +248,76 @@ pub fn decode_with(bytes: &[u8], want: FileEncoding) -> (String, FileEncoding) {
 /// are total — every byte maps — so a reopen under them always succeeds; the
 /// block bites UTF-8 / UTF-16 / Shift_JIS / GBK, whose multi-byte forms can be
 /// malformed.)
+///
+/// Borrowing form of [`decode_strict_owned`] (one copy of the input) (#126).
 pub fn decode_strict(bytes: &[u8], want: FileEncoding) -> Result<(String, FileEncoding), String> {
-    let (body, bom) = match Encoding::for_bom(bytes) {
-        Some((bom_enc, bom_len)) if bom_enc == want.enc => (&bytes[bom_len..], true),
-        _ => (bytes, false),
-    };
+    decode_strict_owned(bytes.to_vec(), want)
+}
+
+/// [`decode_strict`] taking the bytes by value (#126): the same accept/refuse
+/// decision and message, but a UTF-8 reopen that validates is the buffer
+/// itself with no copy. (`String::from_utf8` and the WHATWG UTF-8 decoder agree
+/// exactly on what is valid — the owned/borrowed proptest pins that.)
+pub fn decode_strict_owned(
+    bytes: Vec<u8>,
+    want: FileEncoding,
+) -> Result<(String, FileEncoding), String> {
+    let (strip, bom) = matching_bom(&bytes, want);
+    let decoded = FileEncoding { enc: want.enc, bom };
+    if want.enc == UTF_8 {
+        let mut bytes = bytes;
+        bytes.drain(..strip);
+        return match String::from_utf8(bytes) {
+            Ok(text) => Ok((text, decoded)),
+            Err(err) => Err(reopen_refused(err.as_bytes(), want)),
+        };
+    }
+    let body = &bytes[strip..];
     match want
         .enc
         .decode_without_bom_handling_and_without_replacement(body)
     {
-        Some(text) => Ok((text.into_owned(), FileEncoding { enc: want.enc, bom })),
-        None => {
-            let n = count_malformed(body, want.enc);
-            Err(format!(
-                "Cannot reopen as {}: {} byte sequence(s) not valid {}",
-                want.label(),
-                n,
-                want.label()
-            ))
+        Some(text) => Ok((text.into_owned(), decoded)),
+        None => Err(reopen_refused(body, want)),
+    }
+}
+
+/// How many leading bytes a forced decode as `want` should skip — the length of
+/// a BOM belonging to `want`'s own encoding, else `0` — and whether one was
+/// there. A foreign BOM (a UTF-16 signature ahead of a Windows-1252 reopen) is
+/// ordinary data and is **not** stripped.
+fn matching_bom(bytes: &[u8], want: FileEncoding) -> (usize, bool) {
+    match Encoding::for_bom(bytes) {
+        Some((bom_enc, bom_len)) if bom_enc == want.enc => (bom_len, true),
+        _ => (0, false),
+    }
+}
+
+/// Decode an owned UTF-8 buffer after dropping its first `skip` bytes (a BOM),
+/// zero-copy when it validates. On malformed input the buffer comes back out of
+/// the error untouched and takes the same U+FFFD-substituting WHATWG decode the
+/// borrowed path always used, so the two forms produce identical text (#126).
+fn utf8_lossy_owned(mut bytes: Vec<u8>, skip: usize) -> String {
+    bytes.drain(..skip);
+    match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(err) => {
+            let (text, _) = UTF_8.decode_without_bom_handling(err.as_bytes());
+            text.into_owned()
         }
     }
+}
+
+/// The error a blocked strict reopen reports: the encoding and how many
+/// malformed sequences a lossy decode of `body` would have had to paper over.
+fn reopen_refused(body: &[u8], want: FileEncoding) -> String {
+    let n = count_malformed(body, want.enc);
+    format!(
+        "Cannot reopen as {}: {} byte sequence(s) not valid {}",
+        want.label(),
+        n,
+        want.label()
+    )
 }
 
 /// Count the U+FFFD replacements a lossy decode of `bytes` as `enc` would emit —
@@ -320,6 +404,122 @@ mod tests {
 
     fn fe(label: &str) -> FileEncoding {
         FileEncoding::from_label(label).expect("known label")
+    }
+
+    /// The pre-#126 borrowed decoders, verbatim, as the oracle the owned
+    /// (zero-copy) forms must agree with byte for byte on arbitrary input.
+    mod reference {
+        use super::super::*;
+
+        pub fn decode(bytes: &[u8]) -> (String, FileEncoding) {
+            if let Some((enc, bom_len)) = Encoding::for_bom(bytes) {
+                let (text, _) = enc.decode_without_bom_handling(&bytes[bom_len..]);
+                return (text.into_owned(), FileEncoding { enc, bom: true });
+            }
+            if let Ok(text) = std::str::from_utf8(bytes) {
+                return (
+                    text.to_owned(),
+                    FileEncoding {
+                        enc: UTF_8,
+                        bom: false,
+                    },
+                );
+            }
+            let mut detector = EncodingDetector::new(Iso2022JpDetection::Allow);
+            detector.feed(bytes, true);
+            let enc = detector.guess(None, Utf8Detection::Allow);
+            let (text, _) = enc.decode_without_bom_handling(bytes);
+            (text.into_owned(), FileEncoding { enc, bom: false })
+        }
+
+        pub fn decode_with(bytes: &[u8], want: FileEncoding) -> (String, FileEncoding) {
+            let (body, bom) = match Encoding::for_bom(bytes) {
+                Some((bom_enc, bom_len)) if bom_enc == want.enc => (&bytes[bom_len..], true),
+                _ => (bytes, false),
+            };
+            let (text, _) = want.enc.decode_without_bom_handling(body);
+            (text.into_owned(), FileEncoding { enc: want.enc, bom })
+        }
+
+        pub fn decode_strict(
+            bytes: &[u8],
+            want: FileEncoding,
+        ) -> Result<(String, FileEncoding), String> {
+            let (body, bom) = match Encoding::for_bom(bytes) {
+                Some((bom_enc, bom_len)) if bom_enc == want.enc => (&bytes[bom_len..], true),
+                _ => (bytes, false),
+            };
+            match want
+                .enc
+                .decode_without_bom_handling_and_without_replacement(body)
+            {
+                Some(text) => Ok((text.into_owned(), FileEncoding { enc: want.enc, bom })),
+                None => {
+                    let n = count_malformed(body, want.enc);
+                    Err(format!(
+                        "Cannot reopen as {}: {} byte sequence(s) not valid {}",
+                        want.label(),
+                        n,
+                        want.label()
+                    ))
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn owned_decode_of_valid_utf8_reuses_the_buffer() {
+        // The whole point of the owned forms (#126): a valid UTF-8 file becomes
+        // the `String` *in place* — same allocation, no copy — with and without a
+        // BOM (the BOM path shifts in place, so the pointer still holds).
+        let mut bytes = Vec::with_capacity(64);
+        bytes.extend_from_slice("héllo 世界".as_bytes());
+        let (ptr, cap) = (bytes.as_ptr(), bytes.capacity());
+        let (text, enc) = decode_owned(bytes);
+        assert_eq!(text, "héllo 世界");
+        assert_eq!(enc, fe("UTF-8"));
+        assert_eq!(text.as_ptr(), ptr, "valid UTF-8 must not be copied");
+        assert_eq!(text.capacity(), cap);
+
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(b"hi");
+        let ptr = bytes.as_ptr();
+        let (text, enc) = decode_owned(bytes);
+        assert_eq!(text, "hi");
+        assert_eq!(enc, fe("UTF-8 BOM"));
+        assert_eq!(text.as_ptr(), ptr, "a BOM is stripped in place");
+
+        // The forced and strict reopen paths reuse the buffer the same way.
+        let bytes = b"plain".to_vec();
+        let ptr = bytes.as_ptr();
+        let (text, _) = decode_with_owned(bytes, fe("UTF-8"));
+        assert_eq!(text.as_ptr(), ptr);
+        let bytes = vec![0xEF, 0xBB, 0xBF, b'x'];
+        let ptr = bytes.as_ptr();
+        let (text, enc) = decode_strict_owned(bytes, fe("UTF-8 BOM")).expect("valid");
+        assert_eq!(
+            (text.as_str(), text.as_ptr(), enc),
+            ("x", ptr, fe("UTF-8 BOM"))
+        );
+    }
+
+    #[test]
+    fn owned_decode_falls_back_to_lossy_utf8_on_malformed_bytes() {
+        // Invalid UTF-8 behind a UTF-8 BOM, and a forced UTF-8 reopen of invalid
+        // bytes, both take the error branch of the zero-copy attempt and must
+        // land on exactly the WHATWG replacement decode the borrowed path uses.
+        let bytes = vec![0xEF, 0xBB, 0xBF, b'h', 0xFF, b'i'];
+        assert_eq!(decode_owned(bytes.clone()), reference::decode(&bytes));
+        assert_eq!(decode_owned(bytes.clone()).0, "h\u{FFFD}i");
+        let (text, enc) = decode_with_owned(vec![b'a', 0xC3], fe("UTF-8"));
+        assert_eq!((text.as_str(), enc), ("a\u{FFFD}", fe("UTF-8")));
+        // And the strict form refuses with the same named, counted error.
+        let err = decode_strict_owned(vec![0xFF, b'h', 0xFF], fe("UTF-8")).unwrap_err();
+        assert_eq!(
+            err,
+            reference::decode_strict(&[0xFF, b'h', 0xFF], fe("UTF-8")).unwrap_err()
+        );
+        assert!(err.contains("2 byte sequence(s)"), "{err}");
     }
 
     #[test]
@@ -597,6 +797,42 @@ mod tests {
                 let want = FileEncoding::from_label(label).unwrap();
                 let _ = decode_with(&bytes, want);
                 let _ = decode_strict(&bytes, want); // Ok or Err, never a panic
+            }
+        }
+
+        /// The owned (zero-copy) decoders and the borrowed ones agree exactly —
+        /// text, encoding and error message — with each other *and* with the
+        /// pre-#126 borrowed bodies, for arbitrary bytes under auto-detection and
+        /// under every offered encoding (forced and strict). Bytes drawn with a
+        /// bias toward BOM prefixes and high bytes so every branch is hit often.
+        #[test]
+        fn owned_and_borrowed_decoders_agree(
+            prefix in prop_oneof![
+                Just(vec![]),
+                Just(vec![0xEFu8, 0xBB, 0xBF]),
+                Just(vec![0xFFu8, 0xFE]),
+                Just(vec![0xFEu8, 0xFF]),
+            ],
+            body in proptest::collection::vec(any::<u8>(), 0..64),
+        ) {
+            let bytes: Vec<u8> = prefix.into_iter().chain(body).collect();
+            prop_assert_eq!(decode_owned(bytes.clone()), decode(&bytes));
+            prop_assert_eq!(decode_owned(bytes.clone()), reference::decode(&bytes));
+            for label in options() {
+                let want = FileEncoding::from_label(label).unwrap();
+                prop_assert_eq!(decode_with_owned(bytes.clone(), want), decode_with(&bytes, want));
+                prop_assert_eq!(
+                    decode_with_owned(bytes.clone(), want),
+                    reference::decode_with(&bytes, want)
+                );
+                prop_assert_eq!(
+                    decode_strict_owned(bytes.clone(), want),
+                    decode_strict(&bytes, want)
+                );
+                prop_assert_eq!(
+                    decode_strict_owned(bytes.clone(), want),
+                    reference::decode_strict(&bytes, want)
+                );
             }
         }
 

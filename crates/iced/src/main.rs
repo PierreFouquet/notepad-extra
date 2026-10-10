@@ -30,7 +30,7 @@ use notepad_core::{DiskMeta, DiskStatus, Effect, FindOption, TabId};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 // Vendored copy of iced 0.14's `text_editor`, extended with a visible vertical
 // scrollbar (#34) — the stock widget renders none and exposes no scroll offset.
@@ -315,16 +315,18 @@ fn on_event(
 /// [`Message::DiskEvent`] batches. A plain `fn` with no captures, as
 /// `Subscription::run_with` requires — the watched set arrives through `files`,
 /// which also keys the subscription's identity.
-// `run_with` demands `fn(&D)`, so the param must be `&Vec<_>`; and its `S` must be
-// a single type, so the returned stream is boxed rather than an `impl Stream` that
-// (under the 2024 capture rules) would borrow the `&Vec` lifetime.
-#[allow(clippy::ptr_arg)]
+// `run_with` demands `fn(&D)`; `D` is the shell's shared `Arc<[PathBuf]>` (#126),
+// which hashes by content, so the key semantics are unchanged. Its `S` must be a
+// single type, so the returned stream is boxed rather than an `impl Stream` that
+// (under the 2024 capture rules) would borrow the `&D` lifetime.
 fn watch_worker(
-    files: &Vec<PathBuf>,
+    files: &Arc<[PathBuf]>,
 ) -> std::pin::Pin<Box<dyn iced::futures::Stream<Item = Message> + Send>> {
     use iced::futures::channel::mpsc::Sender;
     use iced::futures::{SinkExt, StreamExt};
-    let files = files.clone();
+    // The watcher wants an owned list. This runs once per *change* of the
+    // watched set, not once per subscription poll, so the copy is fine.
+    let files = files.to_vec();
     Box::pin(iced::stream::channel(
         16,
         move |mut output: Sender<Message>| async move {
@@ -945,6 +947,15 @@ struct Shell {
     /// them itself. Always in step with the active editor's caret: nothing moves
     /// that caret outside `dispatch`, and `update` refreshes after `dispatch`.
     readouts: Readouts,
+    /// The sorted, de-duplicated set of files the external-change watch covers
+    /// (#51) — every titled tab's path. This *is* the identity key of
+    /// [`Shell::watch_subscription`]: when it changes (a tab opened, closed, or
+    /// saved-as), iced rebuilds the watcher over the new set, so the watch always
+    /// tracks exactly the open files and no watch outlives its tab. Refreshed by
+    /// [`Shell::apply_core`] only when the set actually changes, so the
+    /// subscription poll iced makes after every update hands over an `Arc` clone
+    /// instead of re-collecting, cloning and sorting every tab's path (#126).
+    watched: Arc<[PathBuf]>,
 }
 
 impl Shell {
@@ -1033,6 +1044,8 @@ impl Shell {
                 window_width: 1024.0,
                 tabs_menu_open: false,
                 readouts,
+                // The initial document is untitled: nothing to watch yet.
+                watched: Arc::from(Vec::new()),
             },
             Task::none(),
         )
@@ -1764,31 +1777,41 @@ impl Shell {
     /// set of watched files, so opening, closing, saving-as or renaming a tab
     /// re-keys the subscription and iced tears down the old watcher and builds a
     /// new one — which is what keeps watch handles from leaking across tab churn.
-    /// An empty set (only untitled tabs) runs no watcher at all.
+    /// An empty set (only untitled tabs) runs no watcher at all. The key is the
+    /// cached [`Shell::watched`] `Arc`: it hashes by content, so the identity
+    /// semantics are unchanged, but the per-poll cost is one reference-count bump
+    /// rather than a rebuild of the whole set (#126).
     fn watch_subscription(&self) -> Subscription<Message> {
-        let files = self.watched_files();
-        if files.is_empty() {
+        if self.watched.is_empty() {
             Subscription::none()
         } else {
-            Subscription::run_with(files, watch_worker)
+            Subscription::run_with(Arc::clone(&self.watched), watch_worker)
         }
     }
 
-    /// The sorted, de-duplicated set of files the watch covers — every titled
-    /// tab's path (#51). This *is* the subscription's identity key: when it
-    /// changes (a tab opened, closed, or saved-as), iced rebuilds the watcher over
-    /// the new set, so the watch always tracks exactly the open files and no watch
-    /// outlives its tab.
-    fn watched_files(&self) -> Vec<PathBuf> {
-        let mut files: Vec<PathBuf> = self
+    /// Bring [`Shell::watched`] up to date with the documents' paths (#51/#126):
+    /// collect every titled tab's path *by reference*, sort and de-duplicate, and
+    /// only when that differs from the current set allocate a new shared slice.
+    /// So the steady state — any message that opens, closes or renames no tab —
+    /// costs a handful of path compares and a small scratch `Vec` of references,
+    /// and the subscription key stays the very same `Arc`.
+    fn refresh_watched(&mut self) {
+        let mut paths: Vec<&Path> = self
             .core
             .docs
             .iter()
-            .filter_map(|d| d.path.clone())
+            .filter_map(|d| d.path.as_deref())
             .collect();
-        files.sort();
-        files.dedup();
-        files
+        paths.sort_unstable();
+        paths.dedup();
+        if !self
+            .watched
+            .iter()
+            .map(PathBuf::as_path)
+            .eq(paths.iter().copied())
+        {
+            self.watched = paths.into_iter().map(Path::to_path_buf).collect();
+        }
     }
 
     /// Fingerprint document `id`'s file from `bytes` already in hand (#51). `None`
@@ -1812,6 +1835,7 @@ impl Shell {
     fn apply_core(&mut self, msg: core::Message, resync: bool) -> Task<Message> {
         let effects = core::update(&mut self.core, msg);
         self.sync_editor_cache(resync);
+        self.refresh_watched();
         let tasks: Vec<Task<Message>> = effects.into_iter().map(|e| self.run_effect(e)).collect();
         Task::batch(tasks)
     }
@@ -3654,7 +3678,6 @@ mod tests {
     //! **no window and no GPU**. `view` needs a renderer so it is not driven
     //! here; `update`/`apply_core` are, which is where all the shell logic lives.
     use super::*;
-    use std::sync::Arc;
 
     fn paste(s: &str) -> text_editor::Action {
         text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new(s.to_string())))
@@ -6620,9 +6643,9 @@ mod tests {
     fn the_watch_set_tracks_open_titled_tabs() {
         let (mut shell, _) = Shell::new();
         // A fresh untitled tab has nothing to watch — no watcher runs.
-        assert!(shell.watched_files().is_empty());
+        assert!(shell.watched.is_empty());
         open_file(&mut shell, "/tmp/a.txt", "a");
-        assert_eq!(shell.watched_files(), vec![PathBuf::from("/tmp/a.txt")]);
+        assert_eq!(&shell.watched[..], [PathBuf::from("/tmp/a.txt")]);
         // A second file grows the watched set (the subscription key), so iced
         // rebuilds the watcher over both — no watch outlives its tab.
         let _ = shell.update(Message::FileRead {
@@ -6630,9 +6653,42 @@ mod tests {
             result: Ok(b"b".to_vec()),
         });
         assert_eq!(
-            shell.watched_files(),
-            vec![PathBuf::from("/tmp/a.txt"), PathBuf::from("/tmp/b.txt")]
+            &shell.watched[..],
+            [PathBuf::from("/tmp/a.txt"), PathBuf::from("/tmp/b.txt")]
         );
+    }
+
+    #[test]
+    fn the_watched_set_is_shared_until_a_tab_changes_it() {
+        // iced polls `subscription()` after every update (#126): the watch key
+        // must be the very same `Arc` while the open files don't change, and a
+        // new one — with the new contents — as soon as they do.
+        let (mut shell, _) = Shell::new();
+        open_file(&mut shell, "/tmp/a.txt", "a");
+        let before = Arc::clone(&shell.watched);
+        let _ = shell.update(Message::Edit(paste("more")));
+        let _ = shell.update(Message::NewTab); // untitled: nothing new to watch
+        assert!(
+            Arc::ptr_eq(&before, &shell.watched),
+            "an edit and an untitled tab leave the watched set untouched: no rebuild"
+        );
+        let _ = shell.update(Message::FileRead {
+            path: PathBuf::from("/tmp/b.txt"),
+            result: Ok(b"b".to_vec()),
+        });
+        assert!(
+            !Arc::ptr_eq(&before, &shell.watched),
+            "a new titled tab re-keys the watch"
+        );
+        assert_eq!(
+            &shell.watched[..],
+            [PathBuf::from("/tmp/a.txt"), PathBuf::from("/tmp/b.txt")]
+        );
+        // Closing `b.txt` (tab 2, clean, so no prompt) shrinks the set again;
+        // `a.txt` stays, edited and open.
+        let _ = shell.update(Message::TabClosed(2));
+        assert_eq!(shell.core.docs.len(), 2, "the clean tab closed");
+        assert_eq!(&shell.watched[..], [PathBuf::from("/tmp/a.txt")]);
     }
 }
 

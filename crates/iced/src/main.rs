@@ -727,11 +727,24 @@ struct PendingClose {
 }
 
 /// Above this many lines, opening a file first asks the user to confirm (#102).
-/// The vendored `text_editor`'s open cost is dominated by cosmic-text shaping
-/// *every line up front* — ~20 µs/line in a release build, so ~200k lines is
-/// ~4 s and a multi-million-line log is tens of seconds. Scrolling and editing
-/// an already-shaped buffer stay cheap; the whole cost is paid at open.
-const LARGE_FILE_LINES: usize = 200_000;
+/// The vendored `text_editor` shapes *every line of the buffer* when the content
+/// is loaded and relayouts every shaped line again on the first `update` — a
+/// cost inherent to the widget (cosmic-text's `Buffer` is whole-document, with
+/// a laid-out glyph run per line), so this gate is the shell's only lever.
+/// Measured in a release build on 60-byte lines (#126's audit): 20k lines
+/// (1.2 MB) take 0.67 s + 0.45 s and +750 MB of resident memory; 50k lines
+/// (3 MB) 1.7 s + 1.3 s and +1.9 GB; 200k lines (12 MB) 6.5 s + 4.6 s and
+/// +7.5 GB — about 56 µs and 37 KB of RSS per line. Scrolling and editing the
+/// shaped buffer stay cheap; the whole cost is paid at open and kept resident.
+/// 50k lines is where the pause reaches several seconds and the memory passes
+/// 2 GB, so that is where asking first is worth the interruption.
+const LARGE_FILE_LINES: usize = 50_000;
+/// Above this many decoded bytes in total, opening also asks first (#102,
+/// #126). The shaping cost above grows with glyphs, not just lines: a 100k-line
+/// file of 500-byte lines is 50 MB and would pass the line gate while costing
+/// several times what the 50k × 60-byte file does. 8 MiB sits between the 3 MB
+/// that trips the line gate and the 12 MB measured at 200k lines.
+const LARGE_FILE_BYTES: usize = 8 * 1024 * 1024;
 /// Above this many bytes on a single line, opening also asks first (#102). A
 /// lone enormous line shapes *fast* to open (one shaped line), but then every
 /// later edit reshapes the whole line — ~245 µs/char at 1M vs ~4 µs on a normal
@@ -765,9 +778,11 @@ struct PendingOverwrite {
 }
 
 /// Measure a freshly decoded buffer against the large-file thresholds (#102) in
-/// a single pass. Returns `Some(lines)` when opening should confirm first —
-/// either the line count crosses [`LARGE_FILE_LINES`] or the longest single line
-/// crosses [`LARGE_FILE_LINE_BYTES`] — otherwise `None` to open straight away.
+/// a single pass. Returns `Some(lines)` when opening should confirm first — the
+/// line count crosses [`LARGE_FILE_LINES`], the total size [`LARGE_FILE_BYTES`]
+/// or the longest single line [`LARGE_FILE_LINE_BYTES`] — otherwise `None` to
+/// open straight away. The line count is always measured, even when the size
+/// alone decides, because the prompt shows it.
 fn large_file_lines(content: &str) -> Option<usize> {
     let mut lines = 0usize;
     let mut longest = 0usize;
@@ -775,7 +790,36 @@ fn large_file_lines(content: &str) -> Option<usize> {
         lines += 1;
         longest = longest.max(line.len());
     }
-    (lines >= LARGE_FILE_LINES || longest >= LARGE_FILE_LINE_BYTES).then_some(lines)
+    (lines >= LARGE_FILE_LINES
+        || longest >= LARGE_FILE_LINE_BYTES
+        || content.len() >= LARGE_FILE_BYTES)
+        .then_some(lines)
+}
+
+/// The sentence the large-file bar shows (#102): which threshold the file
+/// crossed, in the user's terms, and what accepting costs. A many-line file
+/// reports its line count and size, a file that tripped on size alone its size,
+/// and a lone enormous line — which trips on byte length, not line count, so
+/// "1 lines" would mislead — is described as such. The memory warning is the
+/// measured one (#126): the largest files cost gigabytes of resident memory
+/// to shape, not just a pause.
+fn large_open_prompt(pending: &PendingLargeOpen) -> String {
+    let name = pending.path.file_name().map_or_else(
+        || pending.path.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    let bytes = pending.content.len();
+    let size = format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0));
+    let scale = if pending.lines >= LARGE_FILE_LINES {
+        format!("has {} lines ({size})", pending.lines)
+    } else if bytes >= LARGE_FILE_BYTES {
+        format!("is {size}")
+    } else {
+        "has a very long line".to_string()
+    };
+    format!(
+        "\u{201c}{name}\u{201d} {scale}. Opening it may take a while and, for the largest files, use several GB of memory."
+    )
 }
 
 /// The caret-dependent readouts [`Shell::view`] shows, computed **once per state
@@ -2898,32 +2942,23 @@ impl Shell {
 
     /// The in-app "this file is large — open anyway?" bar, shown while a big file
     /// awaits the user's answer (#102). The vendored editor shapes every line up
-    /// front, so opening a many-line (or one enormous-line) file blocks the UI
-    /// for seconds; this warns first and lets the user open it anyway or back
-    /// out. Rendered as an in-app bar rather than a native dialog for the same
-    /// reasons as [`Shell::confirm_bar`].
+    /// front, so opening a many-line, many-megabyte or one-enormous-line file
+    /// blocks the UI for seconds and holds gigabytes; this warns first and lets
+    /// the user open it anyway or back out. Rendered as an in-app bar rather
+    /// than a native dialog for the same reasons as [`Shell::confirm_bar`].
     fn large_open_confirm_bar(&self) -> Element<'_, Message> {
         let Some(pending) = &self.confirm_large_open else {
             return row![].into(); // never rendered unless set; empty as a guard
         };
         let ui = self.ui_font();
         let t = self.tokens();
-        let name = pending.path.file_name().map_or_else(
-            || pending.path.display().to_string(),
-            |n| n.to_string_lossy().into_owned(),
-        );
-        // Two triggers, two phrasings (#102): a many-line file reports its line
-        // count, while a lone enormous line (which trips on byte length, not line
-        // count — "1 lines" would mislead) is described as such.
-        let scale = if pending.lines >= LARGE_FILE_LINES {
-            format!("{} lines", pending.lines)
-        } else {
-            "a very long line".to_string()
-        };
-        let prompt = format!("\u{201c}{name}\u{201d} has {scale} and may be slow to open.");
+        let prompt = large_open_prompt(pending);
         container(
             row![
-                text(prompt).font(ui),
+                // The sentence names the threshold and the cost, so it is longer
+                // than the other bars' prompts: let it take the remaining width
+                // and wrap, rather than pushing the buttons off the window.
+                text(prompt).font(ui).width(Fill),
                 button(text("Open anyway").font(ui))
                     .style(theme::accent(t))
                     .on_press(Message::LargeOpenConfirmed),
@@ -4557,15 +4592,24 @@ mod tests {
 
     // ---- Large-file open guard wiring (#102) ----
     // The vendored editor shapes every line up front, so a huge file is slow to
-    // open; these assert the confirm-first wiring. They deliberately never let a
-    // huge buffer reach the editor — shaping ~200k lines in a debug build is ~65s
-    // (see #102) — so the *load* path is exercised through a small stashed buffer,
+    // open and holds gigabytes (#126); these assert the confirm-first wiring.
+    // They deliberately never let a huge buffer reach the editor — shaping
+    // ~200k lines in a debug build is ~65 s (see #102), 50k lines a quarter of
+    // that — so the *load* path is exercised through a small stashed buffer,
     // while the *trip* path uses a big string that is only counted, never shaped.
+
+    /// A buffer of `lines` lines, each `line_bytes` bytes including its `\n`.
+    fn lines_of(lines: usize, line_bytes: usize) -> String {
+        format!("{}\n", "a".repeat(line_bytes - 1)).repeat(lines)
+    }
 
     #[test]
     fn opening_a_many_line_file_asks_before_loading() {
         let (mut shell, _) = Shell::new();
         let big = "x\n".repeat(LARGE_FILE_LINES);
+        // Short lines, so this is the *line* gate alone: 100 KB is far under the
+        // size gate and no line comes near the long-line gate.
+        assert!(big.len() < LARGE_FILE_BYTES);
         let _ = shell.update(Message::FileRead {
             path: PathBuf::from("/tmp/huge.log"),
             result: Ok(big.into_bytes()),
@@ -4576,17 +4620,55 @@ mod tests {
             .as_ref()
             .expect("a many-line file arms the confirm bar");
         assert_eq!(pending.lines, LARGE_FILE_LINES);
+        assert_eq!(
+            large_open_prompt(pending),
+            "\u{201c}huge.log\u{201d} has 50000 lines (0.1 MB). Opening it may take a while \
+             and, for the largest files, use several GB of memory."
+        );
         assert_eq!(shell.core.docs.len(), 1);
         assert_eq!(shell.active_editor().text().trim_end(), "");
         let _ = shell.view(); // the large-file bar builds (many-line phrasing)
     }
 
     #[test]
+    fn opening_a_many_megabyte_file_asks_before_loading() {
+        // Lines well under the line gate and each far under the long-line gate,
+        // but 10 MiB in total: the *size* gate alone trips (#126 — shaping cost
+        // follows glyphs, and 200k × 60 B measured 7.5 GB of resident memory).
+        let (mut shell, _) = Shell::new();
+        let wide = lines_of(40_000, 256);
+        assert!(wide.len() >= LARGE_FILE_BYTES && wide.len() < 2 * LARGE_FILE_BYTES);
+        let _ = shell.update(Message::FileRead {
+            path: PathBuf::from("/tmp/wide.csv"),
+            result: Ok(wide.into_bytes()),
+        });
+        let pending = shell
+            .confirm_large_open
+            .as_ref()
+            .expect("a many-megabyte file arms the confirm bar");
+        assert_eq!(pending.lines, 40_000);
+        assert!(
+            pending.lines < LARGE_FILE_LINES,
+            "the line gate did not trip"
+        );
+        assert_eq!(
+            large_open_prompt(pending),
+            "\u{201c}wide.csv\u{201d} is 9.8 MB. Opening it may take a while and, for the \
+             largest files, use several GB of memory."
+        );
+        assert_eq!(shell.core.docs.len(), 1);
+        assert_eq!(shell.active_editor().text().trim_end(), "");
+        let _ = shell.view(); // the large-file bar builds (size phrasing)
+    }
+
+    #[test]
     fn opening_one_enormous_line_asks_before_loading() {
         // A lone long line is fast to *open* but slow to *edit*, so it is gated on
-        // its byte length even though the line count is only 1 (#102).
+        // its byte length even though the line count is only 1 (#102) — and
+        // 500 KB is under the size gate, so this is the long-line gate alone.
         let (mut shell, _) = Shell::new();
         let long = "a".repeat(LARGE_FILE_LINE_BYTES);
+        assert!(long.len() < LARGE_FILE_BYTES);
         let _ = shell.update(Message::FileRead {
             path: PathBuf::from("/tmp/oneline.txt"),
             result: Ok(long.into_bytes()),
@@ -4596,8 +4678,57 @@ mod tests {
             .as_ref()
             .expect("an enormous single line arms the confirm bar");
         assert_eq!(pending.lines, 1);
+        assert_eq!(
+            large_open_prompt(pending),
+            "\u{201c}oneline.txt\u{201d} has a very long line. Opening it may take a while \
+             and, for the largest files, use several GB of memory."
+        );
         assert_eq!(shell.active_editor().text().trim_end(), "");
         let _ = shell.view(); // the large-file bar builds (long-line phrasing)
+    }
+
+    #[test]
+    fn a_file_just_under_every_threshold_is_not_gated() {
+        // One line, one byte and one long-line byte short of the three gates at
+        // once — then each gate pushed over on its own, so a gate that is dropped
+        // or compared with the wrong inequality shows up as the case that stops
+        // tripping. (Measured through the gate function: actually shaping 50k
+        // lines in a debug build would take tens of seconds.)
+        let under_lines = LARGE_FILE_LINES - 1;
+        let line_bytes = (LARGE_FILE_BYTES - 1) / under_lines; // 167 → 8.35 MB total
+        let under = lines_of(under_lines, line_bytes);
+        assert!(under.len() < LARGE_FILE_BYTES);
+        assert_eq!(under.lines().count(), under_lines);
+        assert_eq!(
+            large_file_lines(&under),
+            None,
+            "just under all three: opens"
+        );
+
+        // + one line → the line gate.
+        let one_more_line = format!("{under}z\n");
+        assert!(one_more_line.len() < LARGE_FILE_BYTES);
+        assert_eq!(large_file_lines(&one_more_line), Some(LARGE_FILE_LINES));
+
+        // + the missing bytes on the last line (still a short line, same line
+        // count) → the size gate.
+        let pad = LARGE_FILE_BYTES - under.len();
+        assert!(pad + line_bytes < LARGE_FILE_LINE_BYTES);
+        let heavier = format!("{}{}\n", &under[..under.len() - 1], "b".repeat(pad));
+        assert_eq!(heavier.len(), LARGE_FILE_BYTES);
+        assert_eq!(heavier.lines().count(), under_lines);
+        assert_eq!(large_file_lines(&heavier), Some(under_lines));
+
+        // The last 3 000 short lines swapped for one line at the long-line gate:
+        // fewer lines and fewer bytes than `under`, so only that gate can trip.
+        let stretched = format!(
+            "{}{}\n",
+            &under[..under.len() - 3_000 * line_bytes],
+            "c".repeat(LARGE_FILE_LINE_BYTES)
+        );
+        assert!(stretched.len() < under.len());
+        assert_eq!(stretched.lines().count(), under_lines - 2_999);
+        assert_eq!(large_file_lines(&stretched), Some(under_lines - 2_999));
     }
 
     #[test]
@@ -4635,6 +4766,7 @@ mod tests {
             "confirming clears the bar"
         );
         assert_eq!(shell.active_editor().text().trim_end(), "loaded at last");
+        assert_eq!(shell.core.active_doc().title(), "huge.log");
     }
 
     #[test]
@@ -6857,8 +6989,8 @@ mod ui_tests {
 
     #[test]
     fn large_file_bar_cancel_button_loads_nothing() {
-        // A genuinely huge (200k-line) file arms the bar; the buffer is never
-        // shaped because the user cancels, so this stays fast while still
+        // A file right at the line gate (50k lines) arms the bar; the buffer is
+        // never shaped because the user cancels, so this stays fast while still
         // exercising the real threshold trip and the real Cancel button.
         let (mut shell, _) = Shell::new();
         let big = "x\n".repeat(LARGE_FILE_LINES);
@@ -6897,9 +7029,9 @@ mod ui_tests {
     #[test]
     fn large_file_bar_open_anyway_button_loads_the_file() {
         // A lone enormous line also trips the guard (on byte length, not line
-        // count) and — unlike 200k separate lines — shapes cheaply once loaded,
+        // count) and — unlike 50k separate lines — shapes cheaply once loaded,
         // so the real Open-anyway click can drive the whole accept-and-load path
-        // without the ~65s a 200k-line debug shape would cost.
+        // without the many seconds a 50k-line debug shape would cost.
         let (mut shell, _) = Shell::new();
         let long = "a".repeat(LARGE_FILE_LINE_BYTES);
         let _ = shell.update(Message::FileRead {

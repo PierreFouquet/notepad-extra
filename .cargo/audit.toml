@@ -1,7 +1,8 @@
 # cargo-audit configuration — the RustSec advisory gate (#129).
 #
-# CI runs `cargo audit` against the committed `Cargo.lock` (see the `audit` job in
-# .github/workflows/native-ci.yml). A *new* advisory affecting the tree fails the
+# CI runs `cargo audit` against the committed `Cargo.lock` (see
+# .github/workflows/audit.yml — its own workflow since #133, on every PR and
+# weekly). A *new* advisory affecting the tree fails the
 # build; the advisories listed below are known, assessed, and deliberately
 # accepted, each with the condition that would let us drop it again.
 #

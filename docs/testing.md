@@ -12,7 +12,7 @@ display**.
 | Layer | Where | Run it |
 | --- | --- | --- |
 | Unit tests | `#[cfg(test)]` in each `crates/core/src/*.rs` | `cargo test -p notepad-core` |
-| Property tests (`proptest`) | `app.rs` / `document.rs` `mod tests` | `cargo test -p notepad-core` |
+| Property tests (`proptest`) | per-module `mod tests` in `crates/core/src/*.rs` and `crates/syntax/src/lib.rs` | `cargo test -p notepad-core -p notepad-syntax` |
 | Adversarial / stress | `crates/core/tests/stress.rs` | `cargo test -p notepad-core --test stress` |
 | Fuzzing (`cargo-fuzz`) | `crates/core/fuzz/` | see below (nightly) |
 | Coverage gate | `scripts/coverage.sh` | `scripts/coverage.sh` |
@@ -42,8 +42,9 @@ PR gates down with it.
 ## Adversarial / stress
 
 Hundreds of open operations, million-line pastes, and rapid tab churn — asserting
-the core stays panic-free and structurally sound. Catastrophic-regex cases join
-this file once find/replace (#33) exists.
+the core stays panic-free and structurally sound, including the catastrophic-regex
+guard (`catastrophic_regex_pattern_stays_linear`: the linear-time `regex` engine is
+the guard, #63) and the #126 cost pins below.
 
 It also pins the per-frame cost the status bar depends on (#126): ten thousand
 `status()` + `dirty()` calls on a 200k-line document must finish inside a loose
@@ -58,17 +59,27 @@ plus `cargo-fuzz`:
 ```sh
 rustup toolchain install nightly
 cargo install cargo-fuzz
-cargo fuzz run --fuzz-dir crates/core/fuzz update_sequence
-cargo fuzz run --fuzz-dir crates/core/fuzz text_helpers
+for target in $(cargo fuzz list --fuzz-dir crates/core/fuzz); do   # the same loop CI runs (#98)
+  cargo fuzz run --fuzz-dir crates/core/fuzz "$target" -- -max_total_time=15
+done
 ```
 
 - `update_sequence` — arbitrary `Message` streams through `update`; asserts the
   no-panic / in-bounds / non-empty invariants.
 - `text_helpers` — EOL detection/join, `basename`, `extension_of`, language
   detection must never panic on any input.
+- `edit_diff` — for any pair of strings, `diff` yields an edit that applies and
+  inverts back, never splitting a UTF-8 char (#30; now the blockwise scans, #126).
+- `find_search` — any pattern + options + text + replacement: compiling never
+  panics, searching and replacing stay in bounds (#33).
+- `prefs_parse` — `Preferences::from_json` on arbitrary bytes never panics (#38).
+- `brackets_match` — `brackets::match_at` on any text + offset returns only valid,
+  in-bounds pairs (#41).
+- `encoding_decode` — `decode` and `decode_with` on arbitrary bytes never panic or
+  error (#50, #59, #103).
 
-The core stays dependency-free; the fuzz crate is a **detached** workspace so it
-is never pulled into `cargo test`.
+The core's few dependencies are all pure Rust; the fuzz crate is a **detached**
+workspace so it is never pulled into `cargo test`.
 
 Being detached, it carries its **own committed `Cargo.lock`** — the root one does
 not cover it. `cargo fuzz` accepts no `--locked` flag and forwards nothing to
@@ -124,7 +135,7 @@ make.
 | DoD requirement | Covered by |
 | --- | --- |
 | Unit tests on pure logic | per-module `mod tests` |
-| Property-based tests (`proptest`) | `app.rs` and `document.rs` proptests |
+| Property-based tests (`proptest`) | per-module proptests across the core and syntax crates |
 | Adversarial / stress | `tests/stress.rs` |
 | Edge & error paths | `io.rs` (bad UTF-8, missing file), `text.rs` |
 | Fuzz targets (`cargo-fuzz`) | `fuzz/fuzz_targets/*` |

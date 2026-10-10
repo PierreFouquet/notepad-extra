@@ -29,10 +29,15 @@
 //! one pass, while an edit, undo, redo or replace updates everything
 //! **incrementally** from its single-span [`Edit`] — the totals by delta, the
 //! index by splicing, and the words by recounting only the lines the edit
-//! touched. The last of these relies on a UAX #29 guarantee: `\n` always has a
-//! word boundary on both sides (rules WB3a/WB3b), so the word count of a text is
-//! the sum of its lines' word counts, and a change confined to some lines can
-//! only move the words on those lines.
+//! touched. The last of these relies on how UAX #29 treats line breaks: a word
+//! boundary falls after every `\n` and before every `\n` not preceded by `\r`
+//! (WB3a/WB3b; WB3 keeps `\r\n` as one segment), so the only segments that can
+//! contain `\n` are `\n` itself and `\r\n`, neither of which holds a word
+//! character. Cutting the text at each `\n` therefore never splits or merges a
+//! word-like segment, and segmentation restarts identically after a `\n` and at
+//! the start of text, so the word count of a text is the sum of its lines' word
+//! counts and a change confined to some lines can only move the words on those
+//! lines.
 
 use crate::app::{DiskMeta, DiskStatus, TabId};
 use crate::encoding::FileEncoding;
@@ -370,8 +375,9 @@ impl Document {
     ///   the inserted text come in, and everything after shifts by the length
     ///   delta;
     /// * words: the lines the edit spans are recounted before and after, and
-    ///   the difference applied. Correct because `\n` is always a UAX #29 word
-    ///   boundary (WB3a/WB3b), so no word straddles a line and the rest of the
+    ///   the difference applied. Correct because no UAX #29 word-like segment
+    ///   contains a `\n` (the only segments that do are `\n` and `\r\n`, see the
+    ///   module docs), so no word straddles a line and the rest of the
     ///   document's words are untouched;
     /// * dirty: re-derived (cheaply, see [`Document::refresh_dirty`]).
     ///

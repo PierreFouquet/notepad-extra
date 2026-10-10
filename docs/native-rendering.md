@@ -66,8 +66,9 @@ needed) and calls a pure core function.
 - **Caret moves from the core** — an `Effect::RevealRange { start, end }` (find,
   go-to-line, replace) is byte offsets on the same canonical text the editor
   holds; `run_effect` converts them to the widget's `(line, byte-column)` cursor
-  with `find::line_col_of`, and `Shell::status` converts back with
-  `find::offset_at`. Reuse those, don't re-derive columns.
+  with `Document::line_col_of`, and the status readout converts back with
+  `Document::offset_at` — both through the document's line index, O(log n), never
+  a scan (#126). Reuse those, don't re-derive columns.
 
 ## Damage traps (iced 0.14 + tiny-skia)
 
@@ -190,8 +191,9 @@ a lit on/off toggle (which read as if the word labelled the current mode). A
 
 ## Dialogs are in-app panels, not native windows
 
-The `rfd` `xdg-portal` backend (chosen to stay off GTK build deps) exposes
-no *message* dialog, and native modals aren't headless-testable. So the
+The `rfd` `xdg-portal` backend (chosen to stay off GTK build deps) has no
+portal *message* dialog — rfd 0.17 would spawn `zenity` for one — and native
+modals aren't headless-testable. So the
 confirm-close bar (#31), About panel (#40), find/replace bar (#33) and drag-drop
 overlay (#42) are all ordinary in-app widgets pushed into the layout — keeping
 the app fully offline and its wiring testable. Only file open/save use a real

@@ -245,7 +245,12 @@ cargo check --locked --manifest-path crates/core/fuzz/Cargo.toml   # fuzz target
 
 - **Coverage gate.** Every new line in `notepad-core` / `notepad-syntax` needs a
   test; a small file effectively needs 100 %. The shell's `view` is smoke-tested
-  (xvfb) and Simulator-tested, not coverage-gated.
+  (xvfb) and Simulator-tested, not coverage-gated. Coverage must not depend on
+  proptest luck: a line reached only by random inputs (including a test-module
+  "reference" oracle that only a proptest calls) makes the gate flaky — give it a
+  deterministic unit test. Check with `PROPTEST_CASES=1 bash scripts/coverage.sh`.
+  CI runs the newest stable Rust; coverage regions differ between compiler
+  versions, so verify with the same version when a CI number disagrees with yours.
 - **Dependencies.** Default: none. If one is unavoidable it must be pure Rust and
   licence-compatible with GPL-3.0-or-later; then regenerate the detached fuzz
   lockfile (`cargo generate-lockfile --manifest-path crates/core/fuzz/Cargo.toml`),

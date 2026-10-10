@@ -467,6 +467,61 @@ mod tests {
         }
     }
 
+    /// The reference bodies above are only *called* by the owned-vs-borrowed
+    /// proptest, whose random bytes are rarely valid UTF-8 and only sometimes
+    /// carry the BOM that matches the wanted encoding — so their plain-UTF-8 and
+    /// matching-BOM branches were covered by luck, and the per-file coverage gate
+    /// flaked in CI (99.5 % one run, 97.8 % the next on identical code). Walk
+    /// those branches deterministically, asserting the production decoders agree
+    /// with the oracle on each (#126).
+    #[test]
+    fn reference_oracles_agree_with_the_decoders_on_every_branch() {
+        // Plain UTF-8, no BOM: the oracle's `from_utf8` success return.
+        let plain = b"plain ascii, valid utf-8".to_vec();
+        assert_eq!(reference::decode(&plain), decode(&plain));
+        assert_eq!(reference::decode(&plain), decode_owned(plain.clone()));
+        assert_eq!(reference::decode(&plain).1, FileEncoding::default());
+
+        // A BOM that *matches* the wanted encoding: the oracle's strip arm, in
+        // both the forced and the strict decoder, for UTF-8 and for UTF-16.
+        let utf8_bom = [0xEFu8, 0xBB, 0xBF, b'h', b'i'];
+        assert_eq!(
+            reference::decode_with(&utf8_bom, fe("UTF-8")),
+            decode_with(&utf8_bom, fe("UTF-8"))
+        );
+        assert_eq!(reference::decode_with(&utf8_bom, fe("UTF-8")).1.bom, true);
+        assert_eq!(
+            reference::decode_strict(&utf8_bom, fe("UTF-8")),
+            decode_strict(&utf8_bom, fe("UTF-8"))
+        );
+        let utf16 = encode_for_save("hi", fe("UTF-16 LE")).unwrap();
+        assert_eq!(
+            reference::decode_with(&utf16, fe("UTF-16 LE")),
+            decode_with(&utf16, fe("UTF-16 LE"))
+        );
+        assert_eq!(
+            reference::decode_strict(&utf16, fe("UTF-16 LE")),
+            decode_strict(&utf16, fe("UTF-16 LE"))
+        );
+        assert_eq!(
+            reference::decode_strict(&utf16, fe("UTF-16 LE")).unwrap().0,
+            "hi"
+        );
+
+        // A BOM that does *not* match, and a strict refusal: the other arms.
+        let foreign = [0xFFu8, 0xFE, b'h'];
+        assert_eq!(
+            reference::decode_with(&foreign, fe("Windows-1252")),
+            decode_with(&foreign, fe("Windows-1252"))
+        );
+        let bad = [b'h', 0xFFu8];
+        assert_eq!(
+            reference::decode_strict(&bad, fe("UTF-8")),
+            decode_strict(&bad, fe("UTF-8"))
+        );
+        assert!(reference::decode_strict(&bad, fe("UTF-8")).is_err());
+    }
+
     #[test]
     fn owned_decode_of_valid_utf8_reuses_the_buffer() {
         // The whole point of the owned forms (#126): a valid UTF-8 file becomes

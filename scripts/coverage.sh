@@ -39,11 +39,18 @@ LOCKED=(--locked)
 #    what is already in the target directory rather than replacing it, so a
 #    second run in the same target directory would report the union of both: a
 #    `PROPTEST_CASES=1` check straight after a full run would pass on lines only
-#    the full run reached. `--workspace` rather than the narrower
-#    `--profraw-only`: CI's install-action resolves an older cargo-llvm-cov
-#    (0.5.x) that lacks the latter. It also drops the instrumented workspace
-#    crates, so core and syntax are rebuilt each run; their dependencies are kept.
-cargo llvm-cov clean --workspace
+#    the full run reached. `--profraw-only` removes just that data. The older
+#    cargo-llvm-cov that CI's install-action resolves (0.5.x) lacks the flag,
+#    so fall back to `--workspace` there: it removes the same data but also the
+#    instrumented core and syntax builds, which then rebuild. The help text is
+#    captured first and not piped to `grep -q`: an early exit would raise
+#    SIGPIPE, and with `pipefail` that reads as "flag missing".
+clean_help="$(cargo llvm-cov clean --help)"
+if [[ "$clean_help" == *--profraw-only* ]]; then
+    cargo llvm-cov clean --profraw-only "${LOCKED[@]}"
+else
+    cargo llvm-cov clean --workspace "${LOCKED[@]}"
+fi
 
 # 1. Run both suites once under instrumentation, keeping the raw profile data so
 #    the reports below don't re-run the tests.

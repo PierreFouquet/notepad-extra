@@ -809,6 +809,74 @@ enum Resync {
     Doc(TabId),
 }
 
+/// The (line, byte column) just past `text` when it starts at `start`, in the
+/// `\n`-line terms the core and the buffer share for text with no `\r`.
+fn end_of(start: Position, text: &str) -> Position {
+    match text.rfind('\n') {
+        None => Position {
+            line: start.line,
+            column: start.column + text.len(),
+        },
+        Some(last) => Position {
+            line: start.line + text.matches('\n').count(),
+            column: text.len() - last - 1,
+        },
+    }
+}
+
+/// Replace `edit.removed` at `start` in the buffer with `edit.inserted`, then
+/// put the user's caret and selection back where they were relative to the
+/// text around them (#137). The core's [`Effect::RevealRange`] that follows
+/// undo, redo and replace-next then moves the caret on purpose; replace-all
+/// and whole-document text operations send none, so an edit elsewhere leaves
+/// the caret where the user had it. The editor scrolls only to keep a moved
+/// caret in view, so a caret that was on screen keeps the view still too.
+///
+/// `start` is in the coordinates of the text before the edit, which is what
+/// the buffer holds. It is the same before and after, since nothing before
+/// `edit.at` changes. The removed span's end follows from the removed text
+/// itself, in O(edit), with no scan of the document.
+fn splice_buffer(content: &mut text_editor::Content, start: (usize, usize), edit: core::Edit) {
+    let start = Position {
+        line: start.0,
+        column: start.1,
+    };
+    let removed_end = end_of(start, &edit.removed);
+    let inserted_end = end_of(start, &edit.inserted);
+    let before = content.cursor();
+    content.move_to(Cursor {
+        position: removed_end,
+        selection: (removed_end != start).then_some(start),
+    });
+    content.perform(text_editor::Action::Edit(if edit.inserted.is_empty() {
+        text_editor::Edit::Delete
+    } else {
+        text_editor::Edit::Paste(Arc::new(edit.inserted))
+    }));
+    let key = |p: Position| (p.line, p.column);
+    let shift = |p: Position| {
+        if key(p) <= key(start) {
+            p // at or before the edit, including exactly at its start
+        } else if key(p) < key(removed_end) {
+            inserted_end // the caret was inside the replaced text
+        } else if p.line == removed_end.line {
+            Position {
+                line: inserted_end.line,
+                column: inserted_end.column + (p.column - removed_end.column),
+            }
+        } else {
+            Position {
+                line: p.line - removed_end.line + inserted_end.line,
+                column: p.column,
+            }
+        }
+    };
+    content.move_to(Cursor {
+        position: shift(before.position),
+        selection: before.selection.map(shift),
+    });
+}
+
 /// A document whose Save is waiting on the stale-save overwrite prompt (#51): the
 /// file changed on disk since we loaded/saved it, so the core raised
 /// [`Effect::ConfirmOverwrite`] rather than clobbering the newer copy. Rendered as
@@ -1316,11 +1384,12 @@ impl Shell {
                 self.confirm_overwrite = None;
                 self.apply_core(core::Message::SaveAsRequested, Resync::No)
             }
-            // Undo/redo rewrite the buffer in the core, so resync the editor from
-            // it. Reached from the toolbar and the Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y
-            // accelerators (#39).
-            Message::Undo => self.apply_core(core::Message::Undo, Resync::Active),
-            Message::Redo => self.apply_core(core::Message::Redo, Resync::Active),
+            // Undo/redo rewrite the text in the core, which hands back the exact
+            // edit (`Effect::ApplyEdit`) for the shell to apply to the buffer in
+            // place (#137). Reached from the toolbar and the Ctrl+Z /
+            // Ctrl+Shift+Z / Ctrl+Y accelerators (#39).
+            Message::Undo => self.apply_core(core::Message::Undo, Resync::No),
+            Message::Redo => self.apply_core(core::Message::Redo, Resync::No),
             // resync=false: the per-tab cache already holds this tab's buffer, so
             // selecting it shows that tab's own caret and scroll instead of
             // rebuilding at the top — the crux of #94. (A first-ever selection of
@@ -1802,10 +1871,10 @@ impl Shell {
             }
             Message::FindNext => self.apply_core(core::Message::FindNext, Resync::No),
             Message::FindPrev => self.apply_core(core::Message::FindPrev, Resync::No),
-            // Replaces rewrite the buffer, so resync the editor before the core's
-            // RevealRange selects the result.
-            Message::ReplaceOne => self.apply_core(core::Message::ReplaceNext, Resync::Active),
-            Message::ReplaceAll => self.apply_core(core::Message::ReplaceAll, Resync::Active),
+            // Replaces rewrite the text in the core; its `ApplyEdit` updates the
+            // buffer in place before its `RevealRange` selects the result (#137).
+            Message::ReplaceOne => self.apply_core(core::Message::ReplaceNext, Resync::No),
+            Message::ReplaceAll => self.apply_core(core::Message::ReplaceAll, Resync::No),
             Message::ToggleOption(option) => {
                 self.apply_core(core::Message::FindOptionToggled(option), Resync::No)
             }
@@ -1854,15 +1923,16 @@ impl Shell {
 
             // Line & text operations (#54): map the picked label to a `TextOp`
             // (a header / unknown label is inert), read the editor's live
-            // selection, and dispatch. It rewrites the buffer, so resync=true;
-            // the core re-selects the transformed span for a real selection.
+            // selection, and dispatch. The core's `ApplyEdit` rewrites the buffer
+            // in place (#137) and re-selects the transformed span for a real
+            // selection.
             Message::SelectTextOp(label) => match textop_from_label(&label) {
                 Some(op) => self.apply_core(
                     core::Message::TextOperation {
                         op,
                         selection: self.selection_range(),
                     },
-                    Resync::Active,
+                    Resync::No,
                 ),
                 None => Task::none(),
             },
@@ -2098,6 +2168,33 @@ impl Shell {
         }
     }
 
+    /// Apply a rewrite the core made to document `id` (undo, redo, replace, a
+    /// text operation) to that tab's editor buffer in place (#137). Rebuilding
+    /// the buffer from the whole text made cosmic-text reshape every line,
+    /// about 1.1 s per Ctrl+Z at 20k lines, and threw away the scroll position;
+    /// an in-place edit reshapes only the lines it touches.
+    ///
+    /// The one exception is text holding a `\r`. cosmic-text ends a buffer line
+    /// at a lone `\r` and takes `\r\n` and `\n\r` as one ending each, while the
+    /// core's line index breaks at `\n` alone and counts a `\r` as a column, so
+    /// the two disagree on positions after it and an in-place edit would land
+    /// in the wrong place. Such text (CR-only files, pasted CRs) is rebuilt as
+    /// before. The check is one memchr over the document plus the removed text,
+    /// which is what the buffer still holds where the edit was.
+    fn apply_edit_to_buffer(&mut self, id: TabId, edit: core::Edit) {
+        let Some(doc) = self.core.docs.iter().find(|d| d.id == id) else {
+            return;
+        };
+        let Some(content) = self.editors.get_mut(&id) else {
+            return;
+        };
+        if doc.content().contains('\r') || edit.removed.contains('\r') {
+            *content = text_editor::Content::with_text(doc.content());
+            return;
+        }
+        splice_buffer(content, doc.line_col_of(edit.at), edit);
+    }
+
     /// Open the find bar, seeding the query from a single-line selection (#97
     /// item 1): a selection with no newline
     /// prefills the field, while a multi-line or empty selection opens it as-is.
@@ -2193,6 +2290,10 @@ impl Shell {
                         result,
                     },
                 )
+            }
+            Effect::ApplyEdit { id, edit } => {
+                self.apply_edit_to_buffer(id, edit);
+                Task::none()
             }
             // Turn a byte range into an editor selection (or a bare caret when
             // empty, e.g. go-to-line). The core hands us offsets on the same
@@ -5642,6 +5743,302 @@ mod tests {
         });
         assert_eq!(shell.core.active_doc().content(), "a—b");
         assert_eq!(shell.status().encoding, "Windows-1252");
+    }
+
+    // ---- Core rewrites applied to the buffer in place (#137) ----
+
+    /// A buffer holding `text` with the caret at `caret` and, if given, the
+    /// selection anchored at `anchor`.
+    fn buffer_at(
+        text: &str,
+        caret: (usize, usize),
+        anchor: Option<(usize, usize)>,
+    ) -> text_editor::Content {
+        let mut content = text_editor::Content::with_text(text);
+        let pos = |(line, column)| Position { line, column };
+        content.move_to(Cursor {
+            position: pos(caret),
+            selection: anchor.map(pos),
+        });
+        content
+    }
+
+    fn caret_of(content: &text_editor::Content) -> ((usize, usize), Option<(usize, usize)>) {
+        let c = content.cursor();
+        (
+            (c.position.line, c.position.column),
+            c.selection.map(|p| (p.line, p.column)),
+        )
+    }
+
+    fn core_edit(at: usize, removed: &str, inserted: &str) -> core::Edit {
+        core::Edit {
+            at,
+            removed: removed.to_string(),
+            inserted: inserted.to_string(),
+        }
+    }
+
+    #[test]
+    fn splicing_an_edit_rewrites_exactly_its_span() {
+        // Replace across lines, delete across lines, insert lines: the buffer
+        // ends up holding exactly what the core's text does.
+        let cases = [
+            ("abc\ndef\nghi", core_edit(1, "bc\nd", "X")),
+            ("abc\ndef\nghi", core_edit(2, "c\ndef\ng", "")),
+            ("abc\ndef", core_edit(3, "", "\nnew\nlines")),
+            ("abc", core_edit(0, "abc", "x\ny")),
+            ("", core_edit(0, "", "fresh")),
+            ("tab\tsé\nש", core_edit(4, "sé", "SÉ")),
+        ];
+        for (text, edit) in cases {
+            let mut expected = text.to_string();
+            edit.apply(&mut expected);
+            let mut content = text_editor::Content::with_text(text);
+            let start = core::find::line_col_of(&expected, edit.at);
+            splice_buffer(&mut content, start, edit.clone());
+            assert_eq!(content.text(), expected, "{edit:?} on {text:?}");
+        }
+    }
+
+    #[test]
+    fn splicing_an_edit_keeps_the_caret_where_it_was_relative_to_the_text() {
+        // An edit elsewhere must not move the user's caret or selection
+        // through the text: replace-all and whole-document text operations
+        // send no reveal, so this is where their caret (and view) ends up.
+        let text = "abc\ndef\nghi";
+        let edit = || core_edit(1, "bc\nd", "XY"); // "aXYef\nghi"
+        let check = |caret, anchor, want: ((usize, usize), Option<(usize, usize)>)| {
+            let mut content = buffer_at(text, caret, anchor);
+            splice_buffer(&mut content, (0, 1), edit());
+            assert_eq!(
+                caret_of(&content),
+                want,
+                "caret {caret:?} anchor {anchor:?}"
+            );
+        };
+        // Before the edit: untouched.
+        check((0, 0), None, ((0, 0), None));
+        check((0, 1), None, ((0, 1), None)); // exactly at its start
+        // Inside the replaced text: lands at the end of the inserted text.
+        check((0, 2), None, ((0, 3), None));
+        check((1, 0), None, ((0, 3), None));
+        // At or after its end on the same line: shifted by the line change.
+        check((1, 1), None, ((0, 3), None)); // exactly at its end
+        check((1, 3), None, ((0, 5), None));
+        // On a later line: only the line number moves.
+        check((2, 2), None, ((1, 2), None));
+        // A selection maps both ends.
+        check((2, 3), Some((0, 0)), ((1, 3), Some((0, 0))));
+    }
+
+    #[test]
+    fn a_rewrite_of_text_with_a_cr_rebuilds_the_buffer_from_the_core() {
+        // cosmic-text ends buffer lines at a lone `\r` and takes `\r\n` as one
+        // ending; the core's line index breaks at `\n` alone and counts the `\r`
+        // as a column. An in-place edit would land on the wrong line (a lone
+        // CR, from a CR-only file) or past the end of one (`\r\n`, pasted in),
+        // so the shell rebuilds instead and the buffer still matches the core.
+        for (text, query, replacement, replaced) in [
+            ("one\rtwo\nthree", "three", "3", "one\rtwo\n3"),
+            ("one\r\ntwo", "\n", " ", "one\r two"),
+            // The document is CR-free after this one, but the buffer is not.
+            ("one\r\ntwo", "\r", "", "one\ntwo"),
+        ] {
+            let (mut shell, _) = Shell::new();
+            let _ = shell.update(Message::Edit(paste(text)));
+            let _ = shell.update(Message::FindQueryChanged(query.into()));
+            let _ = shell.update(Message::ReplaceQueryChanged(replacement.into()));
+            let _ = shell.update(Message::ReplaceAll);
+            assert_eq!(shell.core.active_doc().content(), replaced);
+            assert_eq!(shell.active_editor().text(), replaced);
+            let _ = shell.update(Message::Undo);
+            assert_eq!(shell.core.active_doc().content(), text);
+            assert_eq!(shell.active_editor().text(), text);
+        }
+    }
+
+    #[test]
+    fn a_redo_after_a_reveal_inserts_without_eating_the_revealed_selection() {
+        // Found by `buffer_sync` (#137). Replace-next reveals the replacement
+        // as a selection. The redo after it is a pure insertion, spliced in by
+        // moving a bare caret to the edit and pasting, but the editor's
+        // `move_to` kept the selection's anchor, so the paste replaced the
+        // selected "\n" too: the buffer said " " while the core said "\n ".
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::Edit(paste("\n")));
+        let _ = shell.update(Message::Edit(paste(" ")));
+        let _ = shell.update(Message::Undo);
+        let _ = shell.update(Message::FindQueryChanged("\n".into()));
+        let _ = shell.update(Message::ReplaceQueryChanged("\n".into()));
+        let _ = shell.update(Message::ReplaceOne);
+        let _ = shell.update(Message::Redo);
+        assert_eq!(shell.core.active_doc().content(), "\n ");
+        assert_eq!(shell.active_editor().text(), "\n ");
+    }
+
+    #[test]
+    fn go_to_line_over_a_selection_leaves_a_bare_caret() {
+        // A caret-only reveal (#137): the old anchor used to survive, so
+        // go-to-line turned the selection into one running to the new line,
+        // and the next keystroke replaced all of it.
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::Edit(paste("abc\ndef\nghi")));
+        let _ = shell.update(Message::Edit(text_editor::Action::Move(
+            text_editor::Motion::DocumentStart,
+        )));
+        let _ = shell.update(Message::Edit(text_editor::Action::Select(
+            text_editor::Motion::Right,
+        )));
+        assert_eq!(shell.active_editor().selection().as_deref(), Some("a"));
+        let _ = shell.update(Message::GoToInputChanged("3".into()));
+        let _ = shell.update(Message::GoToSubmit);
+        assert_eq!(caret_of(shell.active_editor()), ((2, 0), None));
+        let _ = shell.update(Message::Edit(paste("X")));
+        assert_eq!(shell.active_editor().text(), "abc\ndef\nXghi");
+        assert_eq!(shell.core.active_doc().content(), "abc\ndef\nXghi");
+    }
+
+    #[test]
+    fn undo_redo_on_a_large_document_does_not_rebuild_the_buffer() {
+        // Cost pin (#137). Rebuilding the buffer made cosmic-text reshape every
+        // line on each undo: about 1.1 s per Ctrl+Z at 20k lines in a release
+        // build, and about 1.1 s per step at 10k lines in this debug one, where
+        // the 200 steps below took 218 s rebuilding and take about 1.3 s
+        // spliced in place. The bound sits an order of magnitude from both.
+        let text: String = (0..10_000).map(|i| format!("line number {i}\n")).collect();
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::FileRead {
+            path: PathBuf::from("/tmp/ten-thousand.txt"),
+            result: Ok(text.into_bytes()),
+        });
+        let _ = shell.update(Message::Edit(paste("edited ")));
+        let started = std::time::Instant::now();
+        for _ in 0..100 {
+            let _ = shell.update(Message::Undo);
+            let _ = shell.update(Message::Redo);
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(20),
+            "100 undo/redo round trips took {elapsed:?}"
+        );
+        assert_eq!(
+            shell.active_editor().text(),
+            shell.core.active_doc().content()
+        );
+    }
+
+    mod buffer_sync {
+        //! Invalidation pin for the in-place buffer edits (#137): after any
+        //! sequence of typing, caret moves, undo / redo, replaces and text
+        //! operations, the editor buffer holds exactly the document's text.
+        use super::*;
+        use proptest::prelude::*;
+
+        #[derive(Debug, Clone)]
+        enum Op {
+            Type(String),
+            Move(text_editor::Motion),
+            Select(text_editor::Motion),
+            Backspace,
+            Undo,
+            Redo,
+            ReplaceAll(String, String),
+            ReplaceOne(String, String),
+            Transform(&'static str),
+        }
+
+        fn motion() -> impl Strategy<Value = text_editor::Motion> {
+            use text_editor::Motion::*;
+            prop_oneof![
+                Just(Left),
+                Just(Right),
+                Just(Up),
+                Just(Down),
+                Just(WordLeft),
+                Just(WordRight),
+                Just(Home),
+                Just(End),
+                Just(DocumentStart),
+                Just(DocumentEnd),
+            ]
+        }
+
+        fn op() -> impl Strategy<Value = Op> {
+            // Mostly ASCII, newlines and tabs, and some multi-byte and
+            // right-to-left characters. No `\r`: the core counts lines at `\n`
+            // alone while the editor also breaks them at `\r`, so a reveal (find,
+            // undo, a text operation on a selection) past one puts the caret off
+            // the editor's line, and the next edit panics inside cosmic-text. That
+            // is an older bug in the reveal, not in these edits; the rebuild that
+            // text with a `\r` takes has its own test above.
+            let text = "[ab \n\t]{0,6}|[aé ש\n]{0,4}";
+            let query = "[ab]{1,2}|\n";
+            prop_oneof![
+                text.prop_map(Op::Type),
+                motion().prop_map(Op::Move),
+                motion().prop_map(Op::Select),
+                Just(Op::Backspace),
+                Just(Op::Undo),
+                Just(Op::Redo),
+                (query, text).prop_map(|(q, r)| Op::ReplaceAll(q, r)),
+                (query, text).prop_map(|(q, r)| Op::ReplaceOne(q, r)),
+                prop_oneof![
+                    Just("Sort Lines A→Z"),
+                    Just("Reverse Lines"),
+                    Just("Remove Duplicate Lines"),
+                    Just("Remove Blank Lines"),
+                    Just("UPPERCASE"),
+                    Just("Trim Trailing Whitespace"),
+                ]
+                .prop_map(Op::Transform),
+            ]
+        }
+
+        fn run(shell: &mut Shell, op: Op) {
+            let messages = match op {
+                Op::Type(s) => vec![Message::Edit(paste(&s))],
+                Op::Move(m) => vec![Message::Edit(text_editor::Action::Move(m))],
+                Op::Select(m) => vec![Message::Edit(text_editor::Action::Select(m))],
+                Op::Backspace => vec![Message::Edit(text_editor::Action::Edit(
+                    text_editor::Edit::Backspace,
+                ))],
+                Op::Undo => vec![Message::Undo],
+                Op::Redo => vec![Message::Redo],
+                Op::ReplaceAll(q, r) => vec![
+                    Message::FindQueryChanged(q),
+                    Message::ReplaceQueryChanged(r),
+                    Message::ReplaceAll,
+                ],
+                Op::ReplaceOne(q, r) => vec![
+                    Message::FindQueryChanged(q),
+                    Message::ReplaceQueryChanged(r),
+                    Message::ReplaceOne,
+                ],
+                Op::Transform(label) => vec![Message::SelectTextOp(label.to_string())],
+            };
+            for message in messages {
+                let _ = shell.update(message);
+            }
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(64))]
+            #[test]
+            fn the_buffer_always_holds_the_documents_text(ops in prop::collection::vec(op(), 1..24)) {
+                let (mut shell, _) = Shell::new();
+                for op in ops {
+                    let shown = format!("{op:?}");
+                    run(&mut shell, op);
+                    prop_assert_eq!(
+                        shell.active_editor().text(),
+                        shell.core.active_doc().content(),
+                        "after {}", shown
+                    );
+                }
+            }
+        }
     }
 
     /// A reload or reopen result for tab `id`, as both async paths deliver it.

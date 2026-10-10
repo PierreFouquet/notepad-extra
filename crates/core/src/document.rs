@@ -343,9 +343,29 @@ impl Document {
         let Some(edit) = crate::history::diff(&self.content, &new_content) else {
             return false;
         };
+        self.record(edit, new_content);
+        true
+    }
+
+    /// [`Document::commit`] for a rewrite the core makes itself (replace-next,
+    /// replace-all, the text operations), returning a copy of the applied
+    /// [`Edit`]. The shell applies that same span to the editor buffer it
+    /// already has instead of rebuilding the buffer from the whole text, which
+    /// made cosmic-text reshape every line (#137). The copy is O(edit). A
+    /// keystroke goes through `commit`: its text came from the editor, so the
+    /// buffer needs nothing.
+    pub(crate) fn commit_rewrite(&mut self, new_content: String) -> Option<Edit> {
+        let edit = crate::history::diff(&self.content, &new_content)?;
+        let applied = edit.clone();
+        self.record(edit, new_content);
+        Some(applied)
+    }
+
+    /// Adopt `new_content`, which `edit` turns the current text into, and
+    /// record the step in the history.
+    fn record(&mut self, edit: Edit, new_content: String) {
         self.splice(&edit, |content| *content = new_content);
         self.history.record(edit);
-        true
     }
 
     /// Undo the most recent step, applying it to the buffer and returning the

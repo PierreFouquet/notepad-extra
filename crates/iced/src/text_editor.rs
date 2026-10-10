@@ -702,6 +702,16 @@ where
     pub fn move_to(&mut self, cursor: Cursor) {
         let internal = self.0.get_mut();
 
+        // NOTEPAD-EXTRA(#137): a cursor with no selection is a bare caret.
+        // Upstream only moves the caret then, keeping any selection's anchor, so
+        // the old anchor and the new caret made a selection nobody asked for,
+        // and the next paste overwrote it. The editor has no call to drop a
+        // selection, but a horizontal move with one only collapses it (to its
+        // start, which the `move_to` below then overrides).
+        if cursor.selection.is_none() && internal.editor.cursor().selection.is_some() {
+            internal.editor.perform(Action::Move(Motion::Left));
+        }
+
         internal.editor.move_to(cursor);
     }
 
@@ -2469,9 +2479,10 @@ mod tests {
             SOURCE.lines().filter_map(marker_issue).collect();
         // The divergences catalogued in VENDORED.md: the compiled-out upstream
         // methods (#25), find-match highlighting while unfocused (#33), scrollbar
-        // (#34), editor niceties (#41), the geometry extraction (#79) and the
-        // large-document performance work (#126).
-        for expected in [25u32, 33, 34, 41, 79, 126] {
+        // (#34), editor niceties (#41), the geometry extraction (#79), the
+        // large-document performance work (#126) and the caret-only `move_to`
+        // (#137).
+        for expected in [25u32, 33, 34, 41, 79, 126, 137] {
             assert!(
                 issues.contains(&expected),
                 "no NOTEPAD-EXTRA(#{expected}) marker remains — a documented divergence lost its tag",
@@ -2577,6 +2588,57 @@ mod tests {
             elapsed < Duration::from_secs(2),
             "text() on 8k lines took {elapsed:?}; it should be a single cheap pass"
         );
+    }
+
+    /// Replace, undo and redo keep the view where it was (#137). Rebuilding the
+    /// buffer reset the scroll to the top; the reveal that follows undo / redo
+    /// then scrolled just far enough to show the edit at the bottom edge, and
+    /// replace-all, which reveals nothing, left the view at line 0. Spliced in
+    /// place, an edit on a visible line moves nothing.
+    #[test]
+    fn rewrites_in_place_keep_the_scroll_position() {
+        use crate::{Message, Shell};
+        let text: String = (0..2_000).map(|i| format!("line {i}\n")).collect();
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::FileRead {
+            path: std::path::PathBuf::from("/tmp/scroll.txt"),
+            result: Ok(text.into_bytes()),
+        });
+        let id = shell.core.active_doc().id;
+        // One frame's layout: the editor scrolls to keep a moved caret visible.
+        let frame = |shell: &mut Shell| {
+            let editor = &mut shell.editors.get_mut(&id).unwrap().0.get_mut().editor;
+            editor.update(
+                Size::new(400.0, 200.0),
+                iced_core::Font::default(),
+                Pixels(14.0),
+                LineHeight::default(),
+                Wrapping::None,
+                &mut highlighter::PlainText,
+            );
+            editor.scroll_top()
+        };
+        frame(&mut shell);
+        let caret = Position {
+            line: 1_000,
+            column: 0,
+        };
+        shell.editors.get_mut(&id).unwrap().move_to(Cursor {
+            position: caret,
+            selection: None,
+        });
+        let scrolled = frame(&mut shell);
+        assert!(scrolled > 0.0, "the caret at line 1000 scrolled the view");
+
+        // "line 995" is on screen, five lines above the caret.
+        let _ = shell.update(Message::FindQueryChanged("line 995\n".into()));
+        let _ = shell.update(Message::ReplaceQueryChanged("LINE 995\n".into()));
+        for step in [Message::ReplaceAll, Message::Undo, Message::Redo] {
+            let shown = format!("{step:?}");
+            let _ = shell.update(step);
+            assert_eq!(frame(&mut shell), scrolled, "the view moved after {shown}");
+        }
+        assert_eq!(shell.editors[&id].text(), shell.core.active_doc().content());
     }
 
     // --- Scrollbar inputs (#126) ---
@@ -2801,6 +2863,58 @@ mod tests {
             // `Clone` is implemented through `text()`, so it must round-trip too.
             assert_eq!(content.clone().text(), input, "clone of {input:?}");
         }
+    }
+
+    /// `move_to` with no selection leaves a bare caret, whatever was selected
+    /// before (#137): a selection made with the keyboard, the mouse or an
+    /// earlier `move_to`. The editing check matters most: upstream kept the old
+    /// anchor, so a paste at the new caret replaced the text between the two.
+    #[test]
+    fn move_to_without_a_selection_drops_the_old_one() {
+        let at = |line, column| Position { line, column };
+        let caret = |content: &Content<iced::Renderer>| {
+            let c = content.cursor();
+            (c.position, c.selection)
+        };
+        type Select = fn(&mut Content<iced::Renderer>);
+        let selections: [(&str, Select); 3] = [
+            ("move_to", |c| {
+                c.move_to(Cursor {
+                    position: Position { line: 0, column: 4 },
+                    selection: Some(Position { line: 0, column: 1 }),
+                });
+            }),
+            ("keyboard", |c| c.perform(Action::Select(Motion::Right))),
+            ("select all", |c| c.perform(Action::SelectAll)),
+        ];
+        for (how, select) in selections {
+            let mut content = Content::<iced::Renderer>::with_text("abcdef\nghi");
+            select(&mut content);
+            assert!(
+                content.cursor().selection.is_some(),
+                "{how}: set up a selection"
+            );
+            content.move_to(Cursor {
+                position: at(1, 2),
+                selection: None,
+            });
+            assert_eq!(caret(&content), (at(1, 2), None), "{how}: a bare caret");
+            assert_eq!(content.selection(), None, "{how}: nothing selected");
+            content.perform(Action::Edit(Edit::Paste(Arc::new("X".to_owned()))));
+            assert_eq!(
+                content.text(),
+                "abcdef\nghXi",
+                "{how}: the paste only inserts"
+            );
+        }
+        // A cursor that carries a selection still sets it.
+        let mut content = Content::<iced::Renderer>::with_text("abcdef");
+        content.move_to(Cursor {
+            position: at(0, 3),
+            selection: Some(at(0, 1)),
+        });
+        assert_eq!(caret(&content), (at(0, 3), Some(at(0, 1))));
+        assert_eq!(content.selection().as_deref(), Some("bc"));
     }
 
     /// The fast `text()` agrees with upstream's formulation — join `lines()` with

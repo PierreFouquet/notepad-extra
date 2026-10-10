@@ -633,6 +633,18 @@ pub enum Effect {
     /// into view. `start == end` is a bare caret (go-to-line); otherwise it
     /// highlights a find match or a freshly inserted replacement.
     RevealRange { start: usize, end: usize },
+    /// The core rewrote document `id`'s text by exactly `edit` (undo, redo,
+    /// replace-next, replace-all, a text operation): apply the same span to
+    /// that document's editor buffer (#137). Rebuilding the buffer from the
+    /// whole text instead made cosmic-text reshape every line (about 1.1 s per
+    /// Ctrl+Z at 20k lines) and threw away the scroll position. `edit.at` is a
+    /// byte offset into the text *before* the edit, which is what the buffer
+    /// still holds. It always comes before any [`Effect::RevealRange`] in the
+    /// same batch, whose offsets are into the text *after* it.
+    ApplyEdit {
+        id: TabId,
+        edit: crate::history::Edit,
+    },
     /// The user tried to close document `id`, which has unsaved changes. The
     /// shell must ask whether to save, discard, or keep it, replying with
     /// [`Message::TabCloseSave`], [`Message::TabCloseDiscard`], or nothing
@@ -742,10 +754,14 @@ pub fn update(state: &mut State, message: Message) -> Vec<Effect> {
                 return vec![];
             };
             // Land the caret on what the undo changed rather than at (0,0): the
-            // edit now occupies `at..at + inserted.len()`, so reveal its end so a
-            // shell resync doesn't leave the view scrolled to the top (#94).
+            // edit now occupies `at..at + inserted.len()`, so reveal its end (#94).
             let caret = edit.at + edit.inserted.len();
-            let mut fx = title_effect(state); // content and the "•" may both change
+            // The shell applies the same edit to its buffer, first (#137).
+            let mut fx = vec![Effect::ApplyEdit {
+                id: state.docs[state.active].id,
+                edit,
+            }];
+            fx.extend(title_effect(state)); // content and the "•" may both change
             fx.extend(refresh_find_after_edit(state));
             fx.push(Effect::RevealRange {
                 start: caret,
@@ -760,7 +776,11 @@ pub fn update(state: &mut State, message: Message) -> Vec<Effect> {
             };
             // Reveal the redone edit's end, mirroring `Undo` above (#94).
             let caret = edit.at + edit.inserted.len();
-            let mut fx = title_effect(state);
+            let mut fx = vec![Effect::ApplyEdit {
+                id: state.docs[state.active].id,
+                edit,
+            }];
+            fx.extend(title_effect(state));
             fx.extend(refresh_find_after_edit(state));
             fx.push(Effect::RevealRange {
                 start: caret,
@@ -1279,10 +1299,11 @@ fn close_doc_at(state: &mut State, index: usize) {
     }
 }
 
-/// Apply `new_content` to the active document as one undo-able edit, returning
-/// the title effect whenever the dirty state changes so the shell can keep the
-/// window title and the tab's "•" marker in sync, including the dirty→clean
-/// transition when the document is reverted to its saved baseline.
+/// Apply the editor's `new_content` to the active document as one undo-able
+/// edit, returning the title effect whenever the dirty state changes so the
+/// shell can keep the window title and the tab's "•" marker in sync, including
+/// the dirty→clean transition when the document is reverted to its saved
+/// baseline. The text came from the editor, so its buffer needs nothing.
 fn apply_edit(state: &mut State, new_content: String) -> Vec<Effect> {
     let doc = &mut state.docs[state.active];
     let was_dirty = doc.dirty();
@@ -1290,6 +1311,24 @@ fn apply_edit(state: &mut State, new_content: String) -> Vec<Effect> {
         return title_effect(state);
     }
     vec![]
+}
+
+/// [`apply_edit`] for a rewrite the core makes itself (replace-next,
+/// replace-all, a text operation): the editor's buffer still holds the old
+/// text, so the effects start with [`Effect::ApplyEdit`] carrying the exact
+/// span changed, for the shell to apply in place (#137). Nothing when the text
+/// is unchanged.
+fn apply_rewrite(state: &mut State, new_content: String) -> Vec<Effect> {
+    let doc = &mut state.docs[state.active];
+    let was_dirty = doc.dirty();
+    let Some(edit) = doc.commit_rewrite(new_content) else {
+        return vec![];
+    };
+    let mut fx = vec![Effect::ApplyEdit { id: doc.id, edit }];
+    if was_dirty != doc.dirty() {
+        fx.extend(title_effect(state));
+    }
+    fx
 }
 
 /// Compile the active pattern, or record its error / return `None` for an empty
@@ -1422,7 +1461,7 @@ fn replace_current(state: &mut State) -> Vec<Effect> {
     let Some(rep) = replaced else {
         return vec![];
     };
-    let mut fx = apply_edit(state, rep.text);
+    let mut fx = apply_rewrite(state, rep.text);
     let content = state.docs[state.active].content();
     let after = find::resume_after(content, rep.range);
     let next = matcher
@@ -1443,8 +1482,9 @@ fn replace_current(state: &mut State) -> Vec<Effect> {
 }
 
 /// Replace every match in one undo-able step, via the engine's single-pass
-/// `replace_all` (so it never re-scans its own output). No reveal — the shell
-/// resyncs the rewritten buffer to the top.
+/// `replace_all` (so it never re-scans its own output). No reveal: the shell
+/// applies the edit in place and leaves the caret and the view where they were
+/// (#137).
 fn replace_all_matches(state: &mut State) -> Vec<Effect> {
     let Some(matcher) = compile_query(&mut state.find) else {
         return vec![];
@@ -1456,7 +1496,7 @@ fn replace_all_matches(state: &mut State) -> Vec<Effect> {
     if replaced == 0 {
         return vec![];
     }
-    let fx = apply_edit(state, new_content);
+    let fx = apply_rewrite(state, new_content);
     state.find.current = None;
     state.find.ordinal = 0;
     // The replacement may re-introduce the pattern, so recount on the new text.
@@ -1469,7 +1509,7 @@ fn replace_all_matches(state: &mut State) -> Vec<Effect> {
 /// document). A no-op transform records nothing and returns no effects, so it
 /// never adds an empty undo step. When the user had a real selection, the
 /// transformed span is re-selected so the shell can keep their working set
-/// highlighted; a whole-document op leaves the caret to the shell's resync.
+/// highlighted; a whole-document op leaves the caret where the shell has it.
 fn text_operation(
     state: &mut State,
     op: crate::textops::TextOp,
@@ -1482,7 +1522,7 @@ fn text_operation(
     }
     let had_selection = selection.is_some_and(|(a, b)| a != b);
     let (start, end) = applied.selection;
-    let mut fx = apply_edit(state, applied.content);
+    let mut fx = apply_rewrite(state, applied.content);
     if had_selection {
         fx.push(Effect::RevealRange { start, end });
     }
@@ -2897,6 +2937,104 @@ mod tests {
         assert_eq!(reveal(&redo_fx), Some((10, 10)));
     }
 
+    /// The [`Effect::ApplyEdit`]s in a set of effects, as `(id, edit)` pairs.
+    fn applied_edits(fx: &[Effect]) -> Vec<(TabId, crate::history::Edit)> {
+        fx.iter()
+            .filter_map(|e| match e {
+                Effect::ApplyEdit { id, edit } => Some((*id, edit.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// An edit replacing `removed` at byte `at` with `inserted`.
+    fn edit_at(at: usize, removed: &str, inserted: &str) -> crate::history::Edit {
+        crate::history::Edit {
+            at,
+            removed: removed.to_string(),
+            inserted: inserted.to_string(),
+        }
+    }
+
+    #[test]
+    fn undo_and_redo_hand_the_shell_the_exact_edit_first() {
+        // The shell applies these to the editor buffer it already holds instead
+        // of rebuilding it from the whole text (#137). The edit must come before
+        // the reveal, whose offsets are into the edited text.
+        let mut s = State::default();
+        let id = s.active_doc().id;
+        update(&mut s, Message::Edited("hello world".into()));
+        update(&mut s, Message::Edited("hello BIG world".into()));
+
+        let undo_fx = update(&mut s, Message::Undo);
+        assert_eq!(
+            undo_fx.first(),
+            Some(&Effect::ApplyEdit {
+                id,
+                edit: edit_at(6, "BIG ", ""),
+            })
+        );
+        assert!(matches!(undo_fx.last(), Some(Effect::RevealRange { .. })));
+
+        let redo_fx = update(&mut s, Message::Redo);
+        assert_eq!(
+            redo_fx.first(),
+            Some(&Effect::ApplyEdit {
+                id,
+                edit: edit_at(6, "", "BIG "),
+            })
+        );
+        assert!(matches!(redo_fx.last(), Some(Effect::RevealRange { .. })));
+    }
+
+    #[test]
+    fn replace_and_text_operations_hand_the_shell_the_exact_edit_first() {
+        let mut s = State::default();
+        let id = s.active_doc().id;
+        update(&mut s, Message::Edited("a1 b a2".into()));
+        update(&mut s, Message::FindOpened);
+        update(&mut s, Message::FindQueryChanged("a".into()));
+        update(&mut s, Message::ReplaceTextChanged("xy".into()));
+
+        // Replace-next: one match, then the reveal of the next one.
+        let fx = update(&mut s, Message::ReplaceNext);
+        assert_eq!(s.active_doc().content(), "xy1 b a2");
+        assert_eq!(applied_edits(&fx), [(id, edit_at(0, "a", "xy"))]);
+        assert!(matches!(fx.first(), Some(Effect::ApplyEdit { .. })));
+        assert!(matches!(fx.last(), Some(Effect::RevealRange { .. })));
+
+        // Replace-all: one edit spanning the first to the last change.
+        let fx = update(&mut s, Message::ReplaceAll);
+        assert_eq!(s.active_doc().content(), "xy1 b xy2");
+        assert_eq!(applied_edits(&fx), [(id, edit_at(6, "a", "xy"))]);
+
+        // A whole-document text operation.
+        let fx = update(
+            &mut s,
+            Message::TextOperation {
+                op: crate::textops::TextOp::Uppercase,
+                selection: None,
+            },
+        );
+        assert_eq!(s.active_doc().content(), "XY1 B XY2");
+        assert_eq!(
+            applied_edits(&fx),
+            // The minimal span: the unchanged trailing "2" is not part of it.
+            [(id, edit_at(0, "xy1 b xy", "XY1 B XY"))]
+        );
+    }
+
+    #[test]
+    fn typing_hands_the_shell_no_edit() {
+        // A keystroke's text came from the editor; applying it again would
+        // double it.
+        let mut s = State::default();
+        let fx = update(&mut s, Message::Edited("typed".into()));
+        assert!(applied_edits(&fx).is_empty());
+        let fx = update(&mut s, Message::Edited("typed more".into()));
+        assert!(applied_edits(&fx).is_empty());
+    }
+
     #[test]
     fn redo_with_nothing_to_redo_changes_nothing_and_reveals_nothing() {
         let mut s = State::default();
@@ -3962,6 +4100,31 @@ mod tests {
                 (0u64..8).prop_map(|id| Message::KeepMine { id }),
                 (0u64..8).prop_map(|id| Message::OverwriteConfirmed { id }),
             ],
+            // Line & text operations (#54), on random selections (clamped to
+            // char boundaries by `textops`) or the whole document, so the
+            // rewrite paths are driven like replace and undo (#137).
+            (
+                prop_oneof![
+                    (any::<bool>(), any::<bool>()).prop_map(|(descending, case_insensitive)| {
+                        crate::textops::TextOp::SortLines {
+                            descending,
+                            case_insensitive,
+                        }
+                    }),
+                    Just(crate::textops::TextOp::ReverseLines),
+                    Just(crate::textops::TextOp::RemoveDuplicateLines),
+                    Just(crate::textops::TextOp::RemoveBlankLines),
+                    Just(crate::textops::TextOp::Uppercase),
+                    Just(crate::textops::TextOp::Lowercase),
+                    Just(crate::textops::TextOp::TitleCase),
+                    Just(crate::textops::TextOp::ToggleCase),
+                    Just(crate::textops::TextOp::TrimTrailingWhitespace),
+                    (1usize..9).prop_map(|width| crate::textops::TextOp::TabsToSpaces { width }),
+                    (1usize..9).prop_map(|width| crate::textops::TextOp::SpacesToTabs { width }),
+                ],
+                proptest::option::of((0usize..64, 0usize..64)),
+            )
+                .prop_map(|(op, selection)| Message::TextOperation { op, selection }),
         ]
     }
 
@@ -4036,6 +4199,7 @@ mod tests {
             "ReloadFromDisk",
             "KeepMine",
             "OverwriteConfirmed",
+            "TextOperation",
         ]
         .into_iter()
         .map(String::from)
@@ -4044,6 +4208,47 @@ mod tests {
     }
 
     proptest! {
+        /// The shell's editor buffers stay in step with the core only if every
+        /// rewrite the core makes to an open document is announced (#137).
+        /// Typing (the text came from the editor), load and reload (the shell
+        /// rebuilds those buffers) are the only exceptions. For any message
+        /// stream, every other change to a document's text must come with an
+        /// [`Effect::ApplyEdit`] for that document whose edit turns the old text
+        /// into the new, ahead of any reveal, and no edit is announced for a
+        /// document whose text did not change.
+        #[test]
+        fn every_core_rewrite_is_announced_as_the_exact_edit(seq in prop::collection::vec(arb_message(), 0..80)) {
+            let mut s = State::default();
+            for m in seq {
+                let before: Vec<(TabId, String)> =
+                    s.docs.iter().map(|d| (d.id, d.content().to_string())).collect();
+                let rebuilt_by_the_shell = matches!(
+                    m,
+                    Message::Edited(_) | Message::FileLoaded { .. } | Message::FileReloaded { .. }
+                );
+                let fx = update(&mut s, m);
+                let edits = applied_edits(&fx);
+                if let Some(first_reveal) = fx.iter().position(|e| matches!(e, Effect::RevealRange { .. })) {
+                    let edit_after_reveal = fx[first_reveal..]
+                        .iter()
+                        .any(|e| matches!(e, Effect::ApplyEdit { .. }));
+                    prop_assert!(!edit_after_reveal, "an edit after a reveal");
+                }
+                for (id, old) in &before {
+                    let Some(doc) = s.docs.iter().find(|d| d.id == *id) else { continue };
+                    let mine: Vec<_> = edits.iter().filter(|(e, _)| e == id).collect();
+                    if doc.content() == old {
+                        prop_assert!(mine.is_empty(), "an edit for an unchanged document");
+                    } else if !rebuilt_by_the_shell {
+                        prop_assert_eq!(mine.len(), 1, "a rewrite with no edit for the shell");
+                        let mut replayed = old.clone();
+                        mine[0].1.apply(&mut replayed);
+                        prop_assert_eq!(&replayed, doc.content());
+                    }
+                }
+            }
+        }
+
         /// No message sequence may ever empty the document list, drive `active`
         /// out of bounds, or panic. This is the safety net the pure-core split
         /// exists to give us.

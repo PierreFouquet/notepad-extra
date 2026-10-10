@@ -112,6 +112,12 @@ tempfile = "3.6"
 # stays tiny-skia-only like the shell itself.
 iced_test = "=0.14.0"
 
+# Property tests for the shell's buffer sync (#137): after any sequence of edits,
+# undo / redo, replaces and text operations, every tab's editor buffer must
+# hold exactly its document's text. Already in `Cargo.lock` as notepad-core's
+# dev-dependency, so nothing new to vendor or audit.
+proptest = "1"
+
 # --- Native packaging (#43) ---------------------------------------------------
 # The shipped binary is packaged with standard cargo tooling. cargo-deb and
 # cargo-generate-rpm build the Linux packages, cargo-bundle the macOS .app/.dmg,

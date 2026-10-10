@@ -160,6 +160,7 @@ whole document into words on every `view` (~50 ms at 200 000 lines).
 | `Shell::view`; widget `draw`, `layout`, `mouse_interaction` | `view`: every message batch; `draw` / `layout` / `mouse_interaction`: every redraw (≥ 2/s idle) | O(viewport + chrome). MUST NOT scan the document or call anything that does. |
 | `Shell::update` / `Shell::dispatch` | every message | O(log n) lookups + O(viewport), plus the per-update readout refresh: O(selection) for the status bar and O(distance to the bracket partner) for bracket matching — O(document) for an unmatched opener, once per message, never per frame. |
 | edit path: `Message::Edit` → `Content::text()` → `core::Message::Edited` → `Document::commit` | every keystroke | O(n) is inherent (the widget hands over the whole text) but only with memcpy-class constants: one `text()` pass, one byte prefix/suffix `diff`, then **incremental** updates in O(edit + affected lines + the line starts after the edit — a memcpy-class shift of the index tail, 1.6 MB per keystroke at the top of 200k lines). No Unicode-aware full pass. |
+| rewrite path: undo / redo / replace / text operation → `Effect::ApplyEdit` → `Shell::apply_edit_to_buffer` | per command | O(n) memcpy-class in the core (the rewrite itself, its `diff`, the incremental `Document` update), then the exact edit spliced into the existing editor buffer: cosmic-text reshapes only the lines the edit touches, and the caret and view stay put unless the command reveals its result. One memchr over the document chooses that splice; text holding a `\r` is rebuilt instead (`Content::with_text`, every line reshaped), because the editor breaks lines at `\r` and the core's index does not (#137). |
 | load / reload / save | once per file | O(n), single pass, minimal copies: `encoding::decode_owned` (zero-copy UTF-8), `EndOfLine::normalize` (LF text untouched, CRLF compacted in place), fingerprint hashed before decode. |
 | highlighter | per visible line after an edit / scroll | parse from the nearest checkpoint; memory O(lines / 32). Exceptions tracked below: a forward jump past unparsed lines re-parses every skipped line (#138), and the state is per widget, not per tab (#144). |
 
@@ -177,6 +178,7 @@ whole document into words on every `view` (~50 ms at 200 000 lines).
 | `sync_editor_cache` reconciles buffers only when the editor keys drift from the documents; the watched-file set is rebuilt only when a tab's path changes. | `main.rs` | `the_editor_cache_reconciles_whenever_its_keys_drift_from_the_docs`, `the_watched_set_is_shared_until_a_tab_changes_it` |
 | `highlight::Settings.syntax` is a `&'static str` borrowed from the syntax set, so the per-frame `Settings` the widget compares and clones is a pointer copy. | `highlight.rs` | the `Settings` type is `Copy`; `theme_mode_changes_the_palette` |
 | `Content::text()` is one borrow, one allocation, no per-line `String`. | `text_editor.rs` | `text_round_trips_every_line_ending_shape`, `text_matches_the_upstream_lines_formulation_after_edits` |
+| Every rewrite the core makes to a document's text (undo, redo, replace, a text operation) reaches the shell as the exact `Edit` (`Effect::ApplyEdit`), spliced into that tab's existing buffer in O(edit): after any sequence of commands the buffer holds the document's text, the caret keeps its place relative to the text around it until a reveal moves it, the view scrolls no further than that reveal needs, and only text holding a `\r` is rebuilt. | `app.rs`, `main.rs` | `app::tests::every_core_rewrite_is_announced_as_the_exact_edit`, `buffer_sync::the_buffer_always_holds_the_documents_text` (random command streams vs the core's text), `splicing_an_edit_rewrites_exactly_its_span`, `splicing_an_edit_keeps_the_caret_where_it_was_relative_to_the_text`, `text_editor::tests::rewrites_in_place_keep_the_scroll_position`; cost pin `undo_redo_on_a_large_document_does_not_rebuild_the_buffer` (200 steps at 10k lines: 218 s rebuilding, ≈1.3 s in place) |
 | Scrollbar inputs (`vertical_extent`) are O(1) with wrapping off (one row per line) and one fused pass with wrapping on; thumb geometry unchanged. | `text_editor.rs` | `vertical_extent_matches_the_per_line_walk_in_both_wrap_modes` |
 | With wrapping off, `layout()` never hands the editor a narrower width than it already has (cosmic-text relayouts every shaped line on any size change) — except while a right-to-left run is on screen, when the width falls back to the visible extent because cosmic-text right-aligns RTL paragraphs to the buffer width. | `text_editor.rs` | `no_wrap_layout_width_ratchets_and_wrapping_restores_the_viewport`, `no_wrap_width_yields_to_the_visible_extent_while_rtl_text_is_on_screen` |
 | The highlighter checkpoints parser state every `CHECKPOINT_INTERVAL` (32) lines; `change_line(k)` resumes from the nearest checkpoint and is equivalent to a fresh run. | `highlight.rs` | `resuming_from_a_checkpoint_reproduces_a_fresh_run_for_every_line`, `resuming_after_an_edit_matches_a_fresh_run_of_the_edited_buffer`, `checkpoints_are_one_per_interval` |
@@ -211,6 +213,11 @@ passing, and a change that moves one is its own issue with its own numbers.
   200k lines). The open cost is inherent to the widget and the large-file guard
   (`LARGE_FILE_LINES` 50 000, `LARGE_FILE_BYTES` 8 MiB, `LARGE_FILE_LINE_BYTES`
   500 KB) is its lever; the resize relayout has a proposed fix, tracked as #139.
+- Applying a rewrite to the editor buffer scans the document once for a `\r`
+  (one memchr, ≈0.8 ms at 12 MB) to choose the in-place splice. Text that
+  holds one (CR-only files, stray CRs) is still rebuilt, every line reshaped,
+  because the editor's lines and the core's line index disagree after a `\r`
+  (#137).
 - Saving copies the text once: `Effect::WriteFile` carries an owned `String`
   because the pure core returns effects by value and cannot lend the shell a
   borrow across the call (1 ms at 12 MB, next to the I/O). #147 tracks removing it.
@@ -221,9 +228,6 @@ Paths that currently break a budget above. Each has an issue with measurements
 and a proposed fix; do not "fix" one in passing without that issue's numbers, and
 do not add another without filing one.
 
-- #137 — undo, redo, replace and the text operations rebuild the whole editor
-  buffer (`Content::with_text`), so cosmic-text reshapes every line: ≈1.1 s per
-  Ctrl+Z at 20k lines. The edit path's budget row assumes the incremental form.
 - #138 — the highlighter protocol is forward-only: a jump past unparsed lines
   (Ctrl+End, a far Go-to-line, a theme or language change while scrolled deep)
   re-parses every skipped line in one frame, ≈40 s for 200k Rust lines. The

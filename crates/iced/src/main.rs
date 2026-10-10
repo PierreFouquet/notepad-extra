@@ -959,9 +959,17 @@ fn splice_buffer(
             }
         }
     };
+    // A selection whose anchor lands on the caret is dropped, not restored as
+    // an empty one. A double- or triple-click selection reports its click
+    // point as both ends, and an empty selection makes the next Backspace
+    // delete nothing.
+    let position = shift(before.position);
     content.move_to(Cursor {
-        position: shift(before.position),
-        selection: before.selection.map(shift),
+        position,
+        selection: before
+            .selection
+            .map(shift)
+            .filter(|&anchor| anchor != position),
     });
 }
 
@@ -5907,6 +5915,28 @@ mod tests {
         check((2, 2), None, ((1, 2), None));
         // A selection maps both ends.
         check((2, 3), Some((0, 0)), ((1, 3), Some((0, 0))));
+    }
+
+    #[test]
+    fn splicing_an_edit_drops_a_word_or_line_selection_instead_of_leaving_an_empty_one() {
+        // A double- or triple-click selection reports its click point as both
+        // the caret and the anchor. Restored as is, it became an empty
+        // selection, and the next Backspace deleted nothing. A replace-all or a
+        // whole-document text operation sends no reveal, so this is the state
+        // the user is left in.
+        for select in [
+            text_editor::Action::SelectWord,
+            text_editor::Action::SelectLine,
+        ] {
+            let mut content = buffer_at("foo bar\nbaz", (0, 1), None);
+            content.perform(select.clone());
+            assert!(content.selection().is_some_and(|s| s.starts_with("foo")));
+            let at = |line, column| Position { line, column };
+            splice_buffer(&mut content, at(1, 0), at(1, 3), "BAZ".to_string());
+            assert_eq!(caret_of(&content), ((0, 1), None), "{select:?}");
+            content.perform(text_editor::Action::Edit(text_editor::Edit::Backspace));
+            assert_eq!(content.text(), "oo bar\nBAZ", "{select:?}");
+        }
     }
 
     #[test]

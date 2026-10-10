@@ -306,6 +306,16 @@ cargo check --locked --manifest-path crates/core/fuzz/Cargo.toml   # fuzz target
   macOS stay first-class; app id `io.github.PierreFouquet.NotepadExtra`, licence
   `GPL-3.0-or-later` and the packaging assets unchanged unless the PR is about
   them; vendored code keeps its upstream licence and attribution.
+- **Supported OS versions** (#135): an OS release is supported for exactly as
+  long as its vendor's standard support lasts, and no longer. Paid or opt-in
+  extensions (Windows ESU, Debian LTS, Ubuntu ESM) and the Windows Long-Term
+  Servicing Channel do not count. The floors, their sources and their review
+  dates live in `packaging/support-floors.toml`; the bundle metadata, the `.msi`
+  launch condition, the Linux build runner and the README are copies of it, and
+  a shell test (`declared_os_floors_match_the_support_floors_file`) fails when
+  any copy drifts. Re-check every floor at each release and on each review date;
+  raising a floor is its own issue, never part of another change. Never advertise
+  or test on an OS release its vendor has dropped.
 
 ## 8. Non-optimisations
 

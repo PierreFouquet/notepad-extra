@@ -59,6 +59,9 @@ body:
       value: |
         Fill in the version field that matches your OS below and leave the others on **N/A**.
         (GitHub forms can't hide the non-matching ones automatically.)
+
+        Only the OS releases listed under [Supported OS versions](https://github.com/PierreFouquet/notepad-extra#supported-os-versions)
+        in the README are supported. A bug that only reproduces on an older release is closed as unsupported.
   - type: dropdown
     id: windows-version
     attributes:

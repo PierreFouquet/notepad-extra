@@ -196,7 +196,17 @@ copyright = "Copyright © Pierre Fouquet. GNU GPL v3 or later."
 # `osx_minimum_system_version` key outright (#134) — `packaging/build-macos.sh`
 # pins the tool to that schema.
 [package.metadata.bundle.osx]
-# The supported macOS floor: 14 (Sonoma). Declared as LSMinimumSystemVersion in
-# the .app's Info.plist so LaunchServices enforces it on both arch bundles; older
-# macOS is out of support (Apple Silicon is 11.0+ by hardware anyway). (#99)
-minimum_system_version = "14.0"
+# The macOS floor is the lowest major Apple still ships security updates for
+# (#135: an OS release is supported here exactly as long as its vendor's standard
+# support lasts; #99 introduced the key). Apple patches the current major and the
+# two before it, so the floor moves every September. Today that is 15 (Sequoia):
+# 14 (Sonoma) got its last update, 14.8.9, on 2026-08-06 and was absent from the
+# September 2026 releases that covered 27, 26 and 15. Declared as
+# LSMinimumSystemVersion in the .app's Info.plist so LaunchServices refuses to
+# open the app on older macOS, on both arch bundles (Sequoia runs on Intel and
+# Apple silicon alike). The value must equal `macos_min_version` in
+# packaging/support-floors.toml, which also carries the sources and the review
+# dates; a test enforces that. Next review: September 2027 (macOS 28 ships ->
+# "26.0"); then September 2028 ("27.0", when the Intel build can be retired, 26
+# Tahoe being the last Intel macOS).
+minimum_system_version = "15.0"

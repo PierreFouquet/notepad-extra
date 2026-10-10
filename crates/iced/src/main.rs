@@ -5807,6 +5807,175 @@ mod tests {
         );
     }
 
+    /// Guard against supported-OS floor drift (#135). The policy is "vendor
+    /// standard support only", so every floor moves on its vendor's dates; each is
+    /// declared once, in `packaging/support-floors.toml`, and copied by hand into
+    /// the places that enforce or state it: the macOS bundle metadata
+    /// (`LSMinimumSystemVersion`), the `.msi` launch condition, the Linux build
+    /// runner, the README and the release-notes download table. Those copies
+    /// drift exactly the way the 0.4.0 version metadata did (#99), so editing any
+    /// one of them without the others fails here.
+    ///
+    /// The floors file is read with a deliberately tiny flat parser (only
+    /// `key = "string"` lines and comments) so this crate needs no TOML
+    /// dependency; the parser rejects anything else, which keeps the file flat.
+    #[test]
+    fn declared_os_floors_match_the_support_floors_file() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
+        let read = |rel: &str| {
+            std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("read {rel}: {e}"))
+        };
+
+        let floors_file = read("packaging/support-floors.toml");
+        let floors: std::collections::BTreeMap<&str, &str> = floors_file
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(|line| {
+                let (key, value) = line.split_once('=').unwrap_or_else(|| {
+                    panic!("support-floors.toml: not a `key = \"value\"` line: {line:?}")
+                });
+                let value = value
+                    .trim()
+                    .strip_prefix('"')
+                    .and_then(|v| v.strip_suffix('"'))
+                    .filter(|v| !v.contains('"'))
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "support-floors.toml: `{}` must be one plain quoted string with no \
+                             trailing comment (keep the file flat): {line:?}",
+                            key.trim()
+                        )
+                    });
+                (key.trim(), value)
+            })
+            .collect();
+        let floor = |key: &str| {
+            *floors
+                .get(key)
+                .unwrap_or_else(|| panic!("support-floors.toml lacks `{key}`"))
+        };
+
+        // Every floor carries the date its vendor drops it, a review date (ISO:
+        // YYYY-MM-DD, or YYYY-MM where the vendor has announced no day) and a source.
+        let is_iso_date = |s: &str| {
+            let digits = |part: &str, len: usize| {
+                part.len() == len && part.bytes().all(|b| b.is_ascii_digit())
+            };
+            match s.split('-').collect::<Vec<_>>().as_slice() {
+                [year, month] => digits(year, 4) && digits(month, 2),
+                [year, month, day] => digits(year, 4) && digits(month, 2) && digits(day, 2),
+                _ => false,
+            }
+        };
+        for platform in [
+            "macos",
+            "windows",
+            "debian",
+            "ubuntu",
+            "fedora",
+            "opensuse_leap",
+        ] {
+            for suffix in ["support_ends", "next_review"] {
+                let key = format!("{platform}_{suffix}");
+                let value = floor(&key);
+                assert!(is_iso_date(value), "{key} = {value:?} is not an ISO date");
+            }
+            let source = floor(&format!("{platform}_source"));
+            assert!(
+                source.starts_with("https://"),
+                "{platform}_source = {source:?} is not a URL"
+            );
+        }
+        assert!(is_iso_date(floor("linux_glibc_next_review")));
+
+        // macOS: the `.app`'s LSMinimumSystemVersion is cargo-bundle's
+        // `minimum_system_version`, read from the `[package.metadata.bundle.osx]`
+        // table of this crate's manifest (and only from that table).
+        let macos = floor("macos_min_version");
+        let cargo_toml = read("crates/iced/Cargo.toml");
+        let osx_table = cargo_toml
+            .split_once("[package.metadata.bundle.osx]")
+            .map(|(_, rest)| rest.split("\n[").next().unwrap_or(rest))
+            .expect("Cargo.toml has a [package.metadata.bundle.osx] table");
+        let declared = osx_table
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("minimum_system_version"))
+            .and_then(|rest| rest.trim().strip_prefix('='))
+            .map(|value| value.trim().trim_matches('"'))
+            .expect("[package.metadata.bundle.osx] sets minimum_system_version");
+        assert_eq!(
+            declared, macos,
+            "Cargo.toml [package.metadata.bundle.osx] minimum_system_version must equal \
+             macos_min_version in packaging/support-floors.toml"
+        );
+
+        // Windows: the `.msi` launch condition carries the build number in exactly
+        // one place, as a numeric comparison against the WINDOWSBUILD property, and
+        // its refusal message names the floor release.
+        let build = floor("windows_min_build");
+        let windows = format!("Windows {}", floor("windows_min_version"));
+        let wxs = read("crates/iced/wix/main.wxs");
+        let gates = wxs.matches(&format!("WINDOWSBUILD >= {build}")).count()
+            + wxs.matches(&format!("WINDOWSBUILD &gt;= {build}")).count();
+        assert_eq!(
+            gates, 1,
+            "wix/main.wxs must gate on `WINDOWSBUILD >= {build}` (windows_min_build) exactly once"
+        );
+        assert!(
+            wxs.contains(&windows),
+            "the .msi refusal message in wix/main.wxs must name the floor {windows:?}"
+        );
+
+        // Linux: the packages are linked on the runner whose glibc is the floor, so
+        // the runner and the floor move together; both workflows must still name
+        // the floor's Ubuntu release and its glibc.
+        let ubuntu = floor("ubuntu_min");
+        let glibc = floor("linux_min_glibc");
+        for workflow in [
+            ".github/workflows/packaging.yml",
+            ".github/workflows/release.yml",
+        ] {
+            let yaml = read(workflow);
+            for needle in [format!("ubuntu-{ubuntu}"), format!("glibc {glibc}")] {
+                assert!(
+                    yaml.contains(&needle),
+                    "{workflow} no longer builds on the glibc baseline {needle:?} the floors file names"
+                );
+            }
+        }
+
+        // Docs: the README states every floor, and the download table appended to
+        // each release's notes states the two that users pick a file by.
+        let macos_major = macos.split('.').next().unwrap_or(macos);
+        let macos_named = format!("macOS {macos_major} ({})", floor("macos_min_name"));
+        let readme = read("README.md");
+        for needle in [
+            format!("{macos_named}+"),
+            windows.clone(),
+            format!("build {build}"),
+            format!("Debian {}", floor("debian_min")),
+            format!("Ubuntu {}", floor("ubuntu_min")),
+            format!("Fedora {}", floor("fedora_min")),
+            format!("Leap {}", floor("opensuse_leap_min")),
+            format!("glibc {glibc}"),
+        ] {
+            assert!(
+                readme.contains(&needle),
+                "README.md does not state the floor {needle:?} from packaging/support-floors.toml"
+            );
+        }
+        let downloads = read(".github/release-downloads.md");
+        for needle in [macos_named.as_str(), windows.as_str()] {
+            assert!(
+                downloads.contains(needle),
+                ".github/release-downloads.md does not state the floor {needle:?}"
+            );
+        }
+    }
+
     #[test]
     fn config_path_lands_in_a_per_user_notepad_extra_dir() {
         // Whatever the platform, the file resolves (in CI there is always a HOME /

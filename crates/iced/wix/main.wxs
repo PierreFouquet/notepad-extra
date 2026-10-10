@@ -40,6 +40,60 @@
         <Media Id="1" Cabinet="media1.cab" EmbedCab="yes" DiskPrompt="CD-ROM #1"/>
         <Property Id="DiskPrompt" Value="Notepad Extra Installation"/>
 
+        <!--
+          Supported-OS floor (#135). Policy: a Windows release is supported for
+          exactly as long as Microsoft's standard support for any edition of it
+          lasts; Extended Security Updates do not count. The floor is therefore
+          the oldest Windows 11 release still in that window. It is recorded as
+          `windows_min_version` / `windows_min_build` in
+          packaging/support-floors.toml together with its sources and review
+          date, and a test keeps the build number in the condition below equal to
+          that file (it is written in exactly this one place). The portable .exe
+          has the same floor, but nothing enforces it there.
+
+          Why a registry search rather than the built-in VersionNT / WindowsBuild
+          properties: the Windows Installer reference documents their values only
+          up to Windows 8.1 (VersionNT 603, WindowsBuild 9600; "Operating System
+          Property Values" under learn.microsoft.com/windows/win32/msi), and a
+          process whose manifest does not declare a newer Windows is told it runs
+          on the last one it declares ("Targeting your application for Windows":
+          GetVersionEx "will return the Windows 8 version"), so under msiexec they
+          cannot express a Windows 11 floor. The real build is the REG_SZ value
+          `CurrentBuildNumber` under HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion
+          (`CurrentBuild` is equal on current Windows but carried placeholder text
+          on older NT releases). A WiX v3 RegistrySearch with Type="raw" returns a
+          REG_SZ with no prefix (only DWORD "#", REG_BINARY "#x", REG_EXPAND_SZ
+          "#%" and REG_MULTI_SZ "[~]" are prefixed), and MSI conditional syntax
+          compares a property against an integer literal numerically whenever the
+          property converts to an integer: only a "string or property value that
+          cannot be converted to an integer" makes the comparison false
+          ("Conditional Statement Syntax"), so a missing value fails closed. The
+          search reads the registry view of the package architecture (WiX's Win64
+          default follows candle's -arch); this key is not on the WOW64 shared
+          list, and cargo-wix builds a 64-bit package.
+
+          The condition passes when any of these holds: `Installed` (repair,
+          modify and uninstall of an existing install are never blocked; a
+          MajorUpgrade is a fresh install of a new product code and is gated like
+          one), `MsiNTProductType <> 1` (1 = workstation, 2 = domain controller,
+          3 = server: server SKUs are not client Windows and are not gated; CI's
+          windows-latest runner is Windows Server 2025, build 26100 anyway), or
+          the build meets the floor. Otherwise Setup shows the Message and stops
+          before changing anything (a Condition under Product is a row of the
+          LaunchCondition table, checked by the LaunchConditions action).
+          Review dates: 2026-11-11 (24H2, build 26100), 2027-10-13 (25H2, 26200).
+        -->
+        <Property Id="WINDOWSBUILD">
+            <RegistrySearch Id="CurrentBuildNumber"
+                            Root="HKLM"
+                            Key="SOFTWARE\Microsoft\Windows NT\CurrentVersion"
+                            Name="CurrentBuildNumber"
+                            Type="raw"/>
+        </Property>
+        <Condition Message="Notepad Extra requires Windows 11 23H2 or later, the oldest Windows release still supported by Microsoft. This computer runs Windows build [WINDOWSBUILD]. Update Windows and run Setup again.">
+            <![CDATA[Installed OR MsiNTProductType <> 1 OR WINDOWSBUILD >= 22631]]>
+        </Condition>
+
         <Directory Id="TARGETDIR" Name="SourceDir">
             <Directory Id="ProgramFiles64Folder" Name="PFiles">
                 <Directory Id="APPLICATIONFOLDER" Name="Notepad Extra">

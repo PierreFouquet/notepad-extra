@@ -1,0 +1,126 @@
+# Supported OS versions: the single source of truth for every platform floor.
+#
+# Policy (#135, decided by the maintainer): "as soon as an OS release goes
+# end-of-life it is no longer supported by this application". A release is
+# supported for exactly as long as it is in its vendor's *standard* support.
+# Paid or opt-in extension programmes do not count: Windows Extended Security
+# Updates, Debian LTS (volunteers / Freexian), Ubuntu Expanded Security
+# Maintenance. A Windows *version* counts as supported while any edition of it
+# (Home/Pro or Enterprise/Education) is still in standard support; the Long-Term
+# Servicing Channel does not count as such an edition (Microsoft reserves LTSC
+# for fixed-purpose devices, not general-purpose PCs), so an LTSC release in
+# support never holds the floor at an otherwise end-of-life version. Floors move on
+# the vendors' dates, so each one below records the date its vendor drops it and
+# the date to re-check it. Re-check every floor at each release and on each review
+# date; raising a floor is its own issue. The toolchain's own floors (winit:
+# Windows 10+, macOS 10.12 / 11.0+, glibc 2.17+) are all below these, so the
+# vendor dates alone decide.
+#
+# Format: deliberately flat, only `key = "string"` lines and comments, so the test
+# that pins these values (`declared_os_floors_match_the_support_floors_file` in
+# crates/iced/src/main.rs) reads it without a TOML dependency. Keep it so: no
+# tables, no non-string values, no trailing comment after a value. Dates are ISO
+# (YYYY-MM-DD, or YYYY-MM where the vendor has announced no day).
+#
+# Where each floor is copied to (the test keeps every copy equal to this file):
+#   macos_min_version  -> crates/iced/Cargo.toml [package.metadata.bundle.osx] minimum_system_version
+#   windows_min_build  -> crates/iced/wix/main.wxs launch condition (`WINDOWSBUILD >= <build>`)
+#   all *_min* keys    -> README.md ("Supported OS versions" + the release "Covers" table),
+#                         .github/release-downloads.md
+#   ubuntu_min / linux_min_glibc -> the ubuntu-22.04 runner in
+#                         .github/workflows/packaging.yml and release.yml
+
+# ---- macOS -------------------------------------------------------------------
+# Apple ships security updates for the current major and the two before it and
+# announces no end dates: a major drops out when the next one ships each
+# September. macOS 27 shipped 2026-09-14 (https://support.apple.com/en-us/127257);
+# the September 2026 security releases covered 27, 26 (Tahoe) and 15 (Sequoia,
+# 15.8.1 on 2026-09-28, https://support.apple.com/en-us/149229), while 14 (Sonoma)
+# got nothing after 14.8.9 on 2026-08-06 (https://support.apple.com/en-us/148172).
+# Sequoia runs on Intel and Apple silicon, so both .dmg slices stay. Tahoe (26) is
+# the last Intel macOS; 27 is Apple-silicon only.
+# Review: September 2027 (macOS 28 ships -> floor "26.0"); September 2028 (floor
+# "27.0", and the Intel build can be retired).
+macos_min_version = "15.0"
+macos_min_name = "Sequoia"
+macos_support_ends = "2027-09"
+macos_next_review = "2027-09"
+macos_source = "https://support.apple.com/en-us/100100"
+macos_source_min_version_key = "https://developer.apple.com/documentation/bundleresources/information-property-list/lsminimumsystemversion"
+
+# ---- Windows -----------------------------------------------------------------
+# Windows 10 left standard support on 2025-10-14 (its consumer ESU, to
+# 2027-10-12, is excluded by policy, and so are Windows 10 Enterprise LTSC 2021,
+# mainstream support to 2027-01-12, and IoT Enterprise LTSC 2021, to 2032-01-13:
+# LTSC is a fixed-purpose-device channel and does not hold the floor at 10).
+# Windows 11 Enterprise LTSC 2024 is build 26100 and passes the floor like any
+# 24H2. Windows 11 23H2 (build 10.0.22631): Home/Pro
+# ended 2025-11-11, Enterprise/Education run to 2026-11-10, so it is supported
+# under the any-edition rule. 24H2 (build 26100): Home/Pro to 2026-10-13,
+# Enterprise/Education to 2027-10-12. 25H2 (build 26200): Home/Pro to 2027-10-12,
+# Enterprise/Education to 2028-10-10. ARM64 shares these dates. Windows Server is
+# not a client SKU and is not gated (CI's windows-latest runner is Windows Server
+# 2025, build 26100).
+# Review: 2026-11-11 -> "11 24H2" / build "26100"; 2027-10-13 -> "11 25H2" /
+# build "26200".
+windows_min_version = "11 23H2"
+windows_min_build = "22631"
+windows_support_ends = "2026-11-10"
+windows_next_review = "2026-11-11"
+windows_source = "https://learn.microsoft.com/en-us/lifecycle/products/windows-11-enterprise-and-education"
+windows_source_home_pro = "https://learn.microsoft.com/en-us/lifecycle/products/windows-11-home-and-pro"
+windows_source_builds = "https://learn.microsoft.com/en-us/windows/release-health/windows11-release-information"
+
+# ---- Linux -------------------------------------------------------------------
+# Nothing blocks an install on Linux; these are the releases the packages are
+# built for and tested on. The binding constraint is glibc: the .deb / .rpm /
+# .AppImage are linked on GitHub's ubuntu-22.04 runner (glibc 2.35), the lowest
+# glibc among the supported distros, so one build runs on all of them.
+
+# Debian 12 (bookworm) left regular security support on 2026-07-12
+# (https://www.debian.org/News/2026/20260712); Debian 13 (trixie, glibc 2.41) is
+# stable. Debian keeps oldstable in regular security support for about a year
+# after the next stable ships, so 13's end is projected for August 2028 (Debian 14
+# is due mid-2027); Debian announces the exact date then.
+debian_min = "13"
+debian_support_ends = "2028-08"
+debian_next_review = "2028-08"
+debian_source = "https://www.debian.org/releases/"
+
+# Ubuntu LTS releases in standard security maintenance: 22.04 (glibc 2.35, to
+# 2027-05-31), 24.04 (glibc 2.39) and 26.04 (glibc 2.43). The review date is the
+# retirement of the ubuntu-22.04 runner (see the glibc entry): the build must
+# move to 24.04 / glibc 2.39 by then, and the floor follows on 2027-06-01.
+ubuntu_min = "22.04"
+ubuntu_support_ends = "2027-05-31"
+ubuntu_next_review = "2027-04-17"
+ubuntu_source = "https://ubuntu.com/about/release-cycle"
+
+# Fedora maintains a release until four weeks after the release two versions
+# later ships. Fedora 42 went EOL on 2026-05-27; 43 (glibc 2.42) and 44 (glibc
+# 2.43) are supported. Fedora 45 is targeted for 2026-10-20 (backup dates
+# 2026-10-27 and 2026-11-03), which puts 43's end at about 2026-11-17; Fedora
+# announces the exact date when 45 ships.
+fedora_min = "43"
+fedora_support_ends = "2026-11-17"
+fedora_next_review = "2026-11-17"
+fedora_source = "https://docs.fedoraproject.org/en-US/releases/lifecycle/"
+fedora_source_schedule = "https://fedorapeople.org/groups/schedule/f-45/f-45-key-tasks.html"
+
+# openSUSE Leap 15.6 went EOL on 2026-04-30; Leap 16.0 (glibc 2.40) is maintained
+# to 2027-10-31.
+opensuse_leap_min = "16.0"
+opensuse_leap_support_ends = "2027-10-31"
+opensuse_leap_next_review = "2027-10-31"
+opensuse_leap_source = "https://en.opensuse.org/Lifetime"
+
+# The glibc floor is Ubuntu 22.04's. GitHub deprecated the ubuntu-22.04 image on
+# 2026-09-17; brownouts run March-April 2027 and it retires on 2027-04-17
+# (https://github.com/actions/runner-images/issues/14254). ubuntu-latest moves to
+# 26.04 between 2026-10-19 and 2026-11-19
+# (https://github.com/actions/runner-images/issues/14748). The floor and the
+# runner move together to Ubuntu 24.04 / glibc 2.39 in April-May 2027.
+linux_min_glibc = "2.35"
+linux_min_glibc_from = "Ubuntu 22.04"
+linux_glibc_next_review = "2027-04-17"
+linux_glibc_source = "https://github.com/actions/runner-images/issues/14254"

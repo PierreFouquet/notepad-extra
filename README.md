@@ -106,8 +106,12 @@ Installers are built and attached automatically **when you publish a GitHub Rele
    ([`packaging/linux/io.github.PierreFouquet.NotepadExtra.metainfo.xml`](packaging/linux/io.github.PierreFouquet.NotepadExtra.metainfo.xml))
    and the man page `.TH` line ([`packaging/linux/notepad-extra.1`](packaging/linux/notepad-extra.1)).
    A test enforces that all three agree, so none can silently drift.
-2. On GitHub, **Releases → Draft a new release**, create the tag (e.g. `v0.5.0`), and click **Publish**.
-3. CI builds every platform and uploads the bundles onto that release.
+2. Re-check the OS floors in [`packaging/support-floors.toml`](packaging/support-floors.toml)
+   against the vendor lifecycle pages it cites (see [Supported OS versions](#supported-os-versions)).
+   If a floor has moved, raise it in its own issue first; a test keeps the bundle metadata,
+   the `.msi` launch condition and this README in step with that file.
+3. On GitHub, **Releases → Draft a new release**, create the tag (e.g. `v0.5.0`), and click **Publish**.
+4. CI builds every platform and uploads the bundles onto that release.
 
 > A manual `workflow_dispatch` run is also available; it saves the packages as run artifacts instead.
 >
@@ -117,11 +121,34 @@ Artifacts produced:
 
 | Platform | Files | Covers |
 | --- | --- | --- |
-| Linux x86_64 + aarch64 | `.deb`, `.rpm`, `.AppImage` | Debian/Ubuntu (deb), Fedora/RHEL/openSUSE (rpm), **any distro** (AppImage) |
-| macOS Intel + Apple Silicon | `.dmg` / `.app` | macOS 14 (Sonoma)+ |
-| Windows x64 + ARM64 | `.msi` (x64) / portable `.exe` (x64 + ARM64) | Windows 10/11; ARM64 has no `.msi` — use the portable `.exe` |
+| Linux x86_64 + aarch64 | `.deb`, `.rpm`, `.AppImage` | Debian 13+ / Ubuntu 22.04+ (deb), Fedora 43+ / openSUSE Leap 16.0+ (rpm), **any distro** with glibc 2.35+ (AppImage) |
+| macOS Intel + Apple Silicon | `.dmg` / `.app` | macOS 15 (Sequoia)+ — declared in the `.app` as `LSMinimumSystemVersion` |
+| Windows x64 + ARM64 | `.msi` (x64) / portable `.exe` (x64 + ARM64) | Windows 11 23H2+ (build 22631 or newer; the `.msi` refuses older client Windows); ARM64 has no `.msi` — use the portable `.exe` |
 
 > GitHub-hosted ARM runners (`*-arm`) are free for public repositories; on private repos those jobs are billable.
+
+## Supported OS versions
+
+An OS release is supported for exactly as long as its vendor's standard support lasts: the
+day a release goes end-of-life it is no longer supported here, and paid or opt-in extensions
+(Windows ESU, Debian LTS, Ubuntu ESM) do not count. The floors therefore move on the vendors'
+dates:
+
+| Platform | Minimum | Vendor support ends | Next review |
+| --- | --- | --- | --- |
+| macOS | macOS 15 (Sequoia)+ — enforced by the `.app`'s `LSMinimumSystemVersion` | Sep 2027 (expected: Apple drops a major when the third one after it ships) | Sep 2027 → macOS 26 |
+| Windows | Windows 11 23H2+ (build 22631) — the `.msi` refuses older client Windows; the portable `.exe` has the same floor but does not check it | 2026-11-10 (23H2 Enterprise/Education) | 2026-11-11 → 24H2 (build 26100) |
+| Debian | Debian 13 | Aug 2028 (projected: about a year after Debian 14 ships) | Aug 2028 |
+| Ubuntu | Ubuntu 22.04 LTS | 2027-05-31 | 2027-04-17 (the build runner retires) → 24.04 |
+| Fedora | Fedora 43 | 2026-11-17 (four weeks after Fedora 45 ships) | 2026-11-17 → 44 |
+| openSUSE | Leap 16.0 | 2027-10-31 | 2027-10-31 |
+| any Linux | glibc 2.35 — the packages are linked on Ubuntu 22.04 | 2027-05-31 (with Ubuntu 22.04) | 2027-04-17 → glibc 2.39 |
+
+Windows Server is not gated (it is not a client SKU), and nothing blocks an install on Linux:
+the Linux floors are what the packages are built for and tested on. The floors, their sources
+and the review dates live in [`packaging/support-floors.toml`](packaging/support-floors.toml),
+the single source of truth; a test keeps the bundle metadata, the `.msi` launch condition, the
+build runner and this README in step with it. Raising a floor is its own issue.
 
 ## Project layout
 

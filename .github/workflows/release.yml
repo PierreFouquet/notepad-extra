@@ -19,8 +19,16 @@ env:
 
 jobs:
   # ---- Linux: .deb + .rpm + .AppImage, per arch --------------------------
-  # Built on the oldest supported Ubuntu so the auto-derived `libc6 (>= …)`
-  # glibc floor stays low enough to install on older distros (mirrors #44).
+  # Built on ubuntu-22.04 on purpose (#135): its glibc 2.35 is the baseline for
+  # the Ubuntu 22.04 floor in packaging/support-floors.toml, the lowest glibc of
+  # any supported distro (Debian 13, Ubuntu 22.04, Fedora 43, Leap 16.0), so the
+  # auto-derived `libc6 (>= …)` floor stays low enough for all of them (mirrors
+  # #44). GitHub deprecated this image on 2026-09-17; brownouts run March-April
+  # 2027 and it retires on 2027-04-17
+  # (https://github.com/actions/runner-images/issues/14254). The floor and the
+  # runner move together to ubuntu-24.04 / glibc 2.39 in April-May 2027, as
+  # their own issue; do not bump the runner alone (a test checks it against the
+  # floor).
   # deb + rpm must succeed; the AppImage step is isolated (continue-on-error)
   # because linuxdeploy is fetched from upstream and can regress independently
   # of this repo — a linuxdeploy failure must never discard the deb/rpm.

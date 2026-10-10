@@ -774,6 +774,58 @@ fn large_file_lines(content: &str) -> Option<usize> {
     (lines >= LARGE_FILE_LINES || longest >= LARGE_FILE_LINE_BYTES).then_some(lines)
 }
 
+/// The caret-dependent readouts [`Shell::view`] shows, computed **once per state
+/// change** and only *read* per frame (#126).
+///
+/// `view` runs on every redraw — every keystroke, scroll and pointer event, and
+/// the editor's 500 ms caret blink — and used to derive the status bar and the
+/// bracket highlight afresh each time. The status bar itself is cheap now (the
+/// document caches its totals and line index), but
+/// [`core::brackets::match_at`] walks the text from the caret to its partner —
+/// the rest of the document for an unmatched opener — so an idle editor with a
+/// stray `(` re-scanned the whole buffer twice a second, forever.
+///
+/// Both inputs change only inside [`Shell::dispatch`]: the caret moves only
+/// through `Content::perform` / `move_to` there (an `Edit` action, a reveal, a
+/// go-to-line, a context-menu action), and the document, active tab, language
+/// and encoding only through `apply_core`. So [`Shell::update`] refreshes this
+/// after every message that can move either, skips the two that cannot (pointer
+/// motion and resizes, see there), and `view` reads the stored values.
+#[derive(Debug, Clone, PartialEq)]
+struct Readouts {
+    /// What the status bar shows for the active document (#37/#55).
+    status: core::StatusBar,
+    /// The bracket pair next to the caret (#41), in the widget's coordinates, or
+    /// `None` when the caret touches no bracket.
+    bracket: Option<BracketHighlight>,
+}
+
+impl Readouts {
+    /// Derive both readouts from `doc` and its editor buffer. Headless-testable:
+    /// `text_editor::Content::cursor()` needs no renderer. The widget speaks in
+    /// `(line, byte-column)`; the document's indexed `offset_at` turns that into
+    /// the byte offsets the core's [`core::status`] and
+    /// [`core::brackets::match_at`] expect, and its `line_col_of` maps the matched
+    /// brackets back — O(1) and O(log n) conversions (#126), with the one caret
+    /// conversion shared by both readouts.
+    fn of(doc: &core::Document, editor: &text_editor::Content) -> Self {
+        let cursor = editor.cursor();
+        let caret = doc.offset_at(cursor.position.line, cursor.position.column);
+        let anchor = cursor.selection.map(|a| doc.offset_at(a.line, a.column));
+        let to_pos = |off: usize| {
+            let (line, column) = doc.line_col_of(off);
+            Position { line, column }
+        };
+        Readouts {
+            status: core::status(doc, caret, anchor),
+            bracket: core::brackets::match_at(doc.content(), caret).map(|m| BracketHighlight {
+                here: to_pos(m.here),
+                partner: m.partner.map(to_pos),
+            }),
+        }
+    }
+}
+
 /// The whole shell: the pure core plus the per-tab editor buffers, window title,
 /// the last error surfaced in the status bar, and the go-to-line input's text.
 struct Shell {
@@ -869,6 +921,12 @@ struct Shell {
     /// tab strip lists the tabs that don't fit; this drives its card in `view`.
     /// Shell-only chrome, like [`Shell::drag_hover`]; selecting a tab closes it.
     tabs_menu_open: bool,
+    /// The status-bar and bracket-highlight readouts for the active document,
+    /// refreshed once per state change by [`Shell::update`] and only *read* by
+    /// [`Shell::view`] (#126) — see [`Readouts`] for why `view` must not derive
+    /// them itself. Always in step with the active editor's caret: nothing moves
+    /// that caret outside `dispatch`, and `update` refreshes after `dispatch`.
+    readouts: Readouts,
 }
 
 impl Shell {
@@ -885,6 +943,10 @@ impl Shell {
         // applying the loaded prefs is enough — no editor rebuild needed.
         shell.core.apply_preferences(&prefs);
         let open = shell.open_startup_files(files);
+        // The startup files landed through `dispatch`, not `update`, so refresh
+        // the readouts that `update` would have (#126): the first frame must show
+        // the focused file's status, not the blank tab's.
+        shell.refresh_readouts();
         (shell, Task::batch([task, open]))
     }
 
@@ -927,6 +989,9 @@ impl Shell {
             text_editor::Content::with_text(core.active_doc().content()),
         );
         let title = window_title(&core);
+        // Seed the readouts for the blank document so the first frame — drawn
+        // before any `update` — already has values to show (#126).
+        let readouts = Readouts::of(core.active_doc(), &editors[&core.active_doc().id]);
         (
             Shell {
                 core,
@@ -949,6 +1014,7 @@ impl Shell {
                 // corrects this to the real width almost immediately (#70).
                 window_width: 1024.0,
                 tabs_menu_open: false,
+                readouts,
             },
             Task::none(),
         )
@@ -960,22 +1026,28 @@ impl Shell {
 
     /// The iced entry point. Dispatches the message, then flips
     /// [`Shell::repaint_nudge`] so the next frame forces a full repaint — see the
-    /// field's docs for the underlying iced damage limitation this dodges (#32).
+    /// field's docs for the underlying iced damage limitation this dodges (#32) —
+    /// and refreshes the cached [`Readouts`] that frame will show (#126).
     ///
-    /// The one exception is [`Message::EditorCursorMoved`], which only records
-    /// the pointer position for the context-menu anchor (#97 item 3) and paints
-    /// nothing. It arrives on *every* pointer motion over the editor, so nudging
-    /// it would force a full-window software repaint on each one — the very churn
-    /// the nudge exists to avoid. Skipping the flip lets those frames take iced's
-    /// cheap no-damage path; every message that can change a pixel still nudges.
+    /// The exceptions are [`Message::EditorCursorMoved`], which only records the
+    /// pointer position for the context-menu anchor (#97 item 3) and paints
+    /// nothing, and [`Message::WindowResized`], which records geometry the resize
+    /// itself already repaints. The first arrives on *every* pointer motion over
+    /// the editor, so nudging it would force a full-window software repaint on
+    /// each one — the very churn the nudge exists to avoid. Neither can move the
+    /// caret or touch a document, so neither can stale the readouts. Skipping
+    /// both lets those frames take iced's cheap no-damage path; every message
+    /// that can change a pixel still nudges, and every one that can move the
+    /// caret or change the document still refreshes.
     fn update(&mut self, message: Message) -> Task<Message> {
-        let repaints = !matches!(
+        let changes_state = !matches!(
             message,
             Message::EditorCursorMoved(_) | Message::WindowResized(_)
         );
         let task = self.dispatch(message);
-        if repaints {
+        if changes_state {
             self.repaint_nudge = !self.repaint_nudge;
+            self.refresh_readouts();
         }
         task
     }
@@ -1947,18 +2019,12 @@ impl Shell {
         }
     }
 
-    /// The status-bar readout for the active document, derived from the pure
-    /// core plus the editor widget's live caret/selection. Headless-testable:
-    /// `text_editor::Content::cursor()` needs no renderer. The widget speaks in
-    /// `(line, byte-column)`, which the document's indexed `offset_at` turns
-    /// into the byte offsets the core's [`core::status`] expects — O(1) per
-    /// conversion, since this runs on every redraw (#126).
-    fn status(&self) -> core::StatusBar {
-        let doc = self.core.active_doc();
-        let cursor = self.active_editor().cursor();
-        let caret = doc.offset_at(cursor.position.line, cursor.position.column);
-        let anchor = cursor.selection.map(|a| doc.offset_at(a.line, a.column));
-        core::status(doc, caret, anchor)
+    /// The status-bar readout for the active document (#37/#55): the value
+    /// [`Shell::update`] cached after the last state change, derived from the
+    /// pure core plus the editor widget's caret/selection by [`Readouts::of`].
+    /// A field read, so `view` may call it on every frame (#126).
+    fn status(&self) -> &core::StatusBar {
+        &self.readouts.status
     }
 
     /// The editor's live selection as a byte range `[start, end)`, or `None`
@@ -1973,27 +2039,19 @@ impl Shell {
         Some((anchor, caret))
     }
 
-    /// The bracket pair to highlight for the active document (#41), derived from
-    /// the pure core plus the editor widget's live caret. Mirrors [`Shell::status`]:
-    /// it reads the caret (no renderer needed, so this is headless-testable),
-    /// turns it into a byte offset with the document's indexed `offset_at`, asks
-    /// the core which brackets match, and maps the result back to the widget's
-    /// `(line, column)` positions with its `line_col_of` — the same conversion
-    /// `RevealRange` uses, and O(1)/O(log n) per call because this too runs on
-    /// every redraw (#126).
+    /// The bracket pair to highlight for the active document (#41): cached
+    /// alongside the status, see [`Shell::status`] and [`Readouts`]. A field read,
+    /// where it used to be a bracket scan per frame (#126).
     fn active_bracket(&self) -> Option<BracketHighlight> {
-        let doc = self.core.active_doc();
-        let cursor = self.active_editor().cursor();
-        let caret = doc.offset_at(cursor.position.line, cursor.position.column);
-        let m = core::brackets::match_at(doc.content(), caret)?;
-        let to_pos = |off: usize| {
-            let (line, column) = doc.line_col_of(off);
-            Position { line, column }
-        };
-        Some(BracketHighlight {
-            here: to_pos(m.here),
-            partner: m.partner.map(to_pos),
-        })
+        self.readouts.bracket
+    }
+
+    /// Recompute [`Shell::readouts`] from the active document and its editor
+    /// buffer (#126). Called by [`Shell::update`] after every message that can
+    /// move the caret or change the document, and by [`Shell::boot_with`], whose
+    /// startup files land through `dispatch` directly.
+    fn refresh_readouts(&mut self) {
+        self.readouts = Readouts::of(self.core.active_doc(), self.active_editor());
     }
 
     /// The UI-chrome font as an [`iced::Font`] (#61), resolved from the persisted
@@ -2485,7 +2543,7 @@ impl Shell {
                 let right = row![
                     mode,
                     text(s.eol).font(ui),
-                    pick_list(encoding_options(), Some(s.encoding), Message::SetEncoding)
+                    pick_list(encoding_options(), Some(&s.encoding), Message::SetEncoding)
                         .style(theme::picker(t))
                         .menu_style(theme::picker_menu(t))
                         .font(ui)
@@ -4947,16 +5005,34 @@ mod tests {
         // The exception: cursor tracking for the context-menu anchor (#97 item 3)
         // paints nothing and arrives on every pointer motion, so it must NOT flip
         // the nudge — otherwise moving the mouse would repaint the whole window
-        // continuously.
+        // continuously. The same exclusion governs the readout cache (#126):
+        // pointer motion cannot move the caret, so it must not refresh the
+        // readouts either — shown by moving the caret behind the cache first.
+        let cached = shell.status().clone();
+        shell.active_editor_mut().move_to(Cursor {
+            position: Position { line: 0, column: 3 },
+            selection: None,
+        });
         let _ = shell.update(Message::EditorCursorMoved(Point::new(3.0, 4.0)));
         assert_eq!(
             shell.repaint_nudge, after_toggle,
             "cursor tracking must not flip the nudge"
         );
+        assert_eq!(
+            shell.status(),
+            &cached,
+            "cursor tracking must not refresh the readouts"
+        );
 
-        // A manual pick changes it again → flips (from the unchanged state).
+        // A manual pick changes it again → flips (from the unchanged state), and
+        // being a state change it refreshes the readouts from the live caret.
         let _ = shell.update(Message::SetLanguage("Python".to_string()));
         assert_ne!(shell.repaint_nudge, after_toggle);
+        assert_eq!(
+            (shell.status().column, shell.status().language),
+            (4, "Python"),
+            "a painting update refreshes the readouts"
+        );
 
         // The nudged background differs from the plain one, so `present` sees a
         // changed clear-colour and repaints the whole surface.
@@ -5185,6 +5261,179 @@ mod tests {
             .expect("the lone bracket is highlighted");
         assert_eq!(b.here, Position { line: 0, column: 0 });
         assert_eq!(b.partner, None);
+    }
+
+    // ---- Per-update readout cache (#126) ----
+    //
+    // `view` reads the status bar and the bracket highlight from a cache that
+    // `update` refreshes, instead of deriving them on every frame. These tests
+    // pin both halves: the cache follows every kind of state change, and the two
+    // messages excluded from the refresh really do leave it alone. The latter is
+    // observed by moving the caret *behind the shell's back* — something no
+    // production path does (every caret move arrives as a message through
+    // `update`) — so a readout still showing the old caret is provably cached.
+
+    #[test]
+    fn pointer_tracking_and_resizes_do_not_recompute_the_readouts() {
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::Edit(paste("ab(x)\nmore")));
+        // The caret sits at the end of line 2, where no bracket is adjacent.
+        assert_eq!((shell.status().line, shell.status().column), (2, 5));
+        assert!(shell.active_bracket().is_none());
+        // Park the *live* caret right after the ')' on line 1 — where the status
+        // would read (1, 6) and a pair is adjacent — without telling the cache.
+        shell.active_editor_mut().move_to(Cursor {
+            position: Position { line: 0, column: 5 },
+            selection: None,
+        });
+
+        let _ = shell.update(Message::EditorCursorMoved(Point::new(3.0, 4.0)));
+        assert_eq!(
+            (shell.status().line, shell.status().column),
+            (2, 5),
+            "pointer motion must not recompute the status readout"
+        );
+        assert!(
+            shell.active_bracket().is_none(),
+            "pointer motion must not recompute the bracket readout"
+        );
+        let _ = shell.update(Message::WindowResized(640.0));
+        assert_eq!(
+            (shell.status().line, shell.status().column),
+            (2, 5),
+            "a resize must not recompute the readouts either"
+        );
+        assert!(shell.active_bracket().is_none());
+
+        // Any other message is a potential state change and refreshes the cache
+        // from the live caret.
+        let _ = shell.update(Message::DismissError);
+        assert_eq!(
+            (shell.status().line, shell.status().column),
+            (1, 6),
+            "the next state-changing update refreshes the status readout"
+        );
+        let b = shell
+            .active_bracket()
+            .expect("the pair next to the parked caret");
+        assert_eq!(b.here, Position { line: 0, column: 4 });
+        assert_eq!(b.partner, Some(Position { line: 0, column: 2 }));
+    }
+
+    #[test]
+    fn readouts_follow_caret_moves_edits_and_undo() {
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::Edit(paste("one\ntwo")));
+        let after_paste = shell.status().clone();
+        assert_eq!((after_paste.line, after_paste.column), (2, 4));
+
+        // A caret-only action — not an edit, so the core never hears of it —
+        // still refreshes the position.
+        let _ = shell.update(Message::Edit(text_editor::Action::Move(
+            text_editor::Motion::DocumentStart,
+        )));
+        assert_eq!(
+            (shell.status().line, shell.status().column),
+            (1, 1),
+            "a cursor-move action refreshes the caret readout"
+        );
+        assert_eq!(
+            shell.status().chars,
+            after_paste.chars,
+            "a cursor move leaves the totals alone"
+        );
+
+        // An edit refreshes the totals, the caret and the bracket readout.
+        let _ = shell.update(Message::Edit(paste("(")));
+        assert_eq!(
+            shell.status().chars,
+            after_paste.chars + 1,
+            "an edit refreshes the character total"
+        );
+        assert_eq!((shell.status().line, shell.status().column), (1, 2));
+        let b = shell.active_bracket().expect("the bracket just typed");
+        assert_eq!(b.here, Position { line: 0, column: 0 });
+        assert_eq!(b.partner, None, "an unbalanced opener has no partner");
+
+        // Undo rewrites the buffer from the core and resyncs the editor: the
+        // total goes back and the bracket readout clears.
+        let _ = shell.update(Message::Undo);
+        assert_eq!(
+            shell.status().chars,
+            after_paste.chars,
+            "undo refreshes the totals"
+        );
+        assert!(
+            shell.active_bracket().is_none(),
+            "undo refreshes the bracket readout"
+        );
+    }
+
+    #[test]
+    fn readouts_follow_a_tab_switch() {
+        let (mut shell, _) = Shell::new();
+        open_file(&mut shell, "/tmp/three.rs", "a\nb\nc");
+        let rust_tab = shell.status().clone();
+        assert_eq!((rust_tab.lines, rust_tab.language), (3, "Rust"));
+
+        let _ = shell.update(Message::NewTab);
+        assert_eq!(
+            (shell.status().lines, shell.status().language),
+            (1, "Plain Text"),
+            "a new tab refreshes the readouts to the blank document"
+        );
+
+        let _ = shell.update(Message::TabSelected(0));
+        assert_eq!(
+            shell.status(),
+            &rust_tab,
+            "switching back refreshes the readouts to that tab's document"
+        );
+    }
+
+    #[test]
+    fn readouts_follow_a_find_reveal() {
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::Edit(paste("one\ntwo\nthree")));
+        let _ = shell.update(Message::ToggleFind);
+        assert_eq!(shell.status().selection, 0);
+        // Incremental find selects the first match through `Effect::RevealRange`,
+        // which moves the editor caret inside `dispatch`.
+        let _ = shell.update(Message::FindQueryChanged("two".into()));
+        let s = shell.status();
+        assert_eq!(
+            s.selection, 3,
+            "the revealed selection shows in the readout"
+        );
+        assert_eq!(
+            (s.line, s.column),
+            (2, 4),
+            "the caret readout sits at the end of the revealed match"
+        );
+    }
+
+    #[test]
+    fn readouts_follow_language_and_encoding_changes() {
+        let (mut shell, _) = Shell::new();
+        assert_eq!(shell.status().language, "Plain Text");
+        assert_eq!(shell.status().encoding, "UTF-8");
+        let _ = shell.update(Message::SetLanguage("Python".to_string()));
+        assert_eq!(
+            shell.status().language,
+            "Python",
+            "a language change refreshes the readout"
+        );
+        let _ = shell.update(Message::SetEncoding("UTF-16 LE".to_string()));
+        assert_eq!(
+            shell.status().encoding,
+            "UTF-16 LE",
+            "an encoding change refreshes the readout"
+        );
+        assert_eq!(
+            shell.status().language,
+            "Python",
+            "an encoding change keeps the rest of the readout"
+        );
     }
 
     // ---- Preferences persistence (#38) ----

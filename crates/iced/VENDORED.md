@@ -59,6 +59,7 @@ mechanical. The divergences, by area:
 | Scrollbar + scroll offset | #34 | `trait ScrollOffset` + its `impl`; `struct BarGeometry`; `fn horizontal_bar`; `fn vertical_bar`; scrollbar drawing in `draw` |
 | Line-number gutter, active-line, bracket match | #41 | `struct BracketHighlight`; `const GUTTER_PAD`; `fn gutter_width`, `fn digit_count`, `fn inset_left`, `fn faint`; the `line_numbers` / `active_line` / `bracket` fields; the `line_numbers()` / `active_line()` / `bracket_match()` builder methods + private `gutter()`; gutter/active-line/bracket drawing + gutter reservation in `layout`/`draw` |
 | Compiled-out upstream methods | #25 | the upstream `highlight()` / `class()` methods are gated on the private cfgs `notepad_extra_upstream_highlighter` / `notepad_extra_upstream_advanced` (never set) instead of the upstream `highlighter` / `advanced` Cargo features, so `cargo test --all-features` can't switch on code that references the un-linked `iced_highlighter`; the cfg names are declared in `Cargo.toml`'s `[lints.rust] check-cfg` |
+| Large-document performance | #126 | `Content::text()` is rebuilt in one editor borrow with an exact pre-size and no per-line `String` (the shell calls it on every keystroke) |
 
 The remaining differences from a pristine upstream file are cosmetic (import
 grouping, `rustfmt`) and the ordinary 0.14.0 → 0.14.2 patch drift.

@@ -677,19 +677,54 @@ where
     }
 
     /// Returns the text of the [`Content`].
+    // NOTEPAD-EXTRA(#126): one editor borrow, exact pre-size, no per-line `String`.
     pub fn text(&self) -> String {
-        let mut contents = String::new();
-        let mut lines = self.lines().peekable();
+        // The shell calls this on *every keystroke* (`Message::Edit` →
+        // `core::Message::Edited(text)`), so it must scale with the document
+        // gracefully. Upstream builds the text through `lines()` → `line()`, and
+        // `line()` has to hand back an *owned* copy of each line (the `RefCell`
+        // borrow cannot escape it), so a 200k-line buffer cost 200k temporary
+        // `String`s plus 200k `RefCell` borrows per keystroke. Instead: borrow
+        // the editor once, size the output exactly from the lines' byte lengths
+        // and their separators, then append each line's *borrowed* text (the
+        // concrete editor returns `Cow::Borrowed`) straight into it — two cheap
+        // passes over `line_count()` and a single allocation.
+        //
+        // The separator rule is upstream's, unchanged: a line is followed by its
+        // own ending, except that a `None` ending *between* two lines is written
+        // as the default (`\n`); the last line gets none.
+        let internal = self.0.borrow();
+        let editor = &internal.editor;
+        let count = editor.line_count();
+        let separator = |ending: LineEnding| -> &'static str {
+            if ending == LineEnding::None {
+                LineEnding::default().as_str()
+            } else {
+                ending.as_str()
+            }
+        };
 
-        while let Some(line) = lines.next() {
+        let capacity = (0..count)
+            .map_while(|i| editor.line(i))
+            .enumerate()
+            .map(|(i, line)| {
+                line.text.len()
+                    + if i + 1 < count {
+                        separator(line.ending).len()
+                    } else {
+                        0
+                    }
+            })
+            .sum();
+
+        let mut contents = String::with_capacity(capacity);
+        for i in 0..count {
+            let Some(line) = editor.line(i) else {
+                break;
+            };
             contents.push_str(&line.text);
-
-            if lines.peek().is_some() {
-                contents.push_str(if line.ending == LineEnding::None {
-                    LineEnding::default().as_str()
-                } else {
-                    line.ending.as_str()
-                });
+            if i + 1 < count {
+                contents.push_str(separator(line.ending));
             }
         }
 
@@ -2269,6 +2304,7 @@ mod tests {
                 79,
                 "fn inset_left(rect: Rectangle, gutter: f32) -> Rectangle {",
             ),
+            (126, "    pub fn text(&self) -> String {"),
         ];
         for &(issue, anchor) in anchors {
             let idx = lines
@@ -2293,9 +2329,9 @@ mod tests {
         let issues: std::collections::BTreeSet<u32> =
             SOURCE.lines().filter_map(marker_issue).collect();
         // The divergences catalogued in VENDORED.md: find-match highlighting while
-        // unfocused (#33), scrollbar (#34), editor niceties (#41), and the
-        // geometry extraction (#79).
-        for expected in [33u32, 34, 41, 79] {
+        // unfocused (#33), scrollbar (#34), editor niceties (#41), the geometry
+        // extraction (#79) and the large-document performance work (#126).
+        for expected in [33u32, 34, 41, 79, 126] {
             assert!(
                 issues.contains(&expected),
                 "no NOTEPAD-EXTRA(#{expected}) marker remains — a documented divergence lost its tag",
@@ -2363,6 +2399,89 @@ mod tests {
             selection.ends_with('X'),
             "the trailing edit survives the copy"
         );
+
+        // `text()` is what the shell hands the core on every keystroke (#126): it
+        // must reproduce the whole edited buffer byte-for-byte, and do so in a
+        // single pass. The wall-clock bound is deliberately loose (the real cost
+        // is well under a millisecond here) — it is a coarse pin against a
+        // regression back to per-line allocation or anything super-linear, not a
+        // benchmark.
+        let started = Instant::now();
+        let round_trip = content.text();
+        let elapsed = started.elapsed();
+        assert_eq!(
+            round_trip,
+            format!("{text}X"),
+            "text() round-trips the buffer"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "text() on 8k lines took {elapsed:?}; it should be a single cheap pass"
+        );
+    }
+
+    // --- `Content::text()` round-trip (#126) ---
+
+    /// `text()` reproduces the exact text the buffer was built from, for every
+    /// line-ending flavour cosmic-text recognises (`\n`, `\r\n`, `\r`, `\n\r`) and
+    /// for the empty / no-trailing-newline / trailing-newline shapes. The shell
+    /// feeds this string to the core on every keystroke, so any drift would
+    /// silently corrupt the document.
+    #[test]
+    fn text_round_trips_every_line_ending_shape() {
+        for input in [
+            "",
+            "one line",
+            "trailing newline\n",
+            "two\nlines",
+            "two\nlines\n",
+            "crlf\r\nlines\r\n",
+            "mixed\r\nendings\nhere\rand\n\rthere",
+            "\n",
+            "\r\n",
+            "\r\n\r\n",
+            "blank\n\nlines\n\n",
+            "unicode ✓ 🙂\r\nsecond ✓",
+        ] {
+            let content = Content::<iced::Renderer>::with_text(input);
+            assert_eq!(content.text(), input, "round-trip of {input:?}");
+            // `Clone` is implemented through `text()`, so it must round-trip too.
+            assert_eq!(content.clone().text(), input, "clone of {input:?}");
+        }
+    }
+
+    /// The fast `text()` agrees with upstream's formulation — join `lines()` with
+    /// each line's ending, writing a `None` ending between lines as `\n` — both on
+    /// a freshly opened buffer and after edits that split and extend lines.
+    #[test]
+    fn text_matches_the_upstream_lines_formulation_after_edits() {
+        fn upstream(content: &Content<iced::Renderer>) -> String {
+            let mut out = String::new();
+            let mut lines = content.lines().peekable();
+            while let Some(line) = lines.next() {
+                out.push_str(&line.text);
+                if lines.peek().is_some() {
+                    out.push_str(if line.ending == LineEnding::None {
+                        LineEnding::default().as_str()
+                    } else {
+                        line.ending.as_str()
+                    });
+                }
+            }
+            out
+        }
+
+        let mut content = Content::<iced::Renderer>::with_text("alpha\r\nbeta");
+        assert_eq!(content.text(), upstream(&content));
+
+        content.perform(Action::Move(Motion::DocumentEnd));
+        content.perform(Action::Edit(Edit::Enter));
+        content.perform(Action::Edit(Edit::Insert('x')));
+        content.perform(Action::Move(Motion::DocumentStart));
+        content.perform(Action::Edit(Edit::Enter));
+        assert_eq!(content.text(), upstream(&content));
+        assert!(content.text().ends_with("beta\nx"), "{:?}", content.text());
+        assert_eq!(content.line_count(), 4);
     }
 
     /// A single very long line (no newlines) opens, edits, and stays one line.

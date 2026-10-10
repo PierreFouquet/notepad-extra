@@ -794,6 +794,21 @@ struct LargeFileScan {
     cr_joined: bool,
 }
 
+/// Which editor buffer [`Shell::apply_core`] rebuilds from the core's text
+/// after a message (#143). Most messages leave the text where the editor put
+/// it; a few rewrite one document's text in the core, and that document's
+/// buffer, not "whichever tab is active", is the one to rebuild.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Resync {
+    /// Nothing to rebuild: the text came from the editor, or did not change.
+    No,
+    /// The active document, which the message itself rewrote or just opened.
+    Active,
+    /// This document: a reload or reopen, whose file read may finish after the
+    /// user has switched to another tab.
+    Doc(TabId),
+}
+
 /// A document whose Save is waiting on the stale-save overwrite prompt (#51): the
 /// file changed on disk since we loaded/saved it, so the core raised
 /// [`Effect::ConfirmOverwrite`] rather than clobbering the newer copy. Rendered as
@@ -1292,20 +1307,20 @@ impl Shell {
 
     fn dispatch(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::NewTab => self.apply_core(core::Message::NewTab, true),
-            Message::Open => self.apply_core(core::Message::OpenRequested, false),
-            Message::Save => self.apply_core(core::Message::SaveRequested, false),
+            Message::NewTab => self.apply_core(core::Message::NewTab, Resync::Active),
+            Message::Open => self.apply_core(core::Message::OpenRequested, Resync::No),
+            Message::Save => self.apply_core(core::Message::SaveRequested, Resync::No),
             Message::SaveAs => {
                 // A Save-As writes to a freshly-picked path, so any pending
                 // stale-save overwrite prompt for the old file is moot (#51).
                 self.confirm_overwrite = None;
-                self.apply_core(core::Message::SaveAsRequested, false)
+                self.apply_core(core::Message::SaveAsRequested, Resync::No)
             }
             // Undo/redo rewrite the buffer in the core, so resync the editor from
             // it. Reached from the toolbar and the Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y
             // accelerators (#39).
-            Message::Undo => self.apply_core(core::Message::Undo, true),
-            Message::Redo => self.apply_core(core::Message::Redo, true),
+            Message::Undo => self.apply_core(core::Message::Undo, Resync::Active),
+            Message::Redo => self.apply_core(core::Message::Redo, Resync::Active),
             // resync=false: the per-tab cache already holds this tab's buffer, so
             // selecting it shows that tab's own caret and scroll instead of
             // rebuilding at the top — the crux of #94. (A first-ever selection of
@@ -1315,19 +1330,21 @@ impl Shell {
                 // Selecting a tab (including from the overflow menu) dismisses that
                 // menu — the chosen tab is now active and kept inline (#70).
                 self.tabs_menu_open = false;
-                self.apply_core(core::Message::TabSelected(i), false)
+                self.apply_core(core::Message::TabSelected(i), Resync::No)
             }
             // resync=false: closing a clean tab (or a save-then-close) changes the
             // active document, which `apply_core` detects and resyncs on its own;
             // a *dirty* tab only yields a `ConfirmClose`, so the editor must be
             // left untouched (no caret jump) until the user answers.
-            Message::TabClosed(i) => self.apply_core(core::Message::TabClosed(i), false),
+            Message::TabClosed(i) => self.apply_core(core::Message::TabClosed(i), Resync::No),
             Message::CloseChoiceMade { id, choice } => {
                 self.confirm_close = None;
                 match choice {
-                    CloseChoice::Save => self.apply_core(core::Message::TabCloseSave(id), false),
+                    CloseChoice::Save => {
+                        self.apply_core(core::Message::TabCloseSave(id), Resync::No)
+                    }
                     CloseChoice::Discard => {
-                        self.apply_core(core::Message::TabCloseDiscard(id), false)
+                        self.apply_core(core::Message::TabCloseDiscard(id), Resync::No)
                     }
                     CloseChoice::Cancel => Task::none(),
                 }
@@ -1336,12 +1353,14 @@ impl Shell {
             // Quit / window-close guard (#69). The request routes through the core,
             // which either exits at once (nothing dirty) or raises `ConfirmQuit` for
             // the shell to show the quit-all bar; the answer maps back to the core.
-            Message::QuitRequested => self.apply_core(core::Message::QuitRequested, false),
+            Message::QuitRequested => self.apply_core(core::Message::QuitRequested, Resync::No),
             Message::QuitChoiceMade(choice) => {
                 self.confirm_quit = None;
                 match choice {
-                    QuitChoice::SaveAll => self.apply_core(core::Message::QuitSaveAll, false),
-                    QuitChoice::DiscardAll => self.apply_core(core::Message::QuitDiscardAll, false),
+                    QuitChoice::SaveAll => self.apply_core(core::Message::QuitSaveAll, Resync::No),
+                    QuitChoice::DiscardAll => {
+                        self.apply_core(core::Message::QuitDiscardAll, Resync::No)
+                    }
                     QuitChoice::Cancel => Task::none(),
                 }
             }
@@ -1358,7 +1377,7 @@ impl Shell {
                     self.error = None;
                     let text = self.active_editor().text();
                     // The editor owns the text now — don't clobber it by resyncing.
-                    self.apply_core(core::Message::Edited(text), false)
+                    self.apply_core(core::Message::Edited(text), Resync::No)
                 } else {
                     Task::none()
                 }
@@ -1428,7 +1447,7 @@ impl Shell {
                             encoding,
                             disk,
                         },
-                        true,
+                        Resync::Active,
                     )
                 }
                 Err(e) => {
@@ -1449,7 +1468,7 @@ impl Shell {
                         encoding: pending.encoding,
                         disk: pending.disk,
                     },
-                    true,
+                    Resync::Active,
                 ),
                 None => Task::none(),
             },
@@ -1485,7 +1504,7 @@ impl Shell {
                                     encoding,
                                     disk,
                                 },
-                                true,
+                                Resync::Doc(id),
                             )
                         }
                         Err(e) => {
@@ -1522,7 +1541,7 @@ impl Shell {
                             encoding,
                             disk,
                         },
-                        true,
+                        Resync::Doc(id),
                     )
                 }
                 Err(e) => {
@@ -1534,11 +1553,11 @@ impl Shell {
             Message::SavePicked {
                 id,
                 path: Some(path),
-            } => self.apply_core(core::Message::SavePathChosen { id, path }, false),
+            } => self.apply_core(core::Message::SavePathChosen { id, path }, Resync::No),
             // A cancelled save picker: tell the core so any "save before closing"
             // is dropped rather than left to fire on a later, unrelated save (#31).
             Message::SavePicked { id, path: None } => {
-                self.apply_core(core::Message::SaveAbandoned { id }, false)
+                self.apply_core(core::Message::SaveAbandoned { id }, Resync::No)
             }
 
             Message::Saved { id, path, result } => match result {
@@ -1553,13 +1572,13 @@ impl Shell {
                             path,
                             disk: Some(disk),
                         },
-                        false,
+                        Resync::No,
                     )
                 }
                 Err(e) => {
                     self.error = Some(e);
                     // The write failed: likewise drop any pending close (#31).
-                    self.apply_core(core::Message::SaveAbandoned { id }, false)
+                    self.apply_core(core::Message::SaveAbandoned { id }, Resync::No)
                 }
             },
 
@@ -1584,9 +1603,12 @@ impl Shell {
                 for (id, baseline, path) in targets {
                     match std::fs::metadata(&path) {
                         // Gone / unreadable — report it at once (no bytes to hash).
-                        Err(_) => tasks.push(
-                            self.apply_core(core::Message::DiskChanged { id, meta: None }, false),
-                        ),
+                        Err(_) => {
+                            tasks.push(self.apply_core(
+                                core::Message::DiskChanged { id, meta: None },
+                                Resync::No,
+                            ))
+                        }
                         Ok(md) => {
                             let len = md.len();
                             let modified = md.modified().ok();
@@ -1613,24 +1635,25 @@ impl Shell {
                 Task::batch(tasks)
             }
             Message::DiskChangeObserved { id, meta } => {
-                self.apply_core(core::Message::DiskChanged { id, meta }, false)
+                self.apply_core(core::Message::DiskChanged { id, meta }, Resync::No)
             }
             // The disk-changed bar's "Reload" (discard my edits, take the disk copy).
             Message::ReloadChangedFile => {
                 let id = self.core.active_doc().id;
-                self.apply_core(core::Message::ReloadFromDisk { id }, false)
+                self.apply_core(core::Message::ReloadFromDisk { id }, Resync::No)
             }
             // The disk-changed bar's "Keep mine" / "Keep in editor" (dismiss, adopt
             // the disk state as baseline, keep the buffer).
             Message::KeepMyChanges => {
                 let id = self.core.active_doc().id;
-                self.apply_core(core::Message::KeepMine { id }, false)
+                self.apply_core(core::Message::KeepMine { id }, Resync::No)
             }
             // The stale-save bar's "Overwrite" — proceed with the held-back write.
             Message::OverwriteConfirmed => match self.confirm_overwrite.take() {
-                Some(pending) => {
-                    self.apply_core(core::Message::OverwriteConfirmed { id: pending.id }, false)
-                }
+                Some(pending) => self.apply_core(
+                    core::Message::OverwriteConfirmed { id: pending.id },
+                    Resync::No,
+                ),
                 None => Task::none(),
             },
             // The stale-save bar's "Cancel" — abandon the write, touch nothing.
@@ -1749,7 +1772,7 @@ impl Shell {
             // and still having to click the box would be the same papercut.
             Message::ToggleFind => {
                 if self.core.find.open {
-                    self.apply_core(core::Message::FindClosed, false)
+                    self.apply_core(core::Message::FindClosed, Resync::No)
                 } else {
                     Task::batch([
                         self.open_find(),
@@ -1770,48 +1793,52 @@ impl Shell {
                 };
                 Task::batch([open, iced::widget::operation::focus(field.id())])
             }
-            Message::CloseFind => self.apply_core(core::Message::FindClosed, false),
+            Message::CloseFind => self.apply_core(core::Message::FindClosed, Resync::No),
             Message::FindQueryChanged(q) => {
-                self.apply_core(core::Message::FindQueryChanged(q), false)
+                self.apply_core(core::Message::FindQueryChanged(q), Resync::No)
             }
             Message::ReplaceQueryChanged(r) => {
-                self.apply_core(core::Message::ReplaceTextChanged(r), false)
+                self.apply_core(core::Message::ReplaceTextChanged(r), Resync::No)
             }
-            Message::FindNext => self.apply_core(core::Message::FindNext, false),
-            Message::FindPrev => self.apply_core(core::Message::FindPrev, false),
+            Message::FindNext => self.apply_core(core::Message::FindNext, Resync::No),
+            Message::FindPrev => self.apply_core(core::Message::FindPrev, Resync::No),
             // Replaces rewrite the buffer, so resync the editor before the core's
             // RevealRange selects the result.
-            Message::ReplaceOne => self.apply_core(core::Message::ReplaceNext, true),
-            Message::ReplaceAll => self.apply_core(core::Message::ReplaceAll, true),
+            Message::ReplaceOne => self.apply_core(core::Message::ReplaceNext, Resync::Active),
+            Message::ReplaceAll => self.apply_core(core::Message::ReplaceAll, Resync::Active),
             Message::ToggleOption(option) => {
-                self.apply_core(core::Message::FindOptionToggled(option), false)
+                self.apply_core(core::Message::FindOptionToggled(option), Resync::No)
             }
             Message::GoToInputChanged(s) => {
                 self.goto_input = s;
                 Task::none()
             }
             Message::GoToSubmit => match self.goto_input.trim().parse::<usize>() {
-                Ok(line) => self.apply_core(core::Message::GoToLine(line), false),
+                Ok(line) => self.apply_core(core::Message::GoToLine(line), Resync::No),
                 Err(_) => Task::none(), // ignore non-numeric input, never panic
             },
 
             // Zoom changes only the app-wide font size the view reads; it never
             // rewrites the buffer, so resync=false leaves the editor untouched.
-            Message::ZoomIn => self.apply_core(core::Message::ZoomIn, false),
-            Message::ZoomOut => self.apply_core(core::Message::ZoomOut, false),
-            Message::ZoomReset => self.apply_core(core::Message::ZoomReset, false),
-            Message::ToggleWordWrap => self.apply_core(core::Message::ToggleWordWrap, false),
+            Message::ZoomIn => self.apply_core(core::Message::ZoomIn, Resync::No),
+            Message::ZoomOut => self.apply_core(core::Message::ZoomOut, Resync::No),
+            Message::ZoomReset => self.apply_core(core::Message::ZoomReset, Resync::No),
+            Message::ToggleWordWrap => self.apply_core(core::Message::ToggleWordWrap, Resync::No),
             // The gutter is a view-only preference the editor reads from
             // `show_line_numbers()`; it never rewrites the buffer, so resync=false.
-            Message::ToggleLineNumbers => self.apply_core(core::Message::ToggleLineNumbers, false),
+            Message::ToggleLineNumbers => {
+                self.apply_core(core::Message::ToggleLineNumbers, Resync::No)
+            }
             // Theme is a view-only preference read from `theme()`; it never
             // rewrites the buffer, so resync=false. The editor re-highlights
             // because its highlighter `Settings.theme` changes (#36).
-            Message::ToggleTheme => self.apply_core(core::Message::ToggleTheme, false),
+            Message::ToggleTheme => self.apply_core(core::Message::ToggleTheme, Resync::No),
             Message::SetEditorFont(family) => {
-                self.apply_core(core::Message::SetEditorFont(family), false)
+                self.apply_core(core::Message::SetEditorFont(family), Resync::No)
             }
-            Message::SetUiFont(family) => self.apply_core(core::Message::SetUiFont(family), false),
+            Message::SetUiFont(family) => {
+                self.apply_core(core::Message::SetUiFont(family), Resync::No)
+            }
 
             // Language selection (#32). Map the picker label to a core choice:
             // "Auto-detect" clears the override, a group-header separator is inert,
@@ -1821,7 +1848,7 @@ impl Shell {
                     Task::none()
                 } else {
                     let choice = (label != AUTO_DETECT_LABEL).then_some(label);
-                    self.apply_core(core::Message::SetLanguage(choice), false)
+                    self.apply_core(core::Message::SetLanguage(choice), Resync::No)
                 }
             }
 
@@ -1835,7 +1862,7 @@ impl Shell {
                         op,
                         selection: self.selection_range(),
                     },
-                    true,
+                    Resync::Active,
                 ),
                 None => Task::none(),
             },
@@ -1844,12 +1871,12 @@ impl Shell {
             // save encoding, mark it dirty, and re-encode on the next Save (a lossy
             // save is blocked). The core ignores an unknown label.
             Message::SetEncoding(label) => {
-                self.apply_core(core::Message::SetEncoding(label), false)
+                self.apply_core(core::Message::SetEncoding(label), Resync::No)
             }
             // "Reopen as…" (#50): re-read the file's bytes and strictly re-decode
             // them under the chosen encoding, recovering from a wrong auto-detect.
             // The core emits `ReadFileAs` for a titled tab and ignores an untitled one.
-            Message::ReopenAs(label) => self.apply_core(core::Message::ReopenAs(label), false),
+            Message::ReopenAs(label) => self.apply_core(core::Message::ReopenAs(label), Resync::No),
 
             // The preferences write landed (#38). Its result is deliberately
             // swallowed so a failed save never disrupts editing. Clear the
@@ -1870,12 +1897,12 @@ impl Shell {
                 } else {
                     core::Message::AboutOpened
                 };
-                self.apply_core(msg, false)
+                self.apply_core(msg, Resync::No)
             }
-            Message::CloseAbout => self.apply_core(core::Message::AboutClosed, false),
+            Message::CloseAbout => self.apply_core(core::Message::AboutClosed, Resync::No),
             // The core decides whether the URL is safe to open; an unsafe one
             // yields no effect, so nothing reaches the OS handler.
-            Message::OpenLink(url) => self.apply_core(core::Message::OpenUrl(url), false),
+            Message::OpenLink(url) => self.apply_core(core::Message::OpenUrl(url), Resync::No),
             // The external open finished; its result is swallowed (see the doc on
             // `Message::LinkOpened`).
             Message::LinkOpened => Task::none(),
@@ -1885,9 +1912,9 @@ impl Shell {
             // vendored editor separately unfocuses on Escape, which is harmless.
             Message::Escape => {
                 if self.core.about_open() {
-                    self.apply_core(core::Message::AboutClosed, false)
+                    self.apply_core(core::Message::AboutClosed, Resync::No)
                 } else if self.core.find.open {
-                    self.apply_core(core::Message::FindClosed, false)
+                    self.apply_core(core::Message::FindClosed, Resync::No)
                 } else {
                     Task::none()
                 }
@@ -1983,13 +2010,11 @@ impl Shell {
     }
 
     /// Feed one message through the pure core, run every [`Effect`] it returns,
-    /// and rebuild the editor buffer from the core when the active document may
-    /// have changed underneath us. `resync` is `false` for `Edited` (whose text
-    /// *came from* the editor and must not be overwritten); regardless of it, a
-    /// change of *which* document is active also forces a resync — that is how a
-    /// save-before-close that lands asynchronously (#31) moves the editor onto
-    /// the surviving tab.
-    fn apply_core(&mut self, msg: core::Message, resync: bool) -> Task<Message> {
+    /// and rebuild an editor buffer from the core when the message rewrote that
+    /// document's text underneath it. `resync` names which buffer (see
+    /// [`Resync`]): [`Resync::No`] for `Edited`, whose text *came from* the
+    /// editor and must not be overwritten.
+    fn apply_core(&mut self, msg: core::Message, resync: Resync) -> Task<Message> {
         let effects = core::update(&mut self.core, msg);
         self.sync_editor_cache(resync);
         self.refresh_watched();
@@ -2021,17 +2046,20 @@ impl Shell {
     ///    that already owns a buffer keeps it, caret and scroll intact: that is
     ///    the whole point of the cache, and why a plain tab switch passes
     ///    `resync = false`.
-    /// 3. **Rebuild** *only the active* buffer when `resync` is set, i.e. when
-    ///    the core rewrote that document's text out from under the editor
-    ///    (undo/redo, replace, load). `resync` is `false` for `Edited`, whose
-    ///    text *came from* the editor and must not be clobbered.
+    /// 3. **Rebuild** the one buffer `resync` names, the document whose text the
+    ///    core rewrote out from under the editor (undo/redo, replace, load,
+    ///    reload). That is the active tab's buffer for most messages, but a
+    ///    reload or reopen names its own document: its file read can finish
+    ///    after the user has switched tabs, and rebuilding the active buffer
+    ///    instead left the reloaded tab showing stale text (#143). `Edited`
+    ///    passes [`Resync::No`]: its text *came from* the editor.
     ///
     /// Note there is no longer an "active document changed → rebuild" branch: a
     /// changed active document that already owns a buffer is deliberately left
     /// untouched, so a save-before-close (#31) that moves onto the surviving tab
     /// — like any tab switch — restores that tab's remembered caret rather than
     /// jumping to the top.
-    fn sync_editor_cache(&mut self, resync: bool) {
+    fn sync_editor_cache(&mut self, resync: Resync) {
         // Fast path (#126): the cache already holds exactly the live documents —
         // the same count, and every document's id present (ids are unique, so
         // that is a bijection) — which is every update but a tab open or close.
@@ -2057,9 +2085,14 @@ impl Shell {
             }
         }
 
-        // 3. Rebuild only the active buffer when the core rewrote its text.
-        if resync {
-            let doc = self.core.active_doc();
+        // 3. Rebuild the buffer of the document the core rewrote, if it is
+        //    still open (a reload for a tab closed meanwhile rewrites nothing).
+        let target = match resync {
+            Resync::No => None,
+            Resync::Active => Some(self.core.active_doc().id),
+            Resync::Doc(id) => Some(id),
+        };
+        if let Some(doc) = target.and_then(|id| self.core.docs.iter().find(|d| d.id == id)) {
             self.editors
                 .insert(doc.id, text_editor::Content::with_text(doc.content()));
         }
@@ -2079,7 +2112,7 @@ impl Shell {
             Some(sel) => core::Message::FindOpenedWith(sel),
             None => core::Message::FindOpened,
         };
-        self.apply_core(msg, false)
+        self.apply_core(msg, Resync::No)
     }
 
     /// Queue a preferences snapshot for persistence, serialising and coalescing
@@ -5609,6 +5642,95 @@ mod tests {
         });
         assert_eq!(shell.core.active_doc().content(), "a—b");
         assert_eq!(shell.status().encoding, "Windows-1252");
+    }
+
+    /// A reload or reopen result for tab `id`, as both async paths deliver it.
+    fn reload_result(id: TabId, bytes: &str, disk: bool) -> Message {
+        let encoding = core::FileEncoding::default();
+        let result = Ok(bytes.as_bytes().to_vec());
+        if disk {
+            Message::DiskReloaded {
+                id,
+                encoding,
+                result,
+            }
+        } else {
+            Message::FileReloaded {
+                id,
+                encoding,
+                result,
+            }
+        }
+    }
+
+    #[test]
+    fn a_reload_that_lands_after_a_tab_switch_rebuilds_the_reloaded_tabs_buffer() {
+        // #143: the read behind Reload-after-external-change (#51) or
+        // Reopen-with-encoding (#50) can finish after the user switched tabs.
+        // The core rewrote the reloaded tab A, but the shell rebuilt the active
+        // tab B's buffer: B's caret jumped to the top, A kept its old text, and
+        // the first keystroke in A sent that old text to the core, silently
+        // undoing the reload.
+        for disk in [true, false] {
+            let (mut shell, _) = Shell::new();
+            let _ = shell.update(Message::FileRead {
+                path: PathBuf::from("/tmp/a.txt"),
+                result: Ok(b"old a".to_vec()),
+            });
+            let a = shell.core.active_doc().id;
+            let _ = shell.update(Message::NewTab);
+            let _ = shell.update(Message::Edit(paste("bbb\nccc")));
+            let b_caret = shell.active_editor().cursor().position;
+            assert_eq!((b_caret.line, b_caret.column), (1, 3));
+
+            let _ = shell.update(reload_result(a, "new a", disk));
+            assert_eq!(shell.core.docs[0].content(), "new a", "disk = {disk}");
+            let b_after = shell.active_editor().cursor().position;
+            assert_eq!(
+                (b_after.line, b_after.column),
+                (1, 3),
+                "the active tab B is left alone (disk = {disk})"
+            );
+            assert_eq!(shell.active_editor().text(), "bbb\nccc");
+
+            let _ = shell.update(Message::TabSelected(0));
+            assert_eq!(shell.active_editor().text(), "new a", "disk = {disk}");
+            let _ = shell.update(Message::Edit(paste("!")));
+            assert_eq!(
+                shell.core.active_doc().content(),
+                "!new a",
+                "typing in A keeps the reload (disk = {disk})"
+            );
+            assert_eq!(shell.core.active_doc().id, a);
+        }
+    }
+
+    #[test]
+    fn a_reload_for_a_tab_closed_meanwhile_touches_no_buffer() {
+        // The reloaded tab was closed before its read finished: the core
+        // ignores the result, and no buffer is rebuilt in its place.
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::FileRead {
+            path: PathBuf::from("/tmp/a.txt"),
+            result: Ok(b"a".to_vec()),
+        });
+        let a = shell.core.active_doc().id;
+        let _ = shell.update(Message::NewTab);
+        let _ = shell.update(Message::Edit(paste("b")));
+        let _ = shell.update(Message::TabClosed(0));
+        assert_eq!(shell.core.docs.len(), 1);
+        let caret = shell.active_editor().cursor().position;
+        assert_eq!((caret.line, caret.column), (0, 1));
+        let _ = shell.update(reload_result(a, "late", true));
+        assert_eq!(shell.core.docs.len(), 1);
+        assert_eq!(shell.active_editor().text(), "b");
+        let after = shell.active_editor().cursor().position;
+        assert_eq!(
+            (after.line, after.column),
+            (0, 1),
+            "the surviving tab's buffer was not rebuilt"
+        );
+        assert_eq!(shell.editors.len(), 1, "no buffer for the closed tab");
     }
 
     #[test]

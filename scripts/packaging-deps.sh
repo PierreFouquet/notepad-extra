@@ -54,17 +54,27 @@ RPM_OUT="$DEPS_DIR/rpm-bundled-provides.txt"
 
 command -v jq >/dev/null || { echo "error: jq is required" >&2; exit 2; }
 
-# All external crates.io packages as sorted "name<TAB>version", offline.
+# External packages as sorted "name<TAB>version<TAB>patched", offline (patched
+# is 1 for a vendor/ copy, 0 otherwise; the list renderers read only the first
+# two columns): every crates.io
+# package and, with `--with-vendored`, the patched copies under vendor/ that the
+# root manifest's [patch.crates-io] puts in place of a crates.io release (#149).
+# Those ship in this source tree, so the Gentoo download list leaves them out.
+# They are still compiled into the binary, so the RPM `bundled(crate(...))`
+# provides and the Debian gap report keep them.
 crate_rows() {
-  local offline=(--offline)
+  local offline=(--offline) vendored=false
   [ -n "${PACKAGING_DEPS_ONLINE:-}" ] && offline=()
+  [ "${1:-}" = --with-vendored ] && vendored=true
   cargo metadata --format-version 1 "${offline[@]}" --filter-platform "$TARGET" \
-    | jq -r '
+    | jq -r --argjson vendored "$vendored" '
         (.workspace_members) as $ws
         | .packages[]
         | select(.id as $id | ($ws | index($id)) | not)
-        | select((.source // "") | test("registry.*crates.io"))
-        | "\(.name)\t\(.version)"' \
+        | select(((.source // "") | test("registry.*crates.io"))
+                 or ($vendored and .source == null
+                     and (.manifest_path | test("/vendor/[^/]+/Cargo\\.toml$"))))
+        | "\(.name)\t\(.version)\t\(if .source == null then 1 else 0 end)"' \
     | sort -u
 }
 
@@ -81,7 +91,7 @@ render_gentoo() {
 
 render_rpm() {
   gen_header "Fedora/openSUSE bundled-crate Provides (#8/#12) for the .spec %files-adjacent block."
-  crate_rows | awk -F'\t' '{printf "Provides: bundled(crate(%s)) = %s\n", $1, $2}'
+  crate_rows --with-vendored | awk -F'\t' '{printf "Provides: bundled(crate(%s)) = %s\n", $1, $2}'
 }
 
 do_vendor() {
@@ -102,17 +112,28 @@ do_debian_gap() {
   echo "# Debian packages a crate as source package 'rust-<crate>' (binary"
   echo "# 'librust-<crate>-dev'); vendoring is discouraged, so every MISSING crate"
   echo "# below must be packaged via debcargo / the Debian Rust team before #7."
-  local present=0 missing=0
-  while IFS=$'\t' read -r name version; do
+  echo "# PATCHED crates are built from a vendor/ copy carrying an upstream fix"
+  echo "# (#149): Debian's package must carry the same vendor/<crate>/notepad-extra.patch"
+  echo "# before the build can unbundle it, whether or not the package exists."
+  local present=0 missing=0 patched=0
+  while IFS=$'\t' read -r name version vendored; do
     # Debian source names lowercase the crate and map '_' -> '-'.
     local deb; deb="rust-$(printf '%s' "$name" | tr 'A-Z_' 'a-z-')"
+    if [ "$vendored" = 1 ]; then
+      local state=missing
+      curl -fsS "https://sources.debian.org/api/src/$deb/" >/dev/null 2>&1 && state=present
+      printf 'PATCHED  %s %s (%s %s; needs vendor/%s/notepad-extra.patch)\n' \
+        "$name" "$version" "$deb" "$state" "$name"
+      patched=$((patched+1))
+      continue
+    fi
     if curl -fsS "https://sources.debian.org/api/src/$deb/" >/dev/null 2>&1; then
       printf 'PRESENT  %s %s (%s)\n' "$name" "$version" "$deb"; present=$((present+1))
     else
       printf 'MISSING  %s %s (%s)\n' "$name" "$version" "$deb"; missing=$((missing+1))
     fi
-  done < <(crate_rows)
-  echo "# Summary: $present present, $missing to package." >&2
+  done < <(crate_rows --with-vendored)
+  echo "# Summary: $present present, $missing to package, $patched patched." >&2
 }
 
 check_one() {  # $1 = file, $2 = renderer fn

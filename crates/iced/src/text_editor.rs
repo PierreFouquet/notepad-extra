@@ -2859,4 +2859,179 @@ mod tests {
         assert_eq!(selection.len(), 250_001, "every character round-trips");
         assert!(selection.ends_with('Z'));
     }
+
+    // --- Mixed-direction bidi paragraphs on one buffer line (#149) ---
+
+    /// "shalom": four strong right-to-left letters.
+    const HEB: &str = "\u{5e9}\u{5dc}\u{5d5}\u{5dd}";
+
+    /// Single buffer lines that hold bidi paragraphs of different directions,
+    /// each with the direction of its first paragraph. cosmic-text breaks buffer
+    /// lines only at `\r` and `\n`, but unicode-bidi starts a paragraph after any
+    /// class-B character (U+2029, U+0085, U+001C-U+001E). cosmic-text 0.15.0
+    /// asserted that a line's paragraphs all share one direction, so every line
+    /// here panicked the widget. The panic also poisoned iced's shared font
+    /// system. The patched `vendor/cosmic-text` (upstream 1e0074c) lays the whole
+    /// line out in its first paragraph's direction instead.
+    fn mixed_direction_lines() -> Vec<(&'static str, String, bool)> {
+        vec![
+            ("LTR PS RTL", format!("abc\u{2029}{HEB}"), false),
+            ("RTL PS LTR", format!("{HEB}\u{2029}abc"), true),
+            ("PS RTL", format!("\u{2029}{HEB}"), false),
+            ("RTL PS PS", format!("{HEB}\u{2029}\u{2029}"), true),
+            ("RTL PS digits", format!("{HEB}\u{2029}123"), true),
+            ("RTL PS space", format!("{HEB}\u{2029} "), true),
+            ("LTR NEL RTL", format!("abc\u{85}{HEB}"), false),
+            ("LTR FS RTL", format!("abc\u{1c}{HEB}"), false),
+            ("LTR GS RTL", format!("abc\u{1d}{HEB}"), false),
+            ("LTR RS RTL", format!("abc\u{1e}{HEB}"), false),
+            (
+                "LTR PS Arabic",
+                "abc\u{2029}\u{645}\u{631}\u{62d}\u{628}\u{627}".to_string(),
+                false,
+            ),
+            ("RLM PS PS", "\u{200f}\u{2029}\u{2029}".to_string(), true),
+            (
+                "RTL PS isolated RTL",
+                format!("{HEB}\u{2029}\u{2067}{HEB}\u{2069}"),
+                true,
+            ),
+        ]
+    }
+
+    /// The strong runs of `line` as byte ranges, each with whether it reads
+    /// right to left: maximal stretches of Hebrew or Arabic letters (right to
+    /// left) or of ASCII letters and digits (left to right). Enough for the
+    /// lines above; other characters end a run.
+    fn strong_runs(line: &str) -> Vec<(ops::Range<usize>, bool)> {
+        let class = |c: char| match c {
+            '\u{590}'..='\u{6ff}' => Some(true),
+            c if c.is_ascii_alphanumeric() => Some(false),
+            _ => None,
+        };
+        let mut runs: Vec<(ops::Range<usize>, bool)> = Vec::new();
+        let mut open = false;
+        for (i, c) in line.char_indices() {
+            let end = i + c.len_utf8();
+            match (class(c), runs.last_mut()) {
+                (Some(rtl), Some((range, last))) if open && *last == rtl => range.end = end,
+                (Some(rtl), _) => runs.push((i..end, rtl)),
+                (None, _) => {}
+            }
+            open = class(c).is_some();
+        }
+        runs
+    }
+
+    #[test]
+    fn a_line_of_mixed_direction_bidi_paragraphs_shapes_and_every_run_reads_its_own_way() {
+        // Straight through cosmic-text with a private font system, so a regression
+        // fails here without poisoning the font system the other tests share.
+        //
+        // Upstream 1e0074c builds every paragraph's spans with the line's (first
+        // paragraph's) direction. The visible result: in the laid-out line each
+        // strong run still reads in its own direction, Hebrew and Arabic right
+        // to left and Latin and digits left to right, in a line of either base
+        // direction. Removing the assert but building each paragraph with its
+        // own direction instead reverses the second paragraph's runs, so this
+        // checks the glyphs' left-to-right order, not just that nothing
+        // panicked. That runs under Advanced shaping, the mode the editor uses;
+        // Basic shaping does no bidi reordering, so for it only the panic and
+        // the line direction are checked.
+        use iced_graphics::text::cosmic_text as ct;
+        let mut font_system = ct::FontSystem::new();
+        let attrs = ct::AttrsList::new(&ct::Attrs::new());
+        for (label, line, rtl) in mixed_direction_lines() {
+            for shaping in [ct::Shaping::Advanced, ct::Shaping::Basic] {
+                let shaped = ct::ShapeLine::new(&mut font_system, &line, &attrs, shaping, 8);
+                assert_eq!(shaped.rtl, rtl, "{label} ({shaping:?})");
+            }
+
+            let shaped =
+                ct::ShapeLine::new(&mut font_system, &line, &attrs, ct::Shaping::Advanced, 8);
+            let mut glyphs: Vec<(f32, usize)> = shaped
+                .layout(14.0, None, ct::Wrap::None, None, None)
+                .iter()
+                .flat_map(|run| run.glyphs.iter().map(|g| (g.x, g.start)))
+                .collect();
+            glyphs.sort_by(|a, b| a.0.total_cmp(&b.0));
+            for (range, run_rtl) in strong_runs(&line) {
+                let shown: Vec<usize> = glyphs
+                    .iter()
+                    .map(|&(_, start)| start)
+                    .filter(|start| range.contains(start))
+                    .collect();
+                let mut reading = shown.clone();
+                reading.sort_unstable();
+                if run_rtl {
+                    reading.reverse();
+                }
+                assert_eq!(
+                    shown,
+                    reading,
+                    "{label}: the run at {range:?} must read {} on screen",
+                    if run_rtl {
+                        "right to left"
+                    } else {
+                        "left to right"
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_direction_paragraph_lines_open_lay_out_draw_and_round_trip() {
+        // The open path: the shell builds a `Content` from the core's text, the
+        // widget lays it out and draws it, and every later edit hands the core
+        // `text()`, which must be the exact bytes (#149).
+        // Both wrap modes: the app starts with wrapping off, where `layout()`
+        // takes the no-wrap width ratchet and its right-to-left fallback.
+        for (label, line, _) in mixed_direction_lines() {
+            for wrapping in [Wrapping::None, Wrapping::Word] {
+                let document = format!("first line\n{line}\nlast line");
+                let content = Content::<iced::Renderer>::with_text(&document);
+                let element: Element<'_, (), iced::Theme, iced::Renderer> = text_editor(&content)
+                    .wrapping(wrapping)
+                    .height(Length::Fill)
+                    .into();
+                let mut ui = iced_test::simulator(element);
+                let _ = ui
+                    .snapshot(&iced::Theme::Light)
+                    .unwrap_or_else(|e| panic!("{label} ({wrapping:?}): {e:?}"));
+                drop(ui);
+                assert_eq!(content.text(), document, "{label} ({wrapping:?})");
+            }
+        }
+    }
+
+    #[test]
+    fn pasting_or_inserting_a_paragraph_separator_before_rtl_text_lays_out() {
+        // The edit actions (#149): the edit itself only changes the buffer; the
+        // shaping, which used to panic, happens at the next layout. Typing
+        // through the widget's key handler is covered by the shell's
+        // `typing_a_paragraph_separator_then_hebrew_lays_out` Simulator test.
+        let lay_out = |content: &Content<iced::Renderer>| {
+            let element: Element<'_, (), iced::Theme, iced::Renderer> =
+                text_editor(content).height(Length::Fill).into();
+            let _ui = iced_test::simulator(element);
+        };
+
+        let mut pasted = Content::<iced::Renderer>::with_text("abc");
+        lay_out(&pasted);
+        pasted.perform(Action::Move(Motion::DocumentEnd));
+        pasted.perform(Action::Edit(Edit::Paste(Arc::new(format!(
+            "\u{2029}{HEB}"
+        )))));
+        lay_out(&pasted);
+        assert_eq!(pasted.text(), format!("abc\u{2029}{HEB}"));
+
+        let mut typed = Content::<iced::Renderer>::with_text("abc");
+        typed.perform(Action::Move(Motion::DocumentEnd));
+        typed.perform(Action::Edit(Edit::Insert('\u{2029}')));
+        lay_out(&typed);
+        typed.perform(Action::Edit(Edit::Insert('\u{5e9}')));
+        lay_out(&typed);
+        assert_eq!(typed.text(), "abc\u{2029}\u{5e9}");
+    }
 }

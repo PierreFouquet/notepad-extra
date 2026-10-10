@@ -1,0 +1,8 @@
+# The crates.io release this copy was made from (#149). scripts/vendored-crates.sh
+# downloads it, checks this sha256 (the checksum Cargo.lock carried before the
+# crate was patched in), applies notepad-extra.patch and compares the result with
+# this directory. Flat `key = "value"` lines only, so the script can read them
+# without a TOML parser.
+crate = "cosmic-text"
+version = "0.15.0"
+sha256 = "173852283a9a57a3cbe365d86e74dc428a09c50421477d5ad6fe9d9509e37737"

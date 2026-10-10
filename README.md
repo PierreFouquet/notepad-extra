@@ -166,11 +166,12 @@ Cargo.toml               # Cargo workspace root (virtual manifest — shared ver
 crates/syntax/           # Shared syntect-backed language catalogue
 crates/core/             # Pure update core (State / Message / Effect) — no window, no GPU
 crates/iced/             # Thin iced render shell — builds the `notepad-extra` binary
+vendor/cosmic-text/      # cosmic-text 0.15.0 + an unreleased upstream fix, via [patch.crates-io] (#149)
 packaging/               # Native packaging scripts + Linux desktop/metainfo/man assets
 icons/                   # Application icons (all platforms)
 docs/testing.md          # Test standard
 docs/native-rendering.md # Render-shell drawing notes & traps
-scripts/                 # Helper scripts (coverage gate)
+scripts/                 # Helper scripts (coverage gate, licence / packaging / vendored-crate checks)
 ```
 
 ## License
@@ -179,6 +180,7 @@ Licensed under the GPL-3.0-or-later License — see [LICENSE](LICENSE) for detai
 
 The combined work includes a small amount of vendored third-party code and one
 bundled font under GPL-compatible permissive licenses — notably the iced
-`text_editor` widget (MIT) and DejaVu Sans Mono (Bitstream Vera derivative).
+`text_editor` widget (MIT), a patched copy of the cosmic-text crate (MIT OR
+Apache-2.0) and DejaVu Sans Mono (Bitstream Vera derivative).
 [THIRD-PARTY.md](THIRD-PARTY.md) is the canonical record of what is vendored,
 from where, and under which license.

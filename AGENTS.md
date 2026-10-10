@@ -16,7 +16,8 @@ Companion documents, each authoritative for its area: [`README.md`](README.md)
 (build, run, release), [`docs/testing.md`](docs/testing.md) (test standard),
 [`docs/native-rendering.md`](docs/native-rendering.md) (drawing traps in the
 render shell), [`crates/iced/VENDORED.md`](crates/iced/VENDORED.md) (the forked
-`text_editor` widget), [`.github/pull_request_template.md`](.github/pull_request_template.md)
+`text_editor` widget), [`vendor/cosmic-text/VENDORED.md`](vendor/cosmic-text/VENDORED.md)
+(the patched cosmic-text crate), [`.github/pull_request_template.md`](.github/pull_request_template.md)
 (what a PR must declare).
 
 ## 1. Non-negotiables
@@ -307,6 +308,8 @@ cargo check --locked --manifest-path crates/core/fuzz/Cargo.toml   # fuzz target
 LICENSE_AUDIT_ONLINE=1 bash scripts/license-audit.sh --check       # no copyleft-only dependency; packaging/CRATE-LICENSES.md matches Cargo.lock
 PACKAGING_DEPS_ONLINE=1 bash scripts/packaging-deps.sh --check     # packaging/deps/* match Cargo.lock
 cargo audit                                   # RustSec advisories (needs cargo-audit); .cargo/audit.toml holds the assessed ignores
+bash scripts/vendored-crates.sh check         # each vendor/<crate> == its crates.io release (sha256-checked) + its notepad-extra.patch
+bash scripts/vendored-crates.sh audit         # cargo audit with vendored crates checked as the crates.io release they came from
 ```
 
 - **Coverage gate.** Every new line in `notepad-core` / `notepad-syntax` needs a
@@ -328,6 +331,23 @@ cargo audit                                   # RustSec advisories (needs cargo-
   xkbcommon libraries) must have that library named in the deb `depends` and rpm
   `requires` in `crates/iced/Cargo.toml` and in the README's Linux prerequisites;
   the packaging clean-install smokes are the check (#131 did this for `libdbus-1`).
+- **Patched crates.** Stay on the newest release of each crate that the rest of
+  the graph allows. When that release still has a bug that hits us and upstream
+  has a fix, apply upstream's commit to a copy under `vendor/<crate>/`,
+  substituted with `[patch.crates-io]` in the root `Cargo.toml`. Each copy
+  carries:
+  - a `VENDORED.md` naming the upstream commit and the condition for deleting it;
+  - `notepad-extra.patch`, the exact diff from the release;
+  - `upstream.toml`, the release's name, version and crates.io sha256;
+  - a `// NOTEPAD-EXTRA(#NN)` marker at each change.
+
+  `vendor/` is excluded from the workspace, so our fmt / clippy / test gates do
+  not run over upstream code. A patched copy has no Cargo.lock checksum and
+  `cargo audit` skips path crates, so `scripts/vendored-crates.sh` stands in for
+  both (CI runs `check` in the licence job and `audit` in `audit.yml`). A patched
+  crate drops out of the Gentoo download list but stays in the RPM bundled
+  provides, and the Debian gap report marks it PATCHED
+  (`scripts/packaging-deps.sh`). Today: `vendor/cosmic-text` (#149).
 - **Vendored widget.** Every divergence from upstream iced is marked
   `// NOTEPAD-EXTRA(#NN): reason` and listed in `crates/iced/VENDORED.md`. Tests
   in `text_editor.rs` enforce that the markers are well-formed, that one sits

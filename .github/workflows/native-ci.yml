@@ -173,3 +173,8 @@ jobs:
       # Keep the per-distro dependency lists (#8/#12/#13) in step with Cargo.lock.
       - name: packaging dependency lists freshness
         run: PACKAGING_DEPS_ONLINE=1 bash scripts/packaging-deps.sh --check
+      # A crate patched in from vendor/ has no Cargo.lock checksum. This stands in
+      # for it (#149): each copy must equal its crates.io release (sha256-checked)
+      # plus its recorded notepad-extra.patch, file for file.
+      - name: patched crates match their release plus the recorded patch
+        run: bash scripts/vendored-crates.sh check

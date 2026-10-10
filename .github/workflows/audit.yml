@@ -55,4 +55,10 @@ jobs:
       # dropped (#131 removed the two quick-xml ones once 0.39 left the tree).
       - name: cargo audit
         run: cargo audit
+      # `cargo audit` matches advisories only against crates.io packages, so a
+      # crate patched in from vendor/ would never fail it (#149). This audits a
+      # copy of Cargo.lock in which each vendored crate keeps its crates.io
+      # source, so advisories for the release it was made from still apply.
+      - name: cargo audit, patched crates as their crates.io release
+        run: bash scripts/vendored-crates.sh audit
 

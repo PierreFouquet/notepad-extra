@@ -19,6 +19,10 @@ diverges, how each divergence is marked, and how to re-sync it with a newer iced
   notice is preserved as `src/text_editor.rs`'s header comment, and the
   repo-level record for licensing review is the top-level `THIRD-PARTY.md`.
 
+The widget lays text out through cosmic-text. That crate is itself a patched
+copy while #149's fix is unreleased; see
+[`vendor/cosmic-text/VENDORED.md`](../../vendor/cosmic-text/VENDORED.md).
+
 ## Why it is vendored
 
 iced 0.14's stock `text_editor`:

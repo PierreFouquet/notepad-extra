@@ -1,8 +1,10 @@
 # Third-party code and assets vendored into this repository
 
 Notepad Extra is licensed `GPL-3.0-or-later` (see [LICENSE](LICENSE)). A small
-amount of third-party code and one font family are **vendored** — copied into
-this tree rather than pulled as a dependency. This file is the canonical record
+amount of third-party code and one font family are **vendored**: copied into
+this tree rather than fetched from crates.io when building. That includes one
+crate, cosmic-text, which is still a dependency but is built from its patched
+copy here. This file is the canonical record
 of what, from where, and under which license, for distro licensing review
 (Debian `debian/copyright`, Fedora license audit — #7 / #8 / #17 / #47).
 
@@ -45,8 +47,10 @@ metadata` by [`scripts/license-audit.sh`](scripts/license-audit.sh) — see
   applied verbatim to `src/shape.rs`. It stops a line that mixes bidi paragraph
   directions from panicking the text widgets (#149). The published manifest's
   test, bench and dev-dependency sections are dropped, and the tests, benches,
-  fonts and screenshots are not copied. Provenance, the exact diff and when to
-  drop the copy are in
+  fonts and screenshots are not copied. The exact diff from the release is
+  `vendor/cosmic-text/notepad-extra.patch`, and CI checks the copy against the
+  release plus that patch (`scripts/vendored-crates.sh check`). Provenance and
+  when to drop the copy are in
   [vendor/cosmic-text/VENDORED.md](vendor/cosmic-text/VENDORED.md).
 - **Combined-work licensing:** both licences are GPL-compatible; the crate's
   own notice governs the vendored code.

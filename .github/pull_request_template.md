@@ -48,7 +48,7 @@ The full list, with the exact commands, is `AGENTS.md` §6; run it on the newest
 - [ ] `cargo test --locked --workspace --all-targets` passes — or, for a small contained change, the affected crate(s), named here: …
 - [ ] Coverage gate holds: `bash scripts/coverage.sh` (core + syntax, aggregate & per-file ≥ 99 %), also with `PROPTEST_CASES=1`; `view`/render is smoke-tested only.
 - [ ] Fuzz crate still in step: `cargo metadata --locked --manifest-path crates/core/fuzz/Cargo.toml` and `cargo check --locked --manifest-path crates/core/fuzz/Cargo.toml` pass (lockfile regenerated if the core's dependencies changed).
-- [ ] Dependencies touched: `LICENSE_AUDIT_ONLINE=1 bash scripts/license-audit.sh --check`, `PACKAGING_DEPS_ONLINE=1 bash scripts/packaging-deps.sh --check` and `cargo audit` are clean, and any runtime-loaded library is in the deb/rpm dependency lists — or N/A.
+- [ ] Dependencies touched: `LICENSE_AUDIT_ONLINE=1 bash scripts/license-audit.sh --check`, `PACKAGING_DEPS_ONLINE=1 bash scripts/packaging-deps.sh --check` and `cargo audit` are clean (plus `bash scripts/vendored-crates.sh check` and `audit` if `vendor/` changed), and any runtime-loaded library is in the deb/rpm dependency lists — or N/A.
 - [ ] Shell touched: windowed smoke `xvfb-run -a timeout 10 ./target/debug/notepad-extra` exits 124 — or N/A.
 - [ ] Packaging metadata still validates if touched (`appstreamcli validate --no-net …`, `desktop-file-validate …`); the `packaging.yml` jobs are green on the PR.
 

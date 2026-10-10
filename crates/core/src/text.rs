@@ -175,14 +175,16 @@ mod tests {
         // The save path's whole point (#126): an LF document is handed back as
         // the very same borrow — no allocation — while CRLF must build new text.
         let text = "a\nb\n";
-        match EndOfLine::Lf.join_cow(text) {
-            Cow::Borrowed(b) => assert!(std::ptr::eq(b, text), "must borrow the input itself"),
-            Cow::Owned(_) => panic!("LF join must not allocate"),
-        }
-        match EndOfLine::Crlf.join_cow(text) {
-            Cow::Owned(s) => assert_eq!(s, "a\r\nb\r\n"),
-            Cow::Borrowed(_) => panic!("CRLF join must produce new text"),
-        }
+        let lf = EndOfLine::Lf.join_cow(text);
+        assert!(
+            matches!(lf, Cow::Borrowed(b) if std::ptr::eq(b, text)),
+            "LF join must borrow the input itself, got {lf:?}"
+        );
+        let crlf = EndOfLine::Crlf.join_cow(text);
+        assert!(
+            matches!(&crlf, Cow::Owned(s) if s == "a\r\nb\r\n"),
+            "CRLF join must produce new text, got {crlf:?}"
+        );
     }
 
     #[test]

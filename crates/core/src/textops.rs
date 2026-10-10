@@ -247,17 +247,17 @@ fn remove_duplicate_lines(lines: Vec<&str>) -> Vec<&str> {
 fn title_case(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for word in text.split_word_bounds() {
+        // Segments are never empty, so `next()` always yields the first char;
+        // written branch-free rather than as an `if let` with a dead arm.
         let mut chars = word.chars();
-        if let Some(first) = chars.next() {
-            out.extend(first.to_uppercase());
-            let rest = chars.as_str();
-            if rest.is_ascii() {
-                let at = out.len();
-                out.push_str(rest);
-                out[at..].make_ascii_lowercase();
-            } else {
-                out.push_str(&rest.to_lowercase());
-            }
+        out.extend(chars.next().into_iter().flat_map(char::to_uppercase));
+        let rest = chars.as_str();
+        if rest.is_ascii() {
+            let at = out.len();
+            out.push_str(rest);
+            out[at..].make_ascii_lowercase();
+        } else {
+            out.push_str(&rest.to_lowercase());
         }
     }
     out
@@ -426,6 +426,10 @@ mod tests {
         descending: false,
         case_insensitive: true,
     };
+    const DESC_CI: TextOp = TextOp::SortLines {
+        descending: true,
+        case_insensitive: true,
+    };
 
     #[test]
     fn sort_ascending_and_descending() {
@@ -452,6 +456,11 @@ mod tests {
         );
         // Case-sensitive would sort the capitals first.
         assert_eq!(whole(ASC, "Banana\napple\nCherry"), "Banana\nCherry\napple");
+        // Descending folds case the same way and simply reverses the order.
+        assert_eq!(
+            whole(DESC_CI, "Banana\napple\nCherry"),
+            "Cherry\nBanana\napple"
+        );
     }
 
     #[test]

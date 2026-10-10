@@ -686,7 +686,7 @@ pub fn update(state: &mut State, message: Message) -> Vec<Effect> {
             encoding,
             disk,
         } => {
-            let (eol, normalized) = canonicalize(content);
+            let (eol, normalized) = EndOfLine::normalize(content);
             let language = notepad_syntax::detect(path.to_str().unwrap_or(""));
 
             let reuse = state.docs.len() == 1 && state.docs[0].is_pristine_blank();
@@ -723,7 +723,7 @@ pub fn update(state: &mut State, message: Message) -> Vec<Effect> {
             // fresh load (re-detect EOL, reset history + baseline, adopt the fresh
             // on-disk fingerprint and clear any external-change status), but keep
             // the path and language.
-            let (eol, normalized) = canonicalize(content);
+            let (eol, normalized) = EndOfLine::normalize(content);
             if let Some(doc) = state.doc_mut(id) {
                 doc.load(normalized, eol, encoding, disk);
             }
@@ -1292,19 +1292,6 @@ fn apply_edit(state: &mut State, new_content: String) -> Vec<Effect> {
     vec![]
 }
 
-/// Detect a freshly-read file's line-ending style and canonicalise its text to
-/// `\n` for the buffer. An LF file is passed through **by move**: `to_lf` would
-/// only reproduce it byte-for-byte, and that copy was one of the two or three a
-/// load used to make (#126). Only a CRLF file pays for the rewrite.
-fn canonicalize(content: String) -> (EndOfLine, String) {
-    let eol = EndOfLine::detect(&content);
-    let normalized = match eol {
-        EndOfLine::Crlf => EndOfLine::to_lf(&content),
-        EndOfLine::Lf => content,
-    };
-    (eol, normalized)
-}
-
 /// Compile the active pattern, or record its error / return `None` for an empty
 /// pattern. Central so every find/replace entry point handles bad input the same
 /// way (surfaced, never a panic).
@@ -1338,13 +1325,14 @@ fn refresh_find(state: &mut State, select_first: bool) -> Vec<Effect> {
     let content = state.docs[state.active].content();
     let (count, current, ordinal, effect) = match &matcher {
         Some(m) => {
-            let count = m.count(content);
             let current = if select_first {
                 m.find_from(content, 0)
             } else {
                 state.find.current
             };
-            let ordinal = current.map_or(0, |h| m.ordinal_of(content, h.start));
+            // Both readouts from one automaton pass (#126), not a count scan
+            // followed by an ordinal scan over the same text.
+            let (count, ordinal) = m.count_and_ordinal(content, current.map(|h| h.start));
             let effect = if select_first {
                 current.map(|h| Effect::RevealRange {
                     start: h.start,
@@ -1406,9 +1394,11 @@ fn navigate(state: &mut State, forward: bool) -> Vec<Effect> {
             .find_last_before(content, before)
             .or_else(|| matcher.find_last(content))
     };
-    state.find.count = matcher.count(content);
+    // One pass for the count and the ordinal (#126); see `refresh_find`.
+    let (count, ordinal) = matcher.count_and_ordinal(content, next.map(|h| h.start));
+    state.find.count = count;
     state.find.current = next;
-    state.find.ordinal = next.map_or(0, |h| matcher.ordinal_of(content, h.start));
+    state.find.ordinal = ordinal;
     next.map(|h| Effect::RevealRange {
         start: h.start,
         end: h.end,
@@ -1438,9 +1428,11 @@ fn replace_current(state: &mut State) -> Vec<Effect> {
     let next = matcher
         .find_from(content, after)
         .or_else(|| matcher.find_from(content, 0));
-    state.find.count = matcher.count(content);
+    // One pass for the count and the ordinal (#126); see `refresh_find`.
+    let (count, ordinal) = matcher.count_and_ordinal(content, next.map(|h| h.start));
+    state.find.count = count;
     state.find.current = next;
-    state.find.ordinal = next.map_or(0, |h| matcher.ordinal_of(content, h.start));
+    state.find.ordinal = ordinal;
     // Reveal the next match, or failing that the replacement we just made.
     let reveal = next.unwrap_or(rep.range);
     fx.push(Effect::RevealRange {

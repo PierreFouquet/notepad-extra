@@ -2467,13 +2467,33 @@ mod tests {
     fn every_documented_divergence_issue_has_a_marker() {
         let issues: std::collections::BTreeSet<u32> =
             SOURCE.lines().filter_map(marker_issue).collect();
-        // The divergences catalogued in VENDORED.md: find-match highlighting while
-        // unfocused (#33), scrollbar (#34), editor niceties (#41), the geometry
-        // extraction (#79) and the large-document performance work (#126).
-        for expected in [33u32, 34, 41, 79, 126] {
+        // The divergences catalogued in VENDORED.md: the compiled-out upstream
+        // methods (#25), find-match highlighting while unfocused (#33), scrollbar
+        // (#34), editor niceties (#41), the geometry extraction (#79) and the
+        // large-document performance work (#126).
+        for expected in [25u32, 33, 34, 41, 79, 126] {
             assert!(
                 issues.contains(&expected),
                 "no NOTEPAD-EXTRA(#{expected}) marker remains — a documented divergence lost its tag",
+            );
+        }
+    }
+
+    #[test]
+    fn every_marker_issue_has_a_row_in_vendored_md() {
+        // VENDORED.md is the human-readable catalogue of the same divergences:
+        // a marker whose issue has no `| #NN |` row there is an undocumented
+        // fork, and a row whose markers all went away is caught by the test
+        // above. The row's wording is kept by hand; its presence is not (#126).
+        const CATALOGUE: &str = include_str!("../VENDORED.md");
+        let issues: std::collections::BTreeSet<u32> =
+            SOURCE.lines().filter_map(marker_issue).collect();
+        assert!(!issues.is_empty(), "no NOTEPAD-EXTRA markers found at all");
+        for issue in issues {
+            assert!(
+                CATALOGUE.contains(&format!("| #{issue} |")),
+                "crates/iced/VENDORED.md has no `| #{issue} |` row for the \
+                 NOTEPAD-EXTRA(#{issue}) markers in text_editor.rs"
             );
         }
     }

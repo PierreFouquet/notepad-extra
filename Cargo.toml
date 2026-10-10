@@ -35,8 +35,8 @@ opt-level = 3
 # and AppImage users notice first. Thin LTO + one codegen unit shrink and
 # de-duplicate across the 200+ crate graph; stripping drops the symbol tables
 # (before/after sizes are recorded in the #100 PR). `panic` deliberately stays
-# at the default `unwind`: rfd/ashpd run user callbacks where an abort would be
-# a surprise, and unwind keeps `RUST_BACKTRACE` builds useful.
+# at the default `unwind`: rfd runs its dialogs on their own threads where an
+# abort would be a surprise, and unwind keeps `RUST_BACKTRACE` builds useful.
 [profile.release]
 lto = "thin"
 codegen-units = 1

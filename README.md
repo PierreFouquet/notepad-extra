@@ -57,12 +57,17 @@ Everything stays offline and pure-Rust (fancy-regex, no oniguruma C dependency).
 
 ## Development
 
+Contributing — the process (issues, branches, PRs, CI), the architecture to preserve, the
+performance budgets every change is measured against, and the exact checks to run — is in
+[`AGENTS.md`](AGENTS.md). It applies to coding agents and humans alike; read it first.
+
 ### Prerequisites
 
 - Rust (latest stable) via [rustup](https://rustup.rs/)
 - **Linux only** — the editor is software-rendered (no GPU required), but it dlopens the
-  X11/Wayland, xkbcommon and fontconfig client libraries at runtime. On a typical desktop
-  they are already installed; CI adds just:
+  X11/Wayland, xkbcommon and fontconfig client libraries at runtime, plus `libdbus-1` for
+  the Open/Save dialogs (spoken to the desktop portal; falls back to `zenity` without it).
+  On a typical desktop they are already installed; CI adds just:
 
   ```bash
   sudo apt-get update && sudo apt-get install -y \
@@ -93,7 +98,8 @@ scripts/coverage.sh                                          # coverage gate (ne
 ```
 
 Fuzz targets live under `crates/core/fuzz/` (nightly + `cargo-fuzz`). Everything runs in
-[`.github/workflows/native-ci.yml`](.github/workflows/native-ci.yml); see
+[`.github/workflows/native-ci.yml`](.github/workflows/native-ci.yml) (the advisory scan in
+[`.github/workflows/audit.yml`](.github/workflows/audit.yml)); see
 [docs/testing.md](docs/testing.md) for the full test standard and
 [docs/native-rendering.md](docs/native-rendering.md) for the render-shell drawing notes.
 
@@ -155,6 +161,7 @@ build runner and this README in step with it. Raising a floor is its own issue.
 ## Project layout
 
 ```text
+AGENTS.md                # Contributor & coding-agent guide: process, architecture, performance model, checks
 Cargo.toml               # Cargo workspace root (virtual manifest — shared version & profiles)
 crates/syntax/           # Shared syntect-backed language catalogue
 crates/core/             # Pure update core (State / Message / Effect) — no window, no GPU

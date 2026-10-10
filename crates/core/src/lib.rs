@@ -17,6 +17,7 @@
 
 pub mod app;
 pub mod brackets;
+pub mod document;
 pub mod encoding;
 pub mod find;
 pub mod geometry;
@@ -27,13 +28,13 @@ pub mod status;
 pub mod text;
 pub mod textops;
 
-pub use app::{
-    DiskMeta, DiskStatus, Document, Effect, FindOption, FindState, Message, State, TabId, update,
-};
+pub use app::{DiskMeta, DiskStatus, Effect, FindOption, FindState, Message, State, TabId, update};
 // Re-exported so the shell can name the theme type through `notepad_core` (#36);
 // it originates in `notepad-syntax`, which also owns the light/dark → syntect
 // highlight-theme pairing.
 pub use brackets::BracketMatch;
+// The buffer model with its cached totals and line index (#126).
+pub use document::Document;
 pub use encoding::FileEncoding;
 pub use find::{Match, Matcher, Replacement, SearchError, SearchOptions};
 pub use history::{Edit, History, diff};

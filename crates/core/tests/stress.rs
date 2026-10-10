@@ -9,6 +9,7 @@ use notepad_core::{
     Effect, FileEncoding, Matcher, Message, SearchOptions, State, brackets, status, update,
 };
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 /// A regex-mode [`SearchOptions`].
 fn regex_opts() -> SearchOptions {
@@ -70,18 +71,18 @@ fn million_line_paste_is_a_single_undo_step() {
     let mut s = State::default();
     let huge: String = "x\n".repeat(1_000_000);
     update(&mut s, Message::Edited(huge.clone()));
-    assert_eq!(s.active_doc().content.len(), huge.len());
+    assert_eq!(s.active_doc().content().len(), huge.len());
 
     update(&mut s, Message::Undo);
     assert_eq!(
-        s.active_doc().content,
+        s.active_doc().content(),
         "",
         "one undo removes the whole paste"
     );
     assert!(!s.active_doc().dirty());
 
     update(&mut s, Message::Redo);
-    assert_eq!(s.active_doc().content, huge, "one redo restores it");
+    assert_eq!(s.active_doc().content(), huge, "one redo restores it");
     assert!(s.active_doc().dirty());
 }
 
@@ -95,12 +96,12 @@ fn huge_single_line_edit_then_undo() {
     let mut edited = base.clone();
     edited.replace_range(0..1, "B"); // replace the first char — a replacement, not an insert
     update(&mut s, Message::Edited(edited.clone()));
-    assert_eq!(s.active_doc().content, edited);
+    assert_eq!(s.active_doc().content(), edited);
 
     update(&mut s, Message::Undo);
-    assert_eq!(s.active_doc().content, base);
+    assert_eq!(s.active_doc().content(), base);
     update(&mut s, Message::Undo);
-    assert_eq!(s.active_doc().content, "");
+    assert_eq!(s.active_doc().content(), "");
 }
 
 #[test]
@@ -113,7 +114,7 @@ fn edit_storm_then_full_undo_walks_back_consistently() {
     for i in 0..3000 {
         content = format!("{content}line{i}\n");
         update(&mut s, Message::Edited(content.clone()));
-        assert_eq!(s.active_doc().content, content);
+        assert_eq!(s.active_doc().content(), content);
     }
     // Undo far more times than the (capped) history depth; each step must leave a
     // valid buffer and never panic.
@@ -123,9 +124,9 @@ fn edit_storm_then_full_undo_walks_back_consistently() {
     }
     // The oldest edits were capped away, so undo can't reach the empty buffer;
     // what matters is it stayed panic-free and consistent throughout.
-    let remaining = s.active_doc().content.clone();
+    let remaining = s.active_doc().content().to_string();
     update(&mut s, Message::Redo);
-    assert!(s.active_doc().content.starts_with(&remaining));
+    assert!(s.active_doc().content().starts_with(&remaining));
 }
 
 #[test]
@@ -170,7 +171,7 @@ fn rapid_tab_switch_storm_stays_consistent() {
         assert!(s.active < s.docs.len());
     }
     for (i, doc) in s.docs.iter().enumerate() {
-        assert_eq!(doc.content, format!("content {i}\n"));
+        assert_eq!(doc.content(), format!("content {i}\n"));
     }
 }
 
@@ -304,7 +305,7 @@ fn many_large_tabs_are_retained_then_freed() {
     }
     assert_eq!(s.docs.len(), 250);
     for doc in &s.docs {
-        assert_eq!(doc.content.len(), big.len());
+        assert_eq!(doc.content().len(), big.len());
     }
     // Freshly loaded tabs are clean, so each closes without a confirmation.
     for _ in 0..250 {
@@ -312,7 +313,7 @@ fn many_large_tabs_are_retained_then_freed() {
         assert!(!s.docs.is_empty());
     }
     assert_eq!(s.docs.len(), 1);
-    assert!(s.active_doc().content.is_empty(), "ends on a fresh blank");
+    assert!(s.active_doc().content().is_empty(), "ends on a fresh blank");
 }
 
 // ---- Find / Replace / Go-to-line adversarial cases (#33) ----
@@ -342,10 +343,10 @@ fn replace_all_on_a_huge_document_is_bounded_and_undoable() {
     update(&mut s, Message::ReplaceTextChanged("qux".into()));
     update(&mut s, Message::ReplaceAll);
     assert_eq!(s.find.count, 0);
-    assert!(s.active_doc().content.starts_with("qux bar\n"));
+    assert!(s.active_doc().content().starts_with("qux bar\n"));
     // The whole replace-all collapses to a single undo step.
     update(&mut s, Message::Undo);
-    assert!(s.active_doc().content.starts_with("foo bar\n"));
+    assert!(s.active_doc().content().starts_with("foo bar\n"));
 }
 
 #[test]
@@ -357,7 +358,7 @@ fn search_a_million_line_document() {
     assert_eq!(s.find.count, 1_000_000);
     update(&mut s, Message::FindNext);
     let hit = s.find.current.expect("a match");
-    assert!(hit.end <= s.active_doc().content.len());
+    assert!(hit.end <= s.active_doc().content().len());
 }
 
 #[test]
@@ -382,7 +383,7 @@ fn thousands_of_find_next_calls_stay_in_bounds() {
     for _ in 0..10_000 {
         update(&mut s, Message::FindNext);
         let hit = s.find.current.expect("always on a match");
-        assert!(hit.end <= s.active_doc().content.len());
+        assert!(hit.end <= s.active_doc().content().len());
     }
 }
 
@@ -419,7 +420,7 @@ fn status_on_a_huge_single_line_stays_correct() {
         },
     );
     let doc = s.active_doc();
-    let end = doc.content.len();
+    let end = doc.content().len();
     let st = status(doc, end, None);
     assert_eq!(st.line, 1);
     assert_eq!(st.column, 1_000_001);
@@ -446,7 +447,7 @@ fn status_on_a_million_line_document_stays_correct() {
         },
     );
     let doc = s.active_doc();
-    let st = status(doc, doc.content.len(), None);
+    let st = status(doc, doc.content().len(), None);
     assert_eq!(st.lines, 1_000_001);
     assert_eq!(st.line, 1_000_001);
     assert_eq!(st.column, 1);
@@ -460,7 +461,7 @@ fn rapid_zoom_storm_stays_within_bounds_and_leaves_editing_intact() {
     // undo history — zoom is an app-wide view setting, not a document edit.
     let mut s = State::default();
     update(&mut s, Message::Edited("hello".into()));
-    let before = s.active_doc().content.clone();
+    let before = s.active_doc().content().to_string();
 
     for i in 0..50_000 {
         let msg = match i % 3 {
@@ -477,10 +478,10 @@ fn rapid_zoom_storm_stays_within_bounds_and_leaves_editing_intact() {
     }
 
     // The buffer, dirty flag and undo are untouched by all that zooming.
-    assert_eq!(s.active_doc().content, before);
+    assert_eq!(s.active_doc().content(), before);
     assert!(s.active_doc().dirty());
     update(&mut s, Message::Undo);
-    assert_eq!(s.active_doc().content, "");
+    assert_eq!(s.active_doc().content(), "");
 }
 
 #[test]
@@ -496,6 +497,182 @@ fn monotonic_zoom_to_each_extreme_settles_exactly_on_the_bound() {
         update(&mut s, Message::ZoomOut);
     }
     assert_eq!(s.font_size(), State::MIN_FONT_SIZE);
+}
+
+// ---- Cached document totals and line index (#126) ----
+
+/// A 200k-line document loaded through the real `FileLoaded` path, then dirtied
+/// by one keystroke so neither readout can short-circuit on a pristine buffer.
+fn two_hundred_thousand_lines() -> State {
+    let mut s = State::default();
+    let content = "lorem ipsum dolor sit amet\n".repeat(200_000);
+    update(
+        &mut s,
+        Message::FileLoaded {
+            path: PathBuf::from("/tmp/big.txt"),
+            content: content.clone(),
+            encoding: FileEncoding::default(),
+            disk: None,
+        },
+    );
+    update(&mut s, Message::Edited(format!("{content}x")));
+    assert!(s.active_doc().dirty());
+    s
+}
+
+#[test]
+fn status_and_dirty_on_a_200k_line_document_cost_nothing_per_frame() {
+    // The shell asks for the status readout and every tab's dirty flag on every
+    // redraw. Before #126 each `status()` recounted the whole buffer (chars,
+    // UAX #29 words and newlines — ~50 ms per call at this size in release, far
+    // more in debug) and `dirty()` compared the whole buffer against its saved
+    // copy. Ten thousand frames' worth of those calls would have taken the old
+    // code many minutes; with the cached totals, the indexed caret maths and the
+    // dirty flag they finish in well under a second even unoptimised. The bound
+    // is deliberately loose for a slow CI runner — it only trips if an O(n)
+    // recount sneaks back onto the per-frame path.
+    let s = two_hundred_thousand_lines();
+    let doc = s.active_doc();
+    let lines = doc.line_count();
+    assert_eq!(lines, 200_001);
+
+    let started = Instant::now();
+    let mut checksum = 0usize;
+    for frame in 0..10_000usize {
+        // Walk the caret across the whole document so the line index is
+        // binary-searched at many depths, not just at one hot entry.
+        let caret = doc.offset_at((frame * 7919) % lines, frame % 30);
+        let st = status(doc, caret, None);
+        checksum += st.chars + st.words + st.lines + st.line + st.column;
+        checksum += usize::from(doc.dirty());
+    }
+    let elapsed = started.elapsed();
+    assert!(checksum > 0);
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "10_000 status()+dirty() calls took {elapsed:?}: a per-frame recount is back (#126)"
+    );
+
+    // The cached numbers are the real ones.
+    let text = doc.content();
+    let st = status(doc, text.len(), None);
+    assert_eq!(st.chars, text.chars().count());
+    assert_eq!(st.words, 200_000 * 5 + 1); // five per line, plus the appended "x"
+    assert_eq!(st.lines, 200_001);
+    assert_eq!((st.line, st.column), (200_001, 2)); // after the trailing "x"
+    // And the indexed conversions agree with the pure scanning helpers.
+    for line in [0, 1, 99_999, 200_000, 999_999] {
+        assert_eq!(doc.line_start(line), goto_line_offset(text, line + 1));
+        assert_eq!(doc.offset_at(line, 7), find::offset_at(text, line, 7));
+    }
+    for offset in [0, 27, text.len() / 2, text.len(), usize::MAX] {
+        assert_eq!(doc.line_col_of(offset), find::line_col_of(text, offset));
+    }
+}
+
+#[test]
+fn typing_into_a_200k_line_document_keeps_the_cached_totals_exact() {
+    // Keystrokes arrive as the whole new text; the document must update its
+    // totals from the diff'd span alone (#126) and stay exact while the edits
+    // land mid-document, where every later line start has to shift. Chars and
+    // lines are re-derived cheaply after each keystroke; the (expensive) word
+    // oracle runs at the end over the final text.
+    let mut s = two_hundred_thousand_lines();
+    let mut caret = s.active_doc().line_start(100_000); // a byte offset
+    let mut text = s.active_doc().content().to_string();
+    for ch in "don't 你好 😀\n".chars().cycle().take(120) {
+        text.insert(caret, ch);
+        caret += ch.len_utf8();
+        update(&mut s, Message::Edited(text.clone()));
+        let doc = s.active_doc();
+        assert_eq!(doc.content(), text);
+        assert_eq!(doc.char_count(), text.chars().count());
+        assert_eq!(doc.line_count(), find::line_count(&text));
+        assert_eq!(
+            doc.line_start(100_001),
+            find::goto_line_offset(&text, 100_002)
+        );
+    }
+    let doc = s.active_doc();
+    assert_eq!(
+        doc.word_count(),
+        unicode_segmentation::UnicodeSegmentation::unicode_words(text.as_str()).count()
+    );
+    // Undo the whole typing run: the counts walk back to the loaded baseline.
+    for _ in 0..200 {
+        update(&mut s, Message::Undo);
+    }
+    let doc = s.active_doc();
+    assert!(!doc.dirty());
+    assert_eq!(doc.line_count(), 200_001);
+    assert_eq!(doc.word_count(), 200_000 * 5);
+}
+
+#[test]
+fn typing_at_the_top_of_a_200k_line_document_diffs_at_memory_speed() {
+    // Every keystroke reaches the core as the whole new text, and `diff` finds
+    // the one changed span by scanning both buffers from each end. A keystroke
+    // at the very top leaves no common prefix, so the suffix scan covers the
+    // entire document. This pins the scan alone, with nothing else in the timed
+    // region (no `String` rebuild, no line-index shift), so the ratio between
+    // the two implementations is the whole signal: on this 5.4 MB fixture in a
+    // debug build one scan is ~0.5 ms once the prefix and suffix compare 4 KiB
+    // blocks with `memcmp`, against ~25 ms with the byte-at-a-time loop (#126).
+    // Four hundred scans take ~0.2 s and ~10 s respectively; the 2 s bound is
+    // ten times the measured cost (a slow CI runner) and a fifth of what the byte
+    // loop needs on a fast machine, so the un-optimised code cannot meet it.
+    let text = "lorem ipsum dolor sit amet\n".repeat(200_000);
+    let mut next = String::with_capacity(text.len() + 1);
+    next.push('x');
+    next.push_str(&text);
+    let started = Instant::now();
+    for i in 0..400u32 {
+        let edit = if i % 2 == 0 {
+            notepad_core::diff(&text, &next)
+        } else {
+            notepad_core::diff(&next, &text)
+        }
+        .expect("the buffers differ");
+        assert_eq!(edit.at, 0, "the change is the single char at the top");
+        assert_eq!(edit.removed.len() + edit.inserted.len(), 1);
+    }
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "400 whole-document diffs took {elapsed:?}: `diff` is scanning byte by byte again (#126)"
+    );
+}
+
+#[test]
+fn typing_at_the_top_of_a_200k_line_document_lands_single_char_edits() {
+    // The same keystrokes through the real `update()` path: each one reaches the
+    // core as the whole new text and must land as a single-character edit with
+    // exact cached totals, and undo must walk every one of them back (#126).
+    let mut s = two_hundred_thousand_lines();
+    let baseline_chars = s.active_doc().char_count();
+    for i in 0..200u8 {
+        let text = s.active_doc().content();
+        let mut next = String::with_capacity(text.len() + 1);
+        next.push(char::from(b'a' + i % 26));
+        next.push_str(text);
+        update(&mut s, Message::Edited(next));
+    }
+
+    // The edits really landed, as single-character edits with exact totals.
+    let doc = s.active_doc();
+    let typed: String = (0..200u8)
+        .rev()
+        .map(|i| char::from(b'a' + i % 26))
+        .collect();
+    assert!(doc.content().starts_with(&typed));
+    assert_eq!(doc.char_count(), baseline_chars + 200);
+    assert_eq!(doc.line_count(), 200_001);
+    assert_eq!(
+        doc.word_count(),
+        200_000 * 5 + 1,
+        "the letters joined the first word"
+    );
+    assert_eq!(doc.content().len(), 5_400_001 + 200);
 }
 
 // ---- Bracket matching (#41) ----

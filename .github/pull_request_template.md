@@ -41,11 +41,16 @@ covered in CI.
 
 ## Local checks (mirror CI)
 
+The full list, with the exact commands, is `AGENTS.md` §6; run it on the newest stable Rust (`rustup update stable`).
+
 - [ ] `cargo fmt --all -- --check` is clean.
-- [ ] `cargo clippy --all-targets -- -D warnings` is clean (no new warnings).
-- [ ] `cargo test --all-targets` passes for the affected crates (`notepad-core`, `notepad-syntax`, `notepad-iced`).
-- [ ] Coverage gate holds: `bash scripts/coverage.sh` (aggregate & per-file ≥ 99%; `view`/render is smoke-tested only).
-- [ ] Packaging metadata still validates if touched (`appstreamcli validate --no-net …`, `desktop-file-validate …`).
+- [ ] `cargo clippy --locked --workspace --all-targets -- -D warnings` is clean.
+- [ ] `cargo test --locked --workspace --all-targets` passes — or, for a small contained change, the affected crate(s), named here: …
+- [ ] Coverage gate holds: `bash scripts/coverage.sh` (core + syntax, aggregate & per-file ≥ 99 %), also with `PROPTEST_CASES=1`; `view`/render is smoke-tested only.
+- [ ] Fuzz crate still in step: `cargo metadata --locked --manifest-path crates/core/fuzz/Cargo.toml` and `cargo check --locked --manifest-path crates/core/fuzz/Cargo.toml` pass (lockfile regenerated if the core's dependencies changed).
+- [ ] Dependencies touched: `LICENSE_AUDIT_ONLINE=1 bash scripts/license-audit.sh --check`, `PACKAGING_DEPS_ONLINE=1 bash scripts/packaging-deps.sh --check` and `cargo audit` are clean, and any runtime-loaded library is in the deb/rpm dependency lists — or N/A.
+- [ ] Shell touched: windowed smoke `xvfb-run -a timeout 10 ./target/debug/notepad-extra` exits 124 — or N/A.
+- [ ] Packaging metadata still validates if touched (`appstreamcli validate --no-net …`, `desktop-file-validate …`); the `packaging.yml` jobs are green on the PR.
 
 ## Project constraints
 

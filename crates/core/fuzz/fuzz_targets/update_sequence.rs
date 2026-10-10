@@ -119,7 +119,7 @@ fuzz_target!(|data: &[u8]| {
         assert!(state.font_size() <= State::MAX_FONT_SIZE);
         // A highlighted find match must never dangle past the active buffer.
         if let Some(hit) = state.find.current {
-            let content = &state.active_doc().content;
+            let content = state.active_doc().content();
             assert!(hit.end <= content.len(), "match end past buffer");
             assert!(content.is_char_boundary(hit.start) && content.is_char_boundary(hit.end));
         }

@@ -27,8 +27,10 @@ use iced::widget::{
 use iced::{Element, Fill, Length, Point, Subscription, Task};
 use notepad_core as core;
 use notepad_core::{DiskMeta, DiskStatus, Effect, FindOption, TabId};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 
 // Vendored copy of iced 0.14's `text_editor`, extended with a visible vertical
 // scrollbar (#34) — the stock widget renders none and exposes no scroll offset.
@@ -313,16 +315,18 @@ fn on_event(
 /// [`Message::DiskEvent`] batches. A plain `fn` with no captures, as
 /// `Subscription::run_with` requires — the watched set arrives through `files`,
 /// which also keys the subscription's identity.
-// `run_with` demands `fn(&D)`, so the param must be `&Vec<_>`; and its `S` must be
-// a single type, so the returned stream is boxed rather than an `impl Stream` that
-// (under the 2024 capture rules) would borrow the `&Vec` lifetime.
-#[allow(clippy::ptr_arg)]
+// `run_with` demands `fn(&D)`; `D` is the shell's shared `Arc<[PathBuf]>` (#126),
+// which hashes by content, so the key semantics are unchanged. Its `S` must be a
+// single type, so the returned stream is boxed rather than an `impl Stream` that
+// (under the 2024 capture rules) would borrow the `&D` lifetime.
 fn watch_worker(
-    files: &Vec<PathBuf>,
+    files: &Arc<[PathBuf]>,
 ) -> std::pin::Pin<Box<dyn iced::futures::Stream<Item = Message> + Send>> {
     use iced::futures::channel::mpsc::Sender;
     use iced::futures::{SinkExt, StreamExt};
-    let files = files.clone();
+    // The watcher wants an owned list. This runs once per *change* of the
+    // watched set, not once per subscription poll, so the copy is fine.
+    let files = files.to_vec();
     Box::pin(iced::stream::channel(
         16,
         move |mut output: Sender<Message>| async move {
@@ -414,7 +418,8 @@ enum Message {
     /// The drag left the window without dropping (#42): lower the overlay.
     FilesHoveredLeft,
     /// A chosen file finished loading from disk. The result is the raw bytes so
-    /// the encoding is auto-detected here ([`core::encoding::decode`], #50); a
+    /// the encoding is auto-detected here ([`core::encoding::decode_owned`], #50,
+    /// which takes the buffer by value so a UTF-8 file is never copied, #126); a
     /// read error still carries only the I/O failure (missing / directory /
     /// permission) — a binary or non-UTF-8 file reads back fine and opens lossily.
     FileRead {
@@ -429,7 +434,7 @@ enum Message {
     LargeOpenCancelled,
     /// Document `id` was re-read for a *reopen* under a user-chosen encoding
     /// ([`Message::ReopenAs`]). The raw bytes are *strictly* re-decoded here with
-    /// [`core::encoding::decode_strict`]: if they are not valid in that encoding
+    /// [`core::encoding::decode_strict_owned`]: if they are not valid in that encoding
     /// the reopen is refused (banner set, buffer untouched), mirroring how a lossy
     /// save is blocked. A read error is likewise surfaced in the banner.
     FileReloaded {
@@ -467,7 +472,7 @@ enum Message {
     /// Document `id` was re-read for a *reload from disk* after an external change
     /// ([`Effect::ReloadFile`]). Unlike the strict [`Message::FileReloaded`] reopen,
     /// the bytes are decoded *tolerantly* under the tab's encoding
-    /// ([`core::encoding::decode_with`]) — a reload reopens the file as-is, it must
+    /// ([`core::encoding::decode_with_owned`]) — a reload reopens the file as-is, it must
     /// not fail on bytes that don't fit. A read error is surfaced in the banner.
     DiskReloaded {
         id: TabId,
@@ -722,11 +727,24 @@ struct PendingClose {
 }
 
 /// Above this many lines, opening a file first asks the user to confirm (#102).
-/// The vendored `text_editor`'s open cost is dominated by cosmic-text shaping
-/// *every line up front* — ~20 µs/line in a release build, so ~200k lines is
-/// ~4 s and a multi-million-line log is tens of seconds. Scrolling and editing
-/// an already-shaped buffer stay cheap; the whole cost is paid at open.
-const LARGE_FILE_LINES: usize = 200_000;
+/// The vendored `text_editor` shapes *every line of the buffer* when the content
+/// is loaded and relayouts every shaped line again on the first `update` — a
+/// cost inherent to the widget (cosmic-text's `Buffer` is whole-document, with
+/// a laid-out glyph run per line), so this gate is the shell's only lever.
+/// Measured in a release build on 60-byte lines (#126's audit): 20k lines
+/// (1.2 MB) take 0.67 s + 0.45 s and +750 MB of resident memory; 50k lines
+/// (3 MB) 1.7 s + 1.3 s and +1.9 GB; 200k lines (12 MB) 6.5 s + 4.6 s and
+/// +7.5 GB — about 56 µs and 37 KB of RSS per line. Scrolling and editing the
+/// shaped buffer stay cheap; the whole cost is paid at open and kept resident.
+/// 50k lines is where the pause reaches several seconds and the memory passes
+/// 2 GB, so that is where asking first is worth the interruption.
+const LARGE_FILE_LINES: usize = 50_000;
+/// Above this many decoded bytes in total, opening also asks first (#102,
+/// #126). The shaping cost above grows with glyphs, not just lines: a 100k-line
+/// file of 500-byte lines is 50 MB and would pass the line gate while costing
+/// several times what the 50k × 60-byte file does. 8 MiB sits between the 3 MB
+/// that trips the line gate and the 12 MB measured at 200k lines.
+const LARGE_FILE_BYTES: usize = 8 * 1024 * 1024;
 /// Above this many bytes on a single line, opening also asks first (#102). A
 /// lone enormous line shapes *fast* to open (one shaped line), but then every
 /// later edit reshapes the whole line — ~245 µs/char at 1M vs ~4 µs on a normal
@@ -760,9 +778,11 @@ struct PendingOverwrite {
 }
 
 /// Measure a freshly decoded buffer against the large-file thresholds (#102) in
-/// a single pass. Returns `Some(lines)` when opening should confirm first —
-/// either the line count crosses [`LARGE_FILE_LINES`] or the longest single line
-/// crosses [`LARGE_FILE_LINE_BYTES`] — otherwise `None` to open straight away.
+/// a single pass. Returns `Some(lines)` when opening should confirm first — the
+/// line count crosses [`LARGE_FILE_LINES`], the total size [`LARGE_FILE_BYTES`]
+/// or the longest single line [`LARGE_FILE_LINE_BYTES`] — otherwise `None` to
+/// open straight away. The line count is always measured, even when the size
+/// alone decides, because the prompt shows it.
 fn large_file_lines(content: &str) -> Option<usize> {
     let mut lines = 0usize;
     let mut longest = 0usize;
@@ -770,7 +790,108 @@ fn large_file_lines(content: &str) -> Option<usize> {
         lines += 1;
         longest = longest.max(line.len());
     }
-    (lines >= LARGE_FILE_LINES || longest >= LARGE_FILE_LINE_BYTES).then_some(lines)
+    (lines >= LARGE_FILE_LINES
+        || longest >= LARGE_FILE_LINE_BYTES
+        || content.len() >= LARGE_FILE_BYTES)
+        .then_some(lines)
+}
+
+/// The sentence the large-file bar shows (#102): which threshold the file
+/// crossed, in the user's terms, and what accepting costs. A many-line file
+/// reports its line count and size, a file that tripped on size alone its size,
+/// and a lone enormous line — which trips on byte length, not line count, so
+/// "1 lines" would mislead — is described as such. The memory warning is the
+/// measured one (#126): the largest files cost gigabytes of resident memory
+/// to shape, not just a pause.
+fn large_open_prompt(pending: &PendingLargeOpen) -> String {
+    let name = pending.path.file_name().map_or_else(
+        || pending.path.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    let bytes = pending.content.len();
+    // Binary units, labelled as such: the size gate is `LARGE_FILE_BYTES` in MiB.
+    let size = format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0));
+    let scale = if pending.lines >= LARGE_FILE_LINES {
+        format!("has {} lines ({size})", pending.lines)
+    } else if bytes >= LARGE_FILE_BYTES {
+        format!("is {size}")
+    } else {
+        "has a very long line".to_string()
+    };
+    format!(
+        "\u{201c}{name}\u{201d} {scale}. Opening it may take a while and, for the largest files, use several GB of memory."
+    )
+}
+
+/// The caret-dependent readouts [`Shell::view`] shows, computed **once per state
+/// change** and only *read* per frame (#126).
+///
+/// `view` is rebuilt after every message batch — every keystroke, every scroll
+/// step and every pointer movement over the editor (the shell tracks the pointer
+/// for the context menu, so motion alone is a message) — and used to derive the
+/// status bar and the bracket highlight afresh each time. (The 500 ms caret
+/// blink is a redraw of the existing widget tree: it re-runs the widgets'
+/// `draw`/`layout`, not `view`.) The status bar itself is cheap now (the document
+/// caches its totals and line index), but [`core::brackets::match_at`] walks the
+/// text from the caret to its partner — the rest of the document for an
+/// unmatched opener — so merely moving the mouse across a document with a stray
+/// `(` re-scanned the whole buffer on every motion event.
+///
+/// Both inputs change only inside [`Shell::dispatch`]: the caret moves only
+/// through `Content::perform` / `move_to` there (an `Edit` action, a reveal, a
+/// go-to-line, a context-menu action), and the document, active tab, language
+/// and encoding only through `apply_core`. So [`Shell::update`] refreshes this
+/// after every message that can move either, skips the two that cannot (pointer
+/// motion and resizes, see there), and `view` reads the stored values.
+#[derive(Debug, Clone, PartialEq)]
+struct Readouts {
+    /// What the status bar shows for the active document (#37/#55).
+    status: core::StatusBar,
+    /// The bracket pair next to the caret (#41), in the widget's coordinates, or
+    /// `None` when the caret touches no bracket.
+    bracket: Option<BracketHighlight>,
+}
+
+impl Readouts {
+    /// Derive both readouts from `doc` and its editor buffer. Headless-testable:
+    /// `text_editor::Content::cursor()` needs no renderer. The widget speaks in
+    /// `(line, byte-column)`; the document's indexed `offset_at` turns that into
+    /// the byte offsets the core's [`core::status`] and
+    /// [`core::brackets::match_at`] expect, and its `line_col_of` maps the matched
+    /// brackets back — O(1) and O(log n) conversions (#126), with the one caret
+    /// conversion shared by both readouts.
+    fn of(doc: &core::Document, editor: &text_editor::Content) -> Self {
+        let cursor = editor.cursor();
+        let caret = doc.offset_at(cursor.position.line, cursor.position.column);
+        let anchor = cursor.selection.map(|a| doc.offset_at(a.line, a.column));
+        let to_pos = |off: usize| {
+            let (line, column) = doc.line_col_of(off);
+            Position { line, column }
+        };
+        Readouts {
+            status: core::status(doc, caret, anchor),
+            bracket: core::brackets::match_at(doc.content(), caret).map(|m| BracketHighlight {
+                here: to_pos(m.here),
+                partner: m.partner.map(to_pos),
+            }),
+        }
+    }
+}
+
+/// One frame's tab-strip layout (#70): each tab's display name and the split of
+/// tab indices into those shown inline and those collapsed behind `▾ N more`.
+/// Computed once per [`Shell::view`] and handed to both [`Shell::tab_strip`] and
+/// [`Shell::tabs_overflow_menu`], which used to build their own copies — with a
+/// third in `view` for the overflow check, so every tab name was allocated three
+/// times per frame (#126). A clean tab's name borrows the document's title; only
+/// a dirty tab, whose name carries the "•" marker, allocates.
+struct TabSplit<'a> {
+    /// Each tab's display name, by tab index.
+    names: Vec<Cow<'a, str>>,
+    /// The tabs shown inline on the strip, in order.
+    visible: Vec<usize>,
+    /// The tabs collapsed into the overflow menu, in order.
+    overflow: Vec<usize>,
 }
 
 /// The whole shell: the pure core plus the per-tab editor buffers, window title,
@@ -868,6 +989,21 @@ struct Shell {
     /// tab strip lists the tabs that don't fit; this drives its card in `view`.
     /// Shell-only chrome, like [`Shell::drag_hover`]; selecting a tab closes it.
     tabs_menu_open: bool,
+    /// The status-bar and bracket-highlight readouts for the active document,
+    /// refreshed once per state change by [`Shell::update`] and only *read* by
+    /// [`Shell::view`] (#126) — see [`Readouts`] for why `view` must not derive
+    /// them itself. Always in step with the active editor's caret: nothing moves
+    /// that caret outside `dispatch`, and `update` refreshes after `dispatch`.
+    readouts: Readouts,
+    /// The sorted, de-duplicated set of files the external-change watch covers
+    /// (#51) — every titled tab's path. This *is* the identity key of
+    /// [`Shell::watch_subscription`]: when it changes (a tab opened, closed, or
+    /// saved-as), iced rebuilds the watcher over the new set, so the watch always
+    /// tracks exactly the open files and no watch outlives its tab. Refreshed by
+    /// [`Shell::apply_core`] only when the set actually changes, so the
+    /// subscription poll iced makes after every update hands over an `Arc` clone
+    /// instead of re-collecting, cloning and sorting every tab's path (#126).
+    watched: Arc<[PathBuf]>,
 }
 
 impl Shell {
@@ -884,6 +1020,10 @@ impl Shell {
         // applying the loaded prefs is enough — no editor rebuild needed.
         shell.core.apply_preferences(&prefs);
         let open = shell.open_startup_files(files);
+        // The startup files landed through `dispatch`, not `update`, so refresh
+        // the readouts that `update` would have (#126): the first frame must show
+        // the focused file's status, not the blank tab's.
+        shell.refresh_readouts();
         (shell, Task::batch([task, open]))
     }
 
@@ -923,9 +1063,12 @@ impl Shell {
         let mut editors = HashMap::new();
         editors.insert(
             core.active_doc().id,
-            text_editor::Content::with_text(&core.active_doc().content),
+            text_editor::Content::with_text(core.active_doc().content()),
         );
         let title = window_title(&core);
+        // Seed the readouts for the blank document so the first frame — drawn
+        // before any `update` — already has values to show (#126).
+        let readouts = Readouts::of(core.active_doc(), &editors[&core.active_doc().id]);
         (
             Shell {
                 core,
@@ -948,6 +1091,9 @@ impl Shell {
                 // corrects this to the real width almost immediately (#70).
                 window_width: 1024.0,
                 tabs_menu_open: false,
+                readouts,
+                // The initial document is untitled: nothing to watch yet.
+                watched: Arc::from(Vec::new()),
             },
             Task::none(),
         )
@@ -959,22 +1105,46 @@ impl Shell {
 
     /// The iced entry point. Dispatches the message, then flips
     /// [`Shell::repaint_nudge`] so the next frame forces a full repaint — see the
-    /// field's docs for the underlying iced damage limitation this dodges (#32).
+    /// field's docs for the underlying iced damage limitation this dodges (#32) —
+    /// and refreshes the cached [`Readouts`] that frame will show (#126).
     ///
-    /// The one exception is [`Message::EditorCursorMoved`], which only records
-    /// the pointer position for the context-menu anchor (#97 item 3) and paints
-    /// nothing. It arrives on *every* pointer motion over the editor, so nudging
-    /// it would force a full-window software repaint on each one — the very churn
-    /// the nudge exists to avoid. Skipping the flip lets those frames take iced's
-    /// cheap no-damage path; every message that can change a pixel still nudges.
+    /// The exceptions are [`Message::EditorCursorMoved`], which only records the
+    /// pointer position for the context-menu anchor (#97 item 3) and paints
+    /// nothing, and [`Message::WindowResized`], which records geometry the resize
+    /// itself already repaints. The first arrives on *every* pointer motion over
+    /// the editor, so nudging it would force a full-window software repaint on
+    /// each one — the very churn the nudge exists to avoid. Neither can move the
+    /// caret or touch a document, so neither can stale the readouts, and both
+    /// skip the nudge and the refresh. The scroll messages ([`Message::ScrollNudge`],
+    /// [`Message::ScrollSettle`] and the widget's `Scroll` action) are the other
+    /// way round: they exist to repaint, so they keep the nudge, but they cannot
+    /// move the caret either, so they skip the refresh — otherwise one wheel tick
+    /// would run the bracket scan up to five times, three of them per frame.
+    /// Every other message is a potential state change and does both.
     fn update(&mut self, message: Message) -> Task<Message> {
-        let repaints = !matches!(
+        let changes_state = !matches!(
             message,
             Message::EditorCursorMoved(_) | Message::WindowResized(_)
         );
+        // Scrolling needs the nudge (that is what `ScrollNudge` and the
+        // `ScrollSettle` frames exist for) but moves no caret and touches no
+        // document, so the readouts stay valid. One wheel tick is a `Scroll`
+        // action, a nudge and three settle frames; refreshing on each would run
+        // the bracket scan — O(document) for an unmatched opener — up to five
+        // times per tick, three of them once per frame (#126).
+        let moves_caret_or_text = changes_state
+            && !matches!(
+                message,
+                Message::ScrollNudge
+                    | Message::ScrollSettle
+                    | Message::Edit(text_editor::Action::Scroll { .. })
+            );
         let task = self.dispatch(message);
-        if repaints {
+        if changes_state {
             self.repaint_nudge = !self.repaint_nudge;
+        }
+        if moves_caret_or_text {
+            self.refresh_readouts();
         }
         task
     }
@@ -984,10 +1154,7 @@ impl Shell {
     /// widget in [`Shell::view`]; [`Shell::theme`] derives the coarse `iced::Theme`
     /// from the same choice for the widgets we don't hand-style.
     fn tokens(&self) -> theme::Tokens {
-        match self.core.theme() {
-            core::ThemeMode::Light => theme::LIGHT,
-            core::ThemeMode::Dark => theme::DARK,
-        }
+        tokens_for(self.core.theme())
     }
 
     /// The application background style. Painted from the token `app_bg` (#70) so
@@ -1010,21 +1177,13 @@ impl Shell {
     /// selection) still land in the right colours. iced reads this every frame, so a
     /// theme toggle repaints the chrome; the editor's syntect highlight theme is
     /// paired separately in [`Shell::view`] via the same `ThemeMode`.
+    ///
+    /// A clone of a theme built once per mode ([`app_theme`]): `iced::Theme`'s
+    /// custom variant is an `Arc`, so the per-frame cost is one reference-count
+    /// bump instead of a `String`, an `Arc` and a full extended-palette
+    /// generation (#126).
     fn theme(&self) -> iced::Theme {
-        let t = self.tokens();
-        iced::Theme::custom(
-            "Notepad Extra".to_owned(),
-            iced::theme::Palette {
-                background: t.app_bg,
-                text: t.text,
-                primary: t.accent,
-                success: t.accent,
-                // `Tokens` carries no distinct warning colour; the danger red
-                // doubles for it (nothing in the chrome uses `warning`).
-                warning: t.danger,
-                danger: t.danger,
-            },
-        )
+        app_theme(self.core.theme())
     }
 
     /// The active tab's editor buffer. Its key is present by invariant:
@@ -1150,13 +1309,16 @@ impl Shell {
             Message::FileRead { path, result } => match result {
                 Ok(bytes) => {
                     self.error = None;
-                    // Auto-detect the encoding from the raw bytes (#50); a binary
-                    // or non-UTF-8 file decodes lossily rather than erroring (#59).
-                    let (content, encoding) = core::encoding::decode(&bytes);
                     // Fingerprint the file now, while we hold its bytes, so the
                     // external-change watch has a baseline from the moment the tab
-                    // opens (#51) — no second read.
+                    // opens (#51) — no second read. This goes first: the decode
+                    // below consumes the buffer.
                     let disk = Some(watch::fingerprint(&path, &bytes));
+                    // Auto-detect the encoding from the raw bytes (#50); a binary
+                    // or non-UTF-8 file decodes lossily rather than erroring (#59).
+                    // By value, so the common case — valid UTF-8 — becomes the
+                    // buffer `String` with no copy at all (#126).
+                    let (content, encoding) = core::encoding::decode_owned(bytes);
                     // Large-file guard (#102): the vendored editor shapes every
                     // line up front, so a huge file is slow to open. Stash the
                     // decoded buffer and ask before loading rather than freezing
@@ -1217,27 +1379,30 @@ impl Shell {
                 encoding,
                 result,
             } => match result {
-                // Keep the raw bytes so we can both strictly re-decode them *and*
-                // fingerprint the file for the external-change baseline (#51).
-                Ok(bytes) => match core::encoding::decode_strict(&bytes, encoding) {
-                    Ok((content, encoding)) => {
-                        self.error = None;
-                        let disk = self.disk_fingerprint(id, &bytes);
-                        self.apply_core(
-                            core::Message::FileReloaded {
-                                id,
-                                content,
-                                encoding,
-                                disk,
-                            },
-                            true,
-                        )
+                // Fingerprint the file for the external-change baseline (#51)
+                // *before* the strict re-decode, which takes the bytes by value so
+                // a valid UTF-8 reopen is the buffer itself, uncopied (#126).
+                Ok(bytes) => {
+                    let disk = self.disk_fingerprint(id, &bytes);
+                    match core::encoding::decode_strict_owned(bytes, encoding) {
+                        Ok((content, encoding)) => {
+                            self.error = None;
+                            self.apply_core(
+                                core::Message::FileReloaded {
+                                    id,
+                                    content,
+                                    encoding,
+                                    disk,
+                                },
+                                true,
+                            )
+                        }
+                        Err(e) => {
+                            self.error = Some(e);
+                            Task::none()
+                        }
                     }
-                    Err(e) => {
-                        self.error = Some(e);
-                        Task::none()
-                    }
-                },
+                }
                 Err(e) => {
                     self.error = Some(e);
                     Task::none()
@@ -1255,8 +1420,10 @@ impl Shell {
             } => match result {
                 Ok(bytes) => {
                     self.error = None;
-                    let (content, encoding) = core::encoding::decode_with(&bytes, encoding);
+                    // Fingerprint first (#51): the decode consumes the buffer so a
+                    // UTF-8 reload is never copied (#126).
                     let disk = self.disk_fingerprint(id, &bytes);
+                    let (content, encoding) = core::encoding::decode_with_owned(bytes, encoding);
                     self.apply_core(
                         core::Message::FileReloaded {
                             id,
@@ -1676,31 +1843,41 @@ impl Shell {
     /// set of watched files, so opening, closing, saving-as or renaming a tab
     /// re-keys the subscription and iced tears down the old watcher and builds a
     /// new one — which is what keeps watch handles from leaking across tab churn.
-    /// An empty set (only untitled tabs) runs no watcher at all.
+    /// An empty set (only untitled tabs) runs no watcher at all. The key is the
+    /// cached [`Shell::watched`] `Arc`: it hashes by content, so the identity
+    /// semantics are unchanged, but the per-poll cost is one reference-count bump
+    /// rather than a rebuild of the whole set (#126).
     fn watch_subscription(&self) -> Subscription<Message> {
-        let files = self.watched_files();
-        if files.is_empty() {
+        if self.watched.is_empty() {
             Subscription::none()
         } else {
-            Subscription::run_with(files, watch_worker)
+            Subscription::run_with(Arc::clone(&self.watched), watch_worker)
         }
     }
 
-    /// The sorted, de-duplicated set of files the watch covers — every titled
-    /// tab's path (#51). This *is* the subscription's identity key: when it
-    /// changes (a tab opened, closed, or saved-as), iced rebuilds the watcher over
-    /// the new set, so the watch always tracks exactly the open files and no watch
-    /// outlives its tab.
-    fn watched_files(&self) -> Vec<PathBuf> {
-        let mut files: Vec<PathBuf> = self
+    /// Bring [`Shell::watched`] up to date with the documents' paths (#51/#126):
+    /// collect every titled tab's path *by reference*, sort and de-duplicate, and
+    /// only when that differs from the current set allocate a new shared slice.
+    /// So the steady state — any message that opens, closes or renames no tab —
+    /// costs a handful of path compares and a small scratch `Vec` of references,
+    /// and the subscription key stays the very same `Arc`.
+    fn refresh_watched(&mut self) {
+        let mut paths: Vec<&Path> = self
             .core
             .docs
             .iter()
-            .filter_map(|d| d.path.clone())
+            .filter_map(|d| d.path.as_deref())
             .collect();
-        files.sort();
-        files.dedup();
-        files
+        paths.sort_unstable();
+        paths.dedup();
+        if !self
+            .watched
+            .iter()
+            .map(PathBuf::as_path)
+            .eq(paths.iter().copied())
+        {
+            self.watched = paths.into_iter().map(Path::to_path_buf).collect();
+        }
     }
 
     /// Fingerprint document `id`'s file from `bytes` already in hand (#51). `None`
@@ -1724,12 +1901,14 @@ impl Shell {
     fn apply_core(&mut self, msg: core::Message, resync: bool) -> Task<Message> {
         let effects = core::update(&mut self.core, msg);
         self.sync_editor_cache(resync);
+        self.refresh_watched();
         let tasks: Vec<Task<Message>> = effects.into_iter().map(|e| self.run_effect(e)).collect();
         Task::batch(tasks)
     }
 
     /// Reconcile the per-tab editor cache with the core's documents after an
-    /// update (#94), in three passes:
+    /// update (#94), in three passes — the first two skipped when the cache's
+    /// keys already mirror the documents exactly (#126):
     ///
     /// 1. **Prune** buffers whose tab has closed, so the map can't grow without
     ///    bound as tabs open and close.
@@ -1749,22 +1928,36 @@ impl Shell {
     /// — like any tab switch — restores that tab's remembered caret rather than
     /// jumping to the top.
     fn sync_editor_cache(&mut self, resync: bool) {
-        // 1. Prune buffers for tabs that no longer exist.
-        let live: HashSet<TabId> = self.core.docs.iter().map(|d| d.id).collect();
-        self.editors.retain(|id, _| live.contains(id));
+        // Fast path (#126): the cache already holds exactly the live documents —
+        // the same count, and every document's id present (ids are unique, so
+        // that is a bijection) — which is every update but a tab open or close.
+        // Then passes 1 and 2 have nothing to do and the `HashSet` pass 1 needs
+        // is never built; this runs on *every* message that reaches the core,
+        // including each keystroke.
+        let in_step = self.editors.len() == self.core.docs.len()
+            && self
+                .core
+                .docs
+                .iter()
+                .all(|d| self.editors.contains_key(&d.id));
+        if !in_step {
+            // 1. Prune buffers for tabs that no longer exist.
+            let live: HashSet<TabId> = self.core.docs.iter().map(|d| d.id).collect();
+            self.editors.retain(|id, _| live.contains(id));
 
-        // 2. Lazily create a buffer for any tab that lacks one.
-        for doc in &self.core.docs {
-            self.editors
-                .entry(doc.id)
-                .or_insert_with(|| text_editor::Content::with_text(&doc.content));
+            // 2. Lazily create a buffer for any tab that lacks one.
+            for doc in &self.core.docs {
+                self.editors
+                    .entry(doc.id)
+                    .or_insert_with(|| text_editor::Content::with_text(doc.content()));
+            }
         }
 
         // 3. Rebuild only the active buffer when the core rewrote its text.
         if resync {
             let doc = self.core.active_doc();
             self.editors
-                .insert(doc.id, text_editor::Content::with_text(&doc.content));
+                .insert(doc.id, text_editor::Content::with_text(doc.content()));
         }
     }
 
@@ -1866,11 +2059,12 @@ impl Shell {
             }
             // Turn a byte range into an editor selection (or a bare caret when
             // empty, e.g. go-to-line). The core hands us offsets on the same
-            // canonical text the editor holds; `line_col_of` converts them to the
-            // (line, byte-column) the widget's cursor speaks.
+            // canonical text the editor holds; the document's indexed
+            // `line_col_of` converts them to the (line, byte-column) the widget's
+            // cursor speaks without rescanning the text (#126).
             Effect::RevealRange { start, end } => {
-                let content = &self.core.active_doc().content;
-                let (sl, sc) = core::find::line_col_of(content, start);
+                let doc = self.core.active_doc();
+                let (sl, sc) = doc.line_col_of(start);
                 let cursor = if start == end {
                     Cursor {
                         position: Position {
@@ -1880,7 +2074,7 @@ impl Shell {
                         selection: None,
                     }
                 } else {
-                    let (el, ec) = core::find::line_col_of(content, end);
+                    let (el, ec) = doc.line_col_of(end);
                     Cursor {
                         position: Position {
                             line: el,
@@ -1937,20 +2131,12 @@ impl Shell {
         }
     }
 
-    /// The status-bar readout for the active document, derived from the pure
-    /// core plus the editor widget's live caret/selection. Headless-testable:
-    /// `text_editor::Content::cursor()` needs no renderer. The widget speaks in
-    /// `(line, byte-column)`, which `offset_at` turns into the byte offsets the
-    /// core's [`core::status`] expects.
-    fn status(&self) -> core::StatusBar {
-        let doc = self.core.active_doc();
-        let cursor = self.active_editor().cursor();
-        let caret =
-            core::find::offset_at(&doc.content, cursor.position.line, cursor.position.column);
-        let anchor = cursor
-            .selection
-            .map(|a| core::find::offset_at(&doc.content, a.line, a.column));
-        core::status(doc, caret, anchor)
+    /// The status-bar readout for the active document (#37/#55): the value
+    /// [`Shell::update`] cached after the last state change, derived from the
+    /// pure core plus the editor widget's caret/selection by [`Readouts::of`].
+    /// A field read, so `view` may call it on every frame (#126).
+    fn status(&self) -> &core::StatusBar {
+        &self.readouts.status
     }
 
     /// The editor's live selection as a byte range `[start, end)`, or `None`
@@ -1958,34 +2144,26 @@ impl Shell {
     /// (no renderer needed, so it stays headless-testable) and is what a line/
     /// text operation (#54) is scoped to — the core widens or clamps it.
     fn selection_range(&self) -> Option<(usize, usize)> {
-        let content = &self.core.active_doc().content;
+        let doc = self.core.active_doc();
         let cursor = self.active_editor().cursor();
-        let caret = core::find::offset_at(content, cursor.position.line, cursor.position.column);
-        let anchor = cursor
-            .selection
-            .map(|a| core::find::offset_at(content, a.line, a.column))?;
+        let caret = doc.offset_at(cursor.position.line, cursor.position.column);
+        let anchor = cursor.selection.map(|a| doc.offset_at(a.line, a.column))?;
         Some((anchor, caret))
     }
 
-    /// The bracket pair to highlight for the active document (#41), derived from
-    /// the pure core plus the editor widget's live caret. Mirrors [`Shell::status`]:
-    /// it reads the caret (no renderer needed, so this is headless-testable),
-    /// turns it into a byte offset with `find::offset_at`, asks the core which
-    /// brackets match, and maps the result back to the widget's `(line, column)`
-    /// positions with `find::line_col_of` — the same conversion `RevealRange` uses.
+    /// The bracket pair to highlight for the active document (#41): cached
+    /// alongside the status, see [`Shell::status`] and [`Readouts`]. A field read,
+    /// where it used to be a bracket scan per frame (#126).
     fn active_bracket(&self) -> Option<BracketHighlight> {
-        let content = &self.core.active_doc().content;
-        let cursor = self.active_editor().cursor();
-        let caret = core::find::offset_at(content, cursor.position.line, cursor.position.column);
-        let m = core::brackets::match_at(content, caret)?;
-        let to_pos = |off: usize| {
-            let (line, column) = core::find::line_col_of(content, off);
-            Position { line, column }
-        };
-        Some(BracketHighlight {
-            here: to_pos(m.here),
-            partner: m.partner.map(to_pos),
-        })
+        self.readouts.bracket
+    }
+
+    /// Recompute [`Shell::readouts`] from the active document and its editor
+    /// buffer (#126). Called by [`Shell::update`] after every message that can
+    /// move the caret or change the document, and by [`Shell::boot_with`], whose
+    /// startup files land through `dispatch` directly.
+    fn refresh_readouts(&mut self) {
+        self.readouts = Readouts::of(self.core.active_doc(), self.active_editor());
     }
 
     /// The UI-chrome font as an [`iced::Font`] (#61), resolved from the persisted
@@ -2041,15 +2219,15 @@ impl Shell {
     /// the whole tab to `Fill` — making every tab stretch to an equal share of the
     /// window (and squeezing the `×` off narrow tabs). Back at `Shrink`, tabs size
     /// to `label + ×` and pack left, while the strip still spans each tab's width
-    /// via the flex cross-axis pass.
-    fn tab_widget(
-        &self,
+    /// via the flex cross-axis pass. `name` comes from the frame's [`TabSplit`]: a
+    /// borrowed title for a clean tab, so the label costs no allocation (#126).
+    fn tab_widget<'a>(
         i: usize,
-        name: String,
+        name: Cow<'a, str>,
         active: bool,
         ui: iced::Font,
         t: theme::Tokens,
-    ) -> Element<'_, Message> {
+    ) -> Element<'a, Message> {
         let fg = if active { t.tab_active_fg } else { t.tab_fg };
         let strip = container(Space::new())
             .width(Fill)
@@ -2072,23 +2250,25 @@ impl Shell {
         column![strip, body].width(Length::Shrink).into()
     }
 
-    /// Each tab's display name plus the split into `(names, inline, overflow)`
-    /// index lists (#70). `view` can't measure text, so the widths are estimated
-    /// from iced's default ~16px chrome text; the constants cover the body padding,
-    /// both buttons' own padding, the `×`, and the row spacing, and are generous on
-    /// purpose so the overflow control appears *before* a tab would clip. Shared by
-    /// [`Shell::tab_strip`] and [`Shell::tabs_overflow_menu`] so both agree on which
-    /// tabs are collapsed.
-    fn tab_split(&self) -> (Vec<String>, Vec<usize>, Vec<usize>) {
-        let names: Vec<String> = self
+    /// Each tab's display name plus the split into inline and overflow index
+    /// lists, as one [`TabSplit`] (#70). `view` can't measure text, so the widths
+    /// are estimated from iced's default ~16px chrome text; the constants cover
+    /// the body padding, both buttons' own padding, the `×`, and the row spacing,
+    /// and are generous on purpose so the overflow control appears *before* a tab
+    /// would clip. Computed once per frame by [`Shell::view`] and shared with
+    /// [`Shell::tab_strip`] and [`Shell::tabs_overflow_menu`] so both agree on
+    /// which tabs are collapsed (#126).
+    fn tab_split(&self) -> TabSplit<'_> {
+        let names: Vec<Cow<'_, str>> = self
             .core
             .docs
             .iter()
             .map(|doc| {
+                // `dirty()` is an O(1) flag read (#126); only the marker allocates.
                 if doc.dirty() {
-                    format!("{} \u{2022}", doc.title())
+                    Cow::Owned(format!("{} \u{2022}", doc.title()))
                 } else {
-                    doc.title().to_string()
+                    Cow::Borrowed(doc.title())
                 }
             })
             .collect();
@@ -2102,7 +2282,11 @@ impl Shell {
             .collect();
         let (visible, overflow) =
             split_tabs_for_width(&widths, self.window_width, OVERFLOW_W, self.core.active);
-        (names, visible, overflow)
+        TabSplit {
+            names,
+            visible,
+            overflow,
+        }
     }
 
     /// The Chrome-style tab strip (#70): content-sized tabs packed from the left,
@@ -2110,17 +2294,29 @@ impl Shell {
     /// (rather than a scrollbar) that toggles [`Shell::tabs_overflow_menu`]. The
     /// active tab is always kept inline so it stays visible. The bar spans the full
     /// width in `tabs_bg`, which the active tab (`app_bg`) sits proud of.
-    fn tab_strip(&self, ui: iced::Font, t: theme::Tokens) -> Element<'_, Message> {
+    fn tab_strip<'a>(
+        &'a self,
+        ui: iced::Font,
+        t: theme::Tokens,
+        split: &TabSplit<'a>,
+    ) -> Element<'a, Message> {
         let active = self.core.active;
-        let (names, visible, overflow) = self.tab_split();
         let mut tabs = row![].spacing(0);
-        for &i in &visible {
-            tabs = tabs.push(self.tab_widget(i, names[i].clone(), i == active, ui, t));
+        for &i in &split.visible {
+            // Cloning a borrowed (clean) name is a pointer copy; only a dirty
+            // tab's marked name is a real `String` clone (#126).
+            tabs = tabs.push(Self::tab_widget(
+                i,
+                split.names[i].clone(),
+                i == active,
+                ui,
+                t,
+            ));
         }
-        if !overflow.is_empty() {
+        if !split.overflow.is_empty() {
             // Accent "on" look while the menu is open, matching the toolbar toggles.
             tabs = tabs.push(
-                button(text(format!("\u{25be} {} more", overflow.len())).font(ui))
+                button(text(format!("\u{25be} {} more", split.overflow.len())).font(ui))
                     .style(theme::toggle(t, self.tabs_menu_open))
                     .padding([6, 10])
                     .on_press(Message::ToggleTabsMenu),
@@ -2139,16 +2335,20 @@ impl Shell {
     /// readable width and clips over-long names. Returns an empty element when
     /// nothing has overflowed, so a stale open flag (e.g. after the window was
     /// widened) renders nothing.
-    fn tabs_overflow_menu(&self, ui: iced::Font, t: theme::Tokens) -> Element<'_, Message> {
-        let (names, _visible, overflow) = self.tab_split();
-        if overflow.is_empty() {
+    fn tabs_overflow_menu<'a>(
+        &'a self,
+        ui: iced::Font,
+        t: theme::Tokens,
+        split: &TabSplit<'a>,
+    ) -> Element<'a, Message> {
+        if split.overflow.is_empty() {
             return Space::new().into();
         }
         let mut list = column![].spacing(2);
-        for &i in &overflow {
+        for &i in &split.overflow {
             list = list.push(
                 row![
-                    button(text(names[i].clone()).font(ui))
+                    button(text(split.names[i].clone()).font(ui))
                         .style(theme::ghost(t))
                         .width(Fill)
                         .on_press(Message::TabSelected(i)),
@@ -2166,7 +2366,7 @@ impl Shell {
         // per-row height estimate; the cap is what actually bounds the card.
         const ROW_H: f32 = 34.0;
         const MAX_H: f32 = 360.0;
-        let list_h = (overflow.len() as f32 * ROW_H).min(MAX_H);
+        let list_h = (split.overflow.len() as f32 * ROW_H).min(MAX_H);
         let card = container(scrollable(list).height(Length::Fixed(list_h)))
             .padding(6)
             .width(Length::Fixed(260.0))
@@ -2234,13 +2434,7 @@ impl Shell {
         const SPACING: f32 = 6.0;
         let bw = |chars: usize| chars as f32 * GLYPH_W + BTN_CHROME;
         // The pick_list sizes to its widest option, not the placeholder.
-        let picker_w = textop_options()
-            .iter()
-            .map(|s| s.chars().count())
-            .max()
-            .unwrap_or(0) as f32
-            * GLYPH_W
-            + PICKER_CHROME;
+        let picker_w = textop_widest_label() as f32 * GLYPH_W + PICKER_CHROME;
         let edit_items: Vec<(f32, Element<'_, Message>)> = vec![
             (bw(3), tb("New").on_press(Message::NewTab).into()),
             (bw(4), tb("Open").on_press(Message::Open).into()),
@@ -2331,7 +2525,10 @@ impl Shell {
             .style(theme::bar(t.toolbar_bg))
             .width(Fill);
 
-        let tabs = self.tab_strip(ui, t);
+        // The tab names and the inline/overflow split, once per frame (#126):
+        // shared by the strip, the overflow menu and its open check below.
+        let split = self.tab_split();
+        let tabs = self.tab_strip(ui, t, &split);
 
         let editor = text_editor(self.active_editor())
             .on_action(Message::Edit)
@@ -2357,7 +2554,7 @@ impl Shell {
             // highlighting" without changing the widget's type.
             .highlight_with::<SyntectHighlighter>(
                 highlight::Settings {
-                    syntax: self.core.active_doc().language().to_string(),
+                    syntax: self.core.active_doc().language(),
                     // Pair the editor's syntect theme with the UI theme (#36):
                     // light UI → GitHub-light, dark UI → Monokai.
                     theme: self.core.theme(),
@@ -2411,14 +2608,13 @@ impl Shell {
         // corner is right below the `▾ N more` button — floating here needs no
         // absolute offset. A full-area transparent backdrop dismisses on any
         // off-menu click (toggling the flag back off), like the context menu.
-        let (_, _, overflow) = self.tab_split();
-        let editor: Element<'_, Message> = if self.tabs_menu_open && !overflow.is_empty() {
+        let editor: Element<'_, Message> = if self.tabs_menu_open && !split.overflow.is_empty() {
             stack![
                 editor,
                 mouse_area(container(text("")).width(Fill).height(Fill))
                     .on_press(Message::ToggleTabsMenu)
                     .on_right_press(Message::ToggleTabsMenu),
-                self.tabs_overflow_menu(ui, t),
+                self.tabs_overflow_menu(ui, t, &split),
             ]
             .into()
         } else {
@@ -2477,7 +2673,7 @@ impl Shell {
                 let right = row![
                     mode,
                     text(s.eol).font(ui),
-                    pick_list(encoding_options(), Some(s.encoding), Message::SetEncoding)
+                    pick_list(encoding_options(), Some(&s.encoding), Message::SetEncoding)
                         .style(theme::picker(t))
                         .menu_style(theme::picker_menu(t))
                         .font(ui)
@@ -2765,32 +2961,23 @@ impl Shell {
 
     /// The in-app "this file is large — open anyway?" bar, shown while a big file
     /// awaits the user's answer (#102). The vendored editor shapes every line up
-    /// front, so opening a many-line (or one enormous-line) file blocks the UI
-    /// for seconds; this warns first and lets the user open it anyway or back
-    /// out. Rendered as an in-app bar rather than a native dialog for the same
-    /// reasons as [`Shell::confirm_bar`].
+    /// front, so opening a many-line, many-megabyte or one-enormous-line file
+    /// blocks the UI for seconds and holds gigabytes; this warns first and lets
+    /// the user open it anyway or back out. Rendered as an in-app bar rather
+    /// than a native dialog for the same reasons as [`Shell::confirm_bar`].
     fn large_open_confirm_bar(&self) -> Element<'_, Message> {
         let Some(pending) = &self.confirm_large_open else {
             return row![].into(); // never rendered unless set; empty as a guard
         };
         let ui = self.ui_font();
         let t = self.tokens();
-        let name = pending.path.file_name().map_or_else(
-            || pending.path.display().to_string(),
-            |n| n.to_string_lossy().into_owned(),
-        );
-        // Two triggers, two phrasings (#102): a many-line file reports its line
-        // count, while a lone enormous line (which trips on byte length, not line
-        // count — "1 lines" would mislead) is described as such.
-        let scale = if pending.lines >= LARGE_FILE_LINES {
-            format!("{} lines", pending.lines)
-        } else {
-            "a very long line".to_string()
-        };
-        let prompt = format!("\u{201c}{name}\u{201d} has {scale} and may be slow to open.");
+        let prompt = large_open_prompt(pending);
         container(
             row![
-                text(prompt).font(ui),
+                // The sentence names the threshold and the cost, so it is longer
+                // than the other bars' prompts: let it take the remaining width
+                // and wrap, rather than pushing the buttons off the window.
+                text(prompt).font(ui).width(Fill),
                 button(text("Open anyway").font(ui))
                     .style(theme::accent(t))
                     .on_press(Message::LargeOpenConfirmed),
@@ -3184,7 +3371,7 @@ fn is_group_header(label: &str) -> bool {
 /// `pick_list` has no native option groups, so headers are rendered as (inert)
 /// entries — good-enough parity with the old grouped `<optgroup>` dropdown.
 fn language_options() -> &'static [String] {
-    static OPTS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    static OPTS: OnceLock<Vec<String>> = OnceLock::new();
     OPTS.get_or_init(|| {
         let mut opts = vec![
             AUTO_DETECT_LABEL.to_string(),
@@ -3202,7 +3389,7 @@ fn language_options() -> &'static [String] {
 /// so the shell and core never drift. `pick_list` wants owned `String`s, and the
 /// status bar's selection is the active document's label, also a `String`.
 fn encoding_options() -> &'static [String] {
-    static OPTS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    static OPTS: OnceLock<Vec<String>> = OnceLock::new();
     OPTS.get_or_init(|| {
         core::encoding::options()
             .iter()
@@ -3264,7 +3451,7 @@ const TEXT_OPS_PLACEHOLDER: &str = "Text ops…";
 /// [`textop_from_label`] recognises. Built once; `pick_list` wants owned
 /// `String`s.
 fn textop_options() -> &'static [String] {
-    static OPTS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    static OPTS: OnceLock<Vec<String>> = OnceLock::new();
     OPTS.get_or_init(|| {
         [
             &group_header("Sort") as &str,
@@ -3289,6 +3476,20 @@ fn textop_options() -> &'static [String] {
         .iter()
         .map(|s| s.to_string())
         .collect()
+    })
+}
+
+/// The widest [`textop_options`] label, in characters — what sizes the text-ops
+/// `pick_list`, which grows to its widest option rather than its placeholder.
+/// Counted once: `view` used to re-walk every label on every frame (#126).
+fn textop_widest_label() -> usize {
+    static WIDEST: OnceLock<usize> = OnceLock::new();
+    *WIDEST.get_or_init(|| {
+        textop_options()
+            .iter()
+            .map(|s| s.chars().count())
+            .max()
+            .unwrap_or(0)
     })
 }
 
@@ -3327,6 +3528,52 @@ fn textop_from_label(label: &str) -> Option<core::TextOp> {
         "Spaces → Tabs" => SpacesToTabs { width },
         _ => return None,
     })
+}
+
+/// The chrome colour tokens for `mode` (#70): the one mapping from the core's
+/// light/dark [`core::ThemeMode`] to a [`theme::Tokens`] set, shared by
+/// [`Shell::tokens`] and [`app_theme`] so the hand-styled chrome and the coarse
+/// `iced::Theme` can never disagree about which palette is active.
+fn tokens_for(mode: core::ThemeMode) -> theme::Tokens {
+    match mode {
+        core::ThemeMode::Light => theme::LIGHT,
+        core::ThemeMode::Dark => theme::DARK,
+    }
+}
+
+/// The app's custom `iced::Theme` for `mode` (#36/#70), built **once** per mode
+/// and shared from then on (#126).
+///
+/// `iced::Theme::custom` allocates the name and an `Arc<Custom>` and runs
+/// `palette::Extended::generate` — dozens of colour mixes covering every widget
+/// state — and iced asks the application for its theme on every frame, so
+/// building it per call paid all of that several times a second while idle.
+/// Only two themes can ever exist (one per mode, from `const` tokens), so each
+/// lives in a `OnceLock` and callers receive an `Arc` clone.
+fn app_theme(mode: core::ThemeMode) -> iced::Theme {
+    static LIGHT: OnceLock<iced::Theme> = OnceLock::new();
+    static DARK: OnceLock<iced::Theme> = OnceLock::new();
+    let cell = match mode {
+        core::ThemeMode::Light => &LIGHT,
+        core::ThemeMode::Dark => &DARK,
+    };
+    cell.get_or_init(|| {
+        let t = tokens_for(mode);
+        iced::Theme::custom(
+            APP_NAME.to_owned(),
+            iced::theme::Palette {
+                background: t.app_bg,
+                text: t.text,
+                primary: t.accent,
+                success: t.accent,
+                // `Tokens` carries no distinct warning colour; the danger red
+                // doubles for it (nothing in the chrome uses `warning`).
+                warning: t.danger,
+                danger: t.danger,
+            },
+        )
+    })
+    .clone()
 }
 
 /// The display name shown in the window title and the About panel (#40).
@@ -3488,7 +3735,6 @@ mod tests {
     //! **no window and no GPU**. `view` needs a renderer so it is not driven
     //! here; `update`/`apply_core` are, which is where all the shell logic lives.
     use super::*;
-    use std::sync::Arc;
 
     fn paste(s: &str) -> text_editor::Action {
         text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new(s.to_string())))
@@ -3537,7 +3783,7 @@ mod tests {
         assert_eq!(shell.core.docs[0].path.as_deref(), Some(a.as_path()));
         assert_eq!(shell.core.docs[1].path.as_deref(), Some(b.as_path()));
         assert_eq!(shell.core.active_doc().path.as_deref(), Some(b.as_path()));
-        assert_eq!(shell.core.active_doc().content, "fn beta() {}");
+        assert_eq!(shell.core.active_doc().content(), "fn beta() {}");
         // The editor buffer shows the focused file, and nothing is dirty.
         assert_eq!(shell.active_editor().text().trim_end(), "fn beta() {}");
         assert!(shell.core.docs.iter().all(|d| !d.dirty()));
@@ -3562,7 +3808,7 @@ mod tests {
             shell.core.active_doc().path.as_deref(),
             Some(good.as_path())
         );
-        assert_eq!(shell.core.active_doc().content, "# ok");
+        assert_eq!(shell.core.active_doc().content(), "# ok");
         assert!(
             shell.error.is_some(),
             "the failed read is surfaced in the status bar"
@@ -3710,7 +3956,7 @@ mod tests {
         assert!(
             !shell.core.active_doc().dirty(),
             "back at the saved baseline, content={:?}",
-            shell.core.active_doc().content,
+            shell.core.active_doc().content(),
         );
         assert!(
             !shell.title.starts_with('\u{2022}'),
@@ -3803,12 +4049,55 @@ mod tests {
     }
 
     #[test]
+    fn tab_names_borrow_clean_titles_and_allocate_only_the_dirty_marker() {
+        // `tab_split` runs once per frame (#126): a clean tab's name must be the
+        // document's own title, borrowed, and only a dirty tab's "•"-marked name
+        // may allocate — pinned through the `Cow` variants.
+        let (mut shell, _) = Shell::new();
+        open_file(&mut shell, "/tmp/clean.txt", "clean");
+        let _ = shell.update(Message::NewTab);
+        let _ = shell.update(Message::Edit(paste("x")));
+        let split = shell.tab_split();
+        assert_eq!(split.names.len(), 2);
+        assert!(
+            matches!(split.names[0], Cow::Borrowed("clean.txt")),
+            "a clean tab borrows its title: {:?}",
+            split.names[0]
+        );
+        assert!(
+            matches!(&split.names[1], Cow::Owned(name) if name == "Untitled \u{2022}"),
+            "a dirty tab owns its marked name: {:?}",
+            split.names[1]
+        );
+        // Both fit the default width: all inline, nothing collapsed.
+        assert_eq!(split.visible, vec![0, 1]);
+        assert!(split.overflow.is_empty());
+    }
+
+    #[test]
+    fn the_widest_textop_label_matches_the_options() {
+        // The toolbar sizes the text-ops picker from this once-counted width
+        // (#126); it must be the real maximum over the picker's own options.
+        let expected = textop_options()
+            .iter()
+            .map(|s| s.chars().count())
+            .max()
+            .expect("the picker has options");
+        assert_eq!(textop_widest_label(), expected);
+        assert_eq!(
+            textop_widest_label(),
+            "Sort Lines A\u{2192}Z (ignore case)".chars().count(),
+            "the widest entry today"
+        );
+    }
+
+    #[test]
     fn typing_marks_the_document_dirty() {
         let (mut shell, _) = Shell::new();
         assert!(!shell.core.active_doc().dirty());
         let _ = shell.update(Message::Edit(paste("hello")));
         assert!(shell.core.active_doc().dirty());
-        assert_eq!(shell.core.active_doc().content.trim_end(), "hello");
+        assert_eq!(shell.core.active_doc().content().trim_end(), "hello");
     }
 
     #[test]
@@ -3958,7 +4247,7 @@ mod tests {
         assert_eq!(shell.active_editor().text().trim_end(), "start END");
         // It went *through the core*, not just the widget, so the core's buffer
         // matches — which is what keeps paste undoable.
-        assert_eq!(shell.core.active_doc().content.trim_end(), "start END");
+        assert_eq!(shell.core.active_doc().content().trim_end(), "start END");
 
         let before = shell.active_editor().text();
         let _ = shell.update(Message::ContextPasteReady(None));
@@ -4019,6 +4308,58 @@ mod tests {
         // Back to the first tab: the editor must show its content, not "bbb".
         let _ = shell.update(Message::TabSelected(0));
         assert_eq!(shell.active_editor().text().trim_end(), "aaa");
+    }
+
+    #[test]
+    fn the_editor_cache_reconciles_whenever_its_keys_drift_from_the_docs() {
+        // `sync_editor_cache` runs on every core round-trip (#126) and skips its
+        // prune/create passes while the cache already mirrors `core.docs`. The
+        // skip must be exact, so this stages each way the keys can drift and
+        // checks the slow path still runs. Nothing in production drifts the
+        // cache (the core is the only source of document ids), hence the staging.
+        let (mut shell, _) = Shell::new();
+        let first = shell.core.active_doc().id;
+        let _ = shell.update(Message::NewTab);
+        let second = shell.core.active_doc().id;
+        let ids = |shell: &Shell| {
+            let mut ids: Vec<TabId> = shell.editors.keys().copied().collect();
+            ids.sort_unstable();
+            ids
+        };
+        assert_eq!(ids(&shell), vec![first, second]);
+
+        // An orphan (a buffer for no document) is pruned on the next round-trip.
+        // `CloseFind` is a core no-op here, but it is a full `apply_core` pass.
+        shell
+            .editors
+            .insert(u64::MAX, text_editor::Content::with_text("ghost"));
+        let _ = shell.update(Message::CloseFind);
+        assert_eq!(ids(&shell), vec![first, second], "an orphan is pruned");
+
+        // A missing buffer is recreated from the document's text.
+        shell.editors.remove(&first);
+        let _ = shell.update(Message::CloseFind);
+        assert_eq!(
+            ids(&shell),
+            vec![first, second],
+            "a missing one is recreated"
+        );
+
+        // Same count, wrong key — an orphan standing in for a missing buffer. A
+        // length-only gate would wrongly take the fast path here.
+        let stray = shell.editors.remove(&first).expect("recreated above");
+        shell.editors.insert(u64::MAX, stray);
+        let _ = shell.update(Message::CloseFind);
+        assert_eq!(
+            ids(&shell),
+            vec![first, second],
+            "a swapped key is reconciled, not mistaken for in-step"
+        );
+        assert_eq!(
+            shell.editors[&first].text().trim_end(),
+            "",
+            "the buffer comes back from the (blank) document, not the stray"
+        );
     }
 
     #[test]
@@ -4270,15 +4611,24 @@ mod tests {
 
     // ---- Large-file open guard wiring (#102) ----
     // The vendored editor shapes every line up front, so a huge file is slow to
-    // open; these assert the confirm-first wiring. They deliberately never let a
-    // huge buffer reach the editor — shaping ~200k lines in a debug build is ~65s
-    // (see #102) — so the *load* path is exercised through a small stashed buffer,
+    // open and holds gigabytes (#126); these assert the confirm-first wiring.
+    // They deliberately never let a huge buffer reach the editor — shaping
+    // ~200k lines in a debug build is ~65 s (see #102), 50k lines a quarter of
+    // that — so the *load* path is exercised through a small stashed buffer,
     // while the *trip* path uses a big string that is only counted, never shaped.
+
+    /// A buffer of `lines` lines, each `line_bytes` bytes including its `\n`.
+    fn lines_of(lines: usize, line_bytes: usize) -> String {
+        format!("{}\n", "a".repeat(line_bytes - 1)).repeat(lines)
+    }
 
     #[test]
     fn opening_a_many_line_file_asks_before_loading() {
         let (mut shell, _) = Shell::new();
         let big = "x\n".repeat(LARGE_FILE_LINES);
+        // Short lines, so this is the *line* gate alone: 100 KB is far under the
+        // size gate and no line comes near the long-line gate.
+        assert!(big.len() < LARGE_FILE_BYTES);
         let _ = shell.update(Message::FileRead {
             path: PathBuf::from("/tmp/huge.log"),
             result: Ok(big.into_bytes()),
@@ -4289,17 +4639,55 @@ mod tests {
             .as_ref()
             .expect("a many-line file arms the confirm bar");
         assert_eq!(pending.lines, LARGE_FILE_LINES);
+        assert_eq!(
+            large_open_prompt(pending),
+            "\u{201c}huge.log\u{201d} has 50000 lines (0.1 MiB). Opening it may take a while \
+             and, for the largest files, use several GB of memory."
+        );
         assert_eq!(shell.core.docs.len(), 1);
         assert_eq!(shell.active_editor().text().trim_end(), "");
         let _ = shell.view(); // the large-file bar builds (many-line phrasing)
     }
 
     #[test]
+    fn opening_a_many_megabyte_file_asks_before_loading() {
+        // Lines well under the line gate and each far under the long-line gate,
+        // but 10 MiB in total: the *size* gate alone trips (#126 — shaping cost
+        // follows glyphs, and 200k × 60 B measured 7.5 GB of resident memory).
+        let (mut shell, _) = Shell::new();
+        let wide = lines_of(40_000, 256);
+        assert!(wide.len() >= LARGE_FILE_BYTES && wide.len() < 2 * LARGE_FILE_BYTES);
+        let _ = shell.update(Message::FileRead {
+            path: PathBuf::from("/tmp/wide.csv"),
+            result: Ok(wide.into_bytes()),
+        });
+        let pending = shell
+            .confirm_large_open
+            .as_ref()
+            .expect("a many-megabyte file arms the confirm bar");
+        assert_eq!(pending.lines, 40_000);
+        assert!(
+            pending.lines < LARGE_FILE_LINES,
+            "the line gate did not trip"
+        );
+        assert_eq!(
+            large_open_prompt(pending),
+            "\u{201c}wide.csv\u{201d} is 9.8 MiB. Opening it may take a while and, for the \
+             largest files, use several GB of memory."
+        );
+        assert_eq!(shell.core.docs.len(), 1);
+        assert_eq!(shell.active_editor().text().trim_end(), "");
+        let _ = shell.view(); // the large-file bar builds (size phrasing)
+    }
+
+    #[test]
     fn opening_one_enormous_line_asks_before_loading() {
         // A lone long line is fast to *open* but slow to *edit*, so it is gated on
-        // its byte length even though the line count is only 1 (#102).
+        // its byte length even though the line count is only 1 (#102) — and
+        // 500 KB is under the size gate, so this is the long-line gate alone.
         let (mut shell, _) = Shell::new();
         let long = "a".repeat(LARGE_FILE_LINE_BYTES);
+        assert!(long.len() < LARGE_FILE_BYTES);
         let _ = shell.update(Message::FileRead {
             path: PathBuf::from("/tmp/oneline.txt"),
             result: Ok(long.into_bytes()),
@@ -4309,8 +4697,57 @@ mod tests {
             .as_ref()
             .expect("an enormous single line arms the confirm bar");
         assert_eq!(pending.lines, 1);
+        assert_eq!(
+            large_open_prompt(pending),
+            "\u{201c}oneline.txt\u{201d} has a very long line. Opening it may take a while \
+             and, for the largest files, use several GB of memory."
+        );
         assert_eq!(shell.active_editor().text().trim_end(), "");
         let _ = shell.view(); // the large-file bar builds (long-line phrasing)
+    }
+
+    #[test]
+    fn a_file_just_under_every_threshold_is_not_gated() {
+        // One line, one byte and one long-line byte short of the three gates at
+        // once — then each gate pushed over on its own, so a gate that is dropped
+        // or compared with the wrong inequality shows up as the case that stops
+        // tripping. (Measured through the gate function: actually shaping 50k
+        // lines in a debug build would take tens of seconds.)
+        let under_lines = LARGE_FILE_LINES - 1;
+        let line_bytes = (LARGE_FILE_BYTES - 1) / under_lines; // 167 → 8.35 MB total
+        let under = lines_of(under_lines, line_bytes);
+        assert!(under.len() < LARGE_FILE_BYTES);
+        assert_eq!(under.lines().count(), under_lines);
+        assert_eq!(
+            large_file_lines(&under),
+            None,
+            "just under all three: opens"
+        );
+
+        // + one line → the line gate.
+        let one_more_line = format!("{under}z\n");
+        assert!(one_more_line.len() < LARGE_FILE_BYTES);
+        assert_eq!(large_file_lines(&one_more_line), Some(LARGE_FILE_LINES));
+
+        // + the missing bytes on the last line (still a short line, same line
+        // count) → the size gate.
+        let pad = LARGE_FILE_BYTES - under.len();
+        assert!(pad + line_bytes < LARGE_FILE_LINE_BYTES);
+        let heavier = format!("{}{}\n", &under[..under.len() - 1], "b".repeat(pad));
+        assert_eq!(heavier.len(), LARGE_FILE_BYTES);
+        assert_eq!(heavier.lines().count(), under_lines);
+        assert_eq!(large_file_lines(&heavier), Some(under_lines));
+
+        // The last 3 000 short lines swapped for one line at the long-line gate:
+        // fewer lines and fewer bytes than `under`, so only that gate can trip.
+        let stretched = format!(
+            "{}{}\n",
+            &under[..under.len() - 3_000 * line_bytes],
+            "c".repeat(LARGE_FILE_LINE_BYTES)
+        );
+        assert!(stretched.len() < under.len());
+        assert_eq!(stretched.lines().count(), under_lines - 2_999);
+        assert_eq!(large_file_lines(&stretched), Some(under_lines - 2_999));
     }
 
     #[test]
@@ -4348,6 +4785,7 @@ mod tests {
             "confirming clears the bar"
         );
         assert_eq!(shell.active_editor().text().trim_end(), "loaded at last");
+        assert_eq!(shell.core.active_doc().title(), "huge.log");
     }
 
     #[test]
@@ -4600,7 +5038,7 @@ mod tests {
         let _ = shell.update(Message::Edit(paste("a\nb")));
         let _ = shell.update(Message::GoToInputChanged("not-a-number".into()));
         let _ = shell.update(Message::GoToSubmit); // must not panic
-        assert_eq!(shell.core.active_doc().content, "a\nb");
+        assert_eq!(shell.core.active_doc().content(), "a\nb");
     }
 
     #[test]
@@ -4611,7 +5049,7 @@ mod tests {
         let _ = shell.update(Message::FindQueryChanged("ab".into()));
         let _ = shell.update(Message::ReplaceQueryChanged("X".into()));
         let _ = shell.update(Message::ReplaceOne);
-        assert_eq!(shell.core.active_doc().content, "X ab ab");
+        assert_eq!(shell.core.active_doc().content(), "X ab ab");
         assert_eq!(shell.active_editor().text().trim_end(), "X ab ab");
         // The editor resynced and the selection landed on the next match.
         assert_eq!(shell.active_editor().selection().as_deref(), Some("ab"));
@@ -4756,7 +5194,7 @@ mod tests {
             path: PathBuf::from("/tmp/u16.txt"),
             result: Ok(bytes),
         });
-        assert_eq!(shell.core.active_doc().content, "hi");
+        assert_eq!(shell.core.active_doc().content(), "hi");
         assert_eq!(shell.status().encoding, "UTF-16 LE");
         assert!(shell.error.is_none());
     }
@@ -4775,7 +5213,7 @@ mod tests {
             shell.error.is_none(),
             "a non-UTF-8 file opens, never errors"
         );
-        assert!(!shell.core.active_doc().content.is_empty());
+        assert!(!shell.core.active_doc().content().is_empty());
     }
 
     #[test]
@@ -4793,7 +5231,7 @@ mod tests {
             encoding: core::FileEncoding::from_label("Windows-1252").unwrap(),
             result: Ok(vec![b'a', 0x97, b'b']),
         });
-        assert_eq!(shell.core.active_doc().content, "a—b");
+        assert_eq!(shell.core.active_doc().content(), "a—b");
         assert_eq!(shell.status().encoding, "Windows-1252");
     }
 
@@ -4819,7 +5257,7 @@ mod tests {
             "a non-decodable reopen is blocked with an error"
         );
         assert_eq!(
-            shell.core.active_doc().content,
+            shell.core.active_doc().content(),
             "plain",
             "the buffer is untouched"
         );
@@ -4939,16 +5377,34 @@ mod tests {
         // The exception: cursor tracking for the context-menu anchor (#97 item 3)
         // paints nothing and arrives on every pointer motion, so it must NOT flip
         // the nudge — otherwise moving the mouse would repaint the whole window
-        // continuously.
+        // continuously. The same exclusion governs the readout cache (#126):
+        // pointer motion cannot move the caret, so it must not refresh the
+        // readouts either — shown by moving the caret behind the cache first.
+        let cached = shell.status().clone();
+        shell.active_editor_mut().move_to(Cursor {
+            position: Position { line: 0, column: 3 },
+            selection: None,
+        });
         let _ = shell.update(Message::EditorCursorMoved(Point::new(3.0, 4.0)));
         assert_eq!(
             shell.repaint_nudge, after_toggle,
             "cursor tracking must not flip the nudge"
         );
+        assert_eq!(
+            shell.status(),
+            &cached,
+            "cursor tracking must not refresh the readouts"
+        );
 
-        // A manual pick changes it again → flips (from the unchanged state).
+        // A manual pick changes it again → flips (from the unchanged state), and
+        // being a state change it refreshes the readouts from the live caret.
         let _ = shell.update(Message::SetLanguage("Python".to_string()));
         assert_ne!(shell.repaint_nudge, after_toggle);
+        assert_eq!(
+            (shell.status().column, shell.status().language),
+            (4, "Python"),
+            "a painting update refreshes the readouts"
+        );
 
         // The nudged background differs from the plain one, so `present` sees a
         // changed clear-colour and repaints the whole surface.
@@ -5151,6 +5607,37 @@ mod tests {
     }
 
     #[test]
+    fn the_iced_theme_is_built_once_per_mode_and_shared_across_frames() {
+        // iced asks for the theme on every frame (#126): each mode must come back
+        // as a clone of one shared `Arc`, not a freshly generated palette per call.
+        let same = |a: &iced::Theme, b: &iced::Theme| match (a, b) {
+            (iced::Theme::Custom(a), iced::Theme::Custom(b)) => Arc::ptr_eq(a, b),
+            _ => panic!("the app theme is always the custom variant"),
+        };
+        let (mut shell, _) = Shell::new();
+        let light = shell.theme();
+        assert!(
+            same(&light, &shell.theme()),
+            "two frames in light mode share one theme"
+        );
+
+        let _ = shell.update(Message::ToggleTheme);
+        let dark = shell.theme();
+        assert!(!same(&light, &dark), "dark mode is a different theme");
+        assert_eq!(dark.palette().background, theme::DARK.app_bg);
+        assert!(
+            same(&dark, &shell.theme()),
+            "two frames in dark mode share one theme"
+        );
+
+        let _ = shell.update(Message::ToggleTheme);
+        assert!(
+            same(&light, &shell.theme()),
+            "toggling back reuses the light theme rather than rebuilding it"
+        );
+    }
+
+    #[test]
     fn active_bracket_highlights_the_pair_next_to_the_caret() {
         let (mut shell, _) = Shell::new();
         let _ = shell.update(Message::Edit(paste("(x)")));
@@ -5177,6 +5664,199 @@ mod tests {
             .expect("the lone bracket is highlighted");
         assert_eq!(b.here, Position { line: 0, column: 0 });
         assert_eq!(b.partner, None);
+    }
+
+    // ---- Per-update readout cache (#126) ----
+    //
+    // `view` reads the status bar and the bracket highlight from a cache that
+    // `update` refreshes, instead of deriving them on every frame. These tests
+    // pin both halves: the cache follows every kind of state change, and the two
+    // messages excluded from the refresh really do leave it alone. The latter is
+    // observed by moving the caret *behind the shell's back* — something no
+    // production path does (every caret move arrives as a message through
+    // `update`) — so a readout still showing the old caret is provably cached.
+
+    #[test]
+    fn pointer_tracking_and_resizes_do_not_recompute_the_readouts() {
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::Edit(paste("ab(x)\nmore")));
+        // The caret sits at the end of line 2, where no bracket is adjacent.
+        assert_eq!((shell.status().line, shell.status().column), (2, 5));
+        assert!(shell.active_bracket().is_none());
+        // Park the *live* caret right after the ')' on line 1 — where the status
+        // would read (1, 6) and a pair is adjacent — without telling the cache.
+        shell.active_editor_mut().move_to(Cursor {
+            position: Position { line: 0, column: 5 },
+            selection: None,
+        });
+
+        let _ = shell.update(Message::EditorCursorMoved(Point::new(3.0, 4.0)));
+        assert_eq!(
+            (shell.status().line, shell.status().column),
+            (2, 5),
+            "pointer motion must not recompute the status readout"
+        );
+        assert!(
+            shell.active_bracket().is_none(),
+            "pointer motion must not recompute the bracket readout"
+        );
+        let _ = shell.update(Message::WindowResized(640.0));
+        assert_eq!(
+            (shell.status().line, shell.status().column),
+            (2, 5),
+            "a resize must not recompute the readouts either"
+        );
+        assert!(shell.active_bracket().is_none());
+        // Scrolling repaints but moves no caret: a wheel tick's `Scroll` action,
+        // the nudge it sends and the settle frames that follow all leave the
+        // cache alone (#126) — they would otherwise run the bracket scan up to
+        // five times per tick.
+        for message in [
+            Message::Edit(text_editor::Action::Scroll { lines: 1 }),
+            Message::ScrollNudge,
+            Message::ScrollSettle,
+        ] {
+            let _ = shell.update(message);
+            assert_eq!(
+                (shell.status().line, shell.status().column),
+                (2, 5),
+                "scrolling must not recompute the status readout"
+            );
+            assert!(
+                shell.active_bracket().is_none(),
+                "scrolling must not recompute the bracket readout"
+            );
+        }
+
+        // Any other message is a potential state change and refreshes the cache
+        // from the live caret.
+        let _ = shell.update(Message::DismissError);
+        assert_eq!(
+            (shell.status().line, shell.status().column),
+            (1, 6),
+            "the next state-changing update refreshes the status readout"
+        );
+        let b = shell
+            .active_bracket()
+            .expect("the pair next to the parked caret");
+        assert_eq!(b.here, Position { line: 0, column: 4 });
+        assert_eq!(b.partner, Some(Position { line: 0, column: 2 }));
+    }
+
+    #[test]
+    fn readouts_follow_caret_moves_edits_and_undo() {
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::Edit(paste("one\ntwo")));
+        let after_paste = shell.status().clone();
+        assert_eq!((after_paste.line, after_paste.column), (2, 4));
+
+        // A caret-only action — not an edit, so the core never hears of it —
+        // still refreshes the position.
+        let _ = shell.update(Message::Edit(text_editor::Action::Move(
+            text_editor::Motion::DocumentStart,
+        )));
+        assert_eq!(
+            (shell.status().line, shell.status().column),
+            (1, 1),
+            "a cursor-move action refreshes the caret readout"
+        );
+        assert_eq!(
+            shell.status().chars,
+            after_paste.chars,
+            "a cursor move leaves the totals alone"
+        );
+
+        // An edit refreshes the totals, the caret and the bracket readout.
+        let _ = shell.update(Message::Edit(paste("(")));
+        assert_eq!(
+            shell.status().chars,
+            after_paste.chars + 1,
+            "an edit refreshes the character total"
+        );
+        assert_eq!((shell.status().line, shell.status().column), (1, 2));
+        let b = shell.active_bracket().expect("the bracket just typed");
+        assert_eq!(b.here, Position { line: 0, column: 0 });
+        assert_eq!(b.partner, None, "an unbalanced opener has no partner");
+
+        // Undo rewrites the buffer from the core and resyncs the editor: the
+        // total goes back and the bracket readout clears.
+        let _ = shell.update(Message::Undo);
+        assert_eq!(
+            shell.status().chars,
+            after_paste.chars,
+            "undo refreshes the totals"
+        );
+        assert!(
+            shell.active_bracket().is_none(),
+            "undo refreshes the bracket readout"
+        );
+    }
+
+    #[test]
+    fn readouts_follow_a_tab_switch() {
+        let (mut shell, _) = Shell::new();
+        open_file(&mut shell, "/tmp/three.rs", "a\nb\nc");
+        let rust_tab = shell.status().clone();
+        assert_eq!((rust_tab.lines, rust_tab.language), (3, "Rust"));
+
+        let _ = shell.update(Message::NewTab);
+        assert_eq!(
+            (shell.status().lines, shell.status().language),
+            (1, "Plain Text"),
+            "a new tab refreshes the readouts to the blank document"
+        );
+
+        let _ = shell.update(Message::TabSelected(0));
+        assert_eq!(
+            shell.status(),
+            &rust_tab,
+            "switching back refreshes the readouts to that tab's document"
+        );
+    }
+
+    #[test]
+    fn readouts_follow_a_find_reveal() {
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::Edit(paste("one\ntwo\nthree")));
+        let _ = shell.update(Message::ToggleFind);
+        assert_eq!(shell.status().selection, 0);
+        // Incremental find selects the first match through `Effect::RevealRange`,
+        // which moves the editor caret inside `dispatch`.
+        let _ = shell.update(Message::FindQueryChanged("two".into()));
+        let s = shell.status();
+        assert_eq!(
+            s.selection, 3,
+            "the revealed selection shows in the readout"
+        );
+        assert_eq!(
+            (s.line, s.column),
+            (2, 4),
+            "the caret readout sits at the end of the revealed match"
+        );
+    }
+
+    #[test]
+    fn readouts_follow_language_and_encoding_changes() {
+        let (mut shell, _) = Shell::new();
+        assert_eq!(shell.status().language, "Plain Text");
+        assert_eq!(shell.status().encoding, "UTF-8");
+        let _ = shell.update(Message::SetLanguage("Python".to_string()));
+        assert_eq!(
+            shell.status().language,
+            "Python",
+            "a language change refreshes the readout"
+        );
+        let _ = shell.update(Message::SetEncoding("UTF-16 LE".to_string()));
+        assert_eq!(
+            shell.status().encoding,
+            "UTF-16 LE",
+            "an encoding change refreshes the readout"
+        );
+        assert_eq!(
+            shell.status().language,
+            "Python",
+            "an encoding change keeps the rest of the readout"
+        );
     }
 
     // ---- Preferences persistence (#38) ----
@@ -5757,7 +6437,7 @@ mod tests {
         let _ = shell.update(Message::OpenLink("javascript:alert(1)".to_string()));
         let _ = shell.update(Message::LinkOpened);
         assert_eq!(shell.core.docs.len(), 1);
-        assert_eq!(shell.core.active_doc().content.trim_end(), "body");
+        assert_eq!(shell.core.active_doc().content().trim_end(), "body");
         assert!(shell.error.is_none());
     }
 
@@ -6137,9 +6817,9 @@ mod tests {
     fn the_watch_set_tracks_open_titled_tabs() {
         let (mut shell, _) = Shell::new();
         // A fresh untitled tab has nothing to watch — no watcher runs.
-        assert!(shell.watched_files().is_empty());
+        assert!(shell.watched.is_empty());
         open_file(&mut shell, "/tmp/a.txt", "a");
-        assert_eq!(shell.watched_files(), vec![PathBuf::from("/tmp/a.txt")]);
+        assert_eq!(&shell.watched[..], [PathBuf::from("/tmp/a.txt")]);
         // A second file grows the watched set (the subscription key), so iced
         // rebuilds the watcher over both — no watch outlives its tab.
         let _ = shell.update(Message::FileRead {
@@ -6147,9 +6827,42 @@ mod tests {
             result: Ok(b"b".to_vec()),
         });
         assert_eq!(
-            shell.watched_files(),
-            vec![PathBuf::from("/tmp/a.txt"), PathBuf::from("/tmp/b.txt")]
+            &shell.watched[..],
+            [PathBuf::from("/tmp/a.txt"), PathBuf::from("/tmp/b.txt")]
         );
+    }
+
+    #[test]
+    fn the_watched_set_is_shared_until_a_tab_changes_it() {
+        // iced polls `subscription()` after every update (#126): the watch key
+        // must be the very same `Arc` while the open files don't change, and a
+        // new one — with the new contents — as soon as they do.
+        let (mut shell, _) = Shell::new();
+        open_file(&mut shell, "/tmp/a.txt", "a");
+        let before = Arc::clone(&shell.watched);
+        let _ = shell.update(Message::Edit(paste("more")));
+        let _ = shell.update(Message::NewTab); // untitled: nothing new to watch
+        assert!(
+            Arc::ptr_eq(&before, &shell.watched),
+            "an edit and an untitled tab leave the watched set untouched: no rebuild"
+        );
+        let _ = shell.update(Message::FileRead {
+            path: PathBuf::from("/tmp/b.txt"),
+            result: Ok(b"b".to_vec()),
+        });
+        assert!(
+            !Arc::ptr_eq(&before, &shell.watched),
+            "a new titled tab re-keys the watch"
+        );
+        assert_eq!(
+            &shell.watched[..],
+            [PathBuf::from("/tmp/a.txt"), PathBuf::from("/tmp/b.txt")]
+        );
+        // Closing `b.txt` (tab 2, clean, so no prompt) shrinks the set again;
+        // `a.txt` stays, edited and open.
+        let _ = shell.update(Message::TabClosed(2));
+        assert_eq!(shell.core.docs.len(), 2, "the clean tab closed");
+        assert_eq!(&shell.watched[..], [PathBuf::from("/tmp/a.txt")]);
     }
 }
 
@@ -6315,8 +7028,8 @@ mod ui_tests {
 
     #[test]
     fn large_file_bar_cancel_button_loads_nothing() {
-        // A genuinely huge (200k-line) file arms the bar; the buffer is never
-        // shaped because the user cancels, so this stays fast while still
+        // A file right at the line gate (50k lines) arms the bar; the buffer is
+        // never shaped because the user cancels, so this stays fast while still
         // exercising the real threshold trip and the real Cancel button.
         let (mut shell, _) = Shell::new();
         let big = "x\n".repeat(LARGE_FILE_LINES);
@@ -6355,9 +7068,9 @@ mod ui_tests {
     #[test]
     fn large_file_bar_open_anyway_button_loads_the_file() {
         // A lone enormous line also trips the guard (on byte length, not line
-        // count) and — unlike 200k separate lines — shapes cheaply once loaded,
+        // count) and — unlike 50k separate lines — shapes cheaply once loaded,
         // so the real Open-anyway click can drive the whole accept-and-load path
-        // without the ~65s a 200k-line debug shape would cost.
+        // without the many seconds a 50k-line debug shape would cost.
         let (mut shell, _) = Shell::new();
         let long = "a".repeat(LARGE_FILE_LINE_BYTES);
         let _ = shell.update(Message::FileRead {

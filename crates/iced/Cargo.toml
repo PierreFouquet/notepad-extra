@@ -54,12 +54,15 @@ iced_core = "=0.14.0"
 iced_graphics = "=0.14.0"
 
 # Native file dialogs. `xdg-portal` keeps us off GTK system build deps (a goal of
-# the native rewrite); `async-std` gives rfd its own executor so it works
-# regardless of iced's runtime.
-rfd = { version = "0.15", default-features = false, features = [
-    "xdg-portal",
-    "async-std",
-] }
+# the native rewrite). Since rfd 0.17 the portal backend speaks D-Bus through
+# hand-written FFI over `libdbus-1`, which it `dlopen`s at **runtime** (falling
+# back to `zenity` when the library or the portal is absent) — so there is still
+# no C library to compile or link at build time, and the old `async-std` executor
+# feature (removed upstream) is gone with the `ashpd`/`zbus` stack it drove: each
+# dialog runs on its own thread. `libdbus-1` joins the dlopened runtime libraries
+# declared in the deb/rpm metadata below (#131). The `wayland` default feature
+# only serves `set_parent`, which we never call, so it stays off.
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 
 # Decode the embedded `icons/icon.png` into RGBA for the window icon (#66). Pure
 # Rust and already in `Cargo.lock`, so it adds nothing to vendor for the
@@ -137,10 +140,11 @@ highlighting for 80+ languages, find/replace/go-to-line, word wrap, editor zoom 
 and light/dark themes, and preserves each file's original line endings on save.\
 """
 # `$auto` derives the ELF-linked libs (libc6, libgcc-s1); the rest are dlopened
-# by winit/softbuffer (X11/Wayland/xkb) and cosmic-text (fontconfig) and so are
-# invisible to shlibdeps — they must be named. #44 (install into a clean
-# container + launch under xvfb) is the check that this list is complete.
-depends = "$auto, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libx11-6, libxcb1, libxcursor1, libxrandr2, libxi6, libfontconfig1"
+# by winit/softbuffer (X11/Wayland/xkb), cosmic-text (fontconfig) and rfd's
+# xdg-portal file dialogs (libdbus-1, #131) and so are invisible to shlibdeps —
+# they must be named. #44 (install into a clean container + launch under xvfb) is
+# the check that this list is complete.
+depends = "$auto, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libx11-6, libxcb1, libxcursor1, libxrandr2, libxi6, libfontconfig1, libdbus-1-3"
 assets = [
     ["target/release/notepad-extra", "usr/bin/notepad-extra", "755"],
     ["../../packaging/linux/io.github.PierreFouquet.NotepadExtra.desktop", "usr/share/applications/io.github.PierreFouquet.NotepadExtra.desktop", "644"],
@@ -179,6 +183,8 @@ libXcursor = "*"
 libXrandr = "*"
 libXi = "*"
 fontconfig = "*"
+# rfd's xdg-portal backend dlopens libdbus-1 for the file dialogs (#131).
+dbus-libs = "*"
 
 # macOS .app / .dmg via cargo-bundle. It assembles an .icns from these PNG
 # sources at build time. Icon paths are relative to this manifest.

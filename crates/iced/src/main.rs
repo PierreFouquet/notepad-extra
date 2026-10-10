@@ -1817,7 +1817,8 @@ impl Shell {
     }
 
     /// Reconcile the per-tab editor cache with the core's documents after an
-    /// update (#94), in three passes:
+    /// update (#94), in three passes — the first two skipped when the cache's
+    /// keys already mirror the documents exactly (#126):
     ///
     /// 1. **Prune** buffers whose tab has closed, so the map can't grow without
     ///    bound as tabs open and close.
@@ -1837,15 +1838,29 @@ impl Shell {
     /// — like any tab switch — restores that tab's remembered caret rather than
     /// jumping to the top.
     fn sync_editor_cache(&mut self, resync: bool) {
-        // 1. Prune buffers for tabs that no longer exist.
-        let live: HashSet<TabId> = self.core.docs.iter().map(|d| d.id).collect();
-        self.editors.retain(|id, _| live.contains(id));
+        // Fast path (#126): the cache already holds exactly the live documents —
+        // the same count, and every document's id present (ids are unique, so
+        // that is a bijection) — which is every update but a tab open or close.
+        // Then passes 1 and 2 have nothing to do and the `HashSet` pass 1 needs
+        // is never built; this runs on *every* message that reaches the core,
+        // including each keystroke.
+        let in_step = self.editors.len() == self.core.docs.len()
+            && self
+                .core
+                .docs
+                .iter()
+                .all(|d| self.editors.contains_key(&d.id));
+        if !in_step {
+            // 1. Prune buffers for tabs that no longer exist.
+            let live: HashSet<TabId> = self.core.docs.iter().map(|d| d.id).collect();
+            self.editors.retain(|id, _| live.contains(id));
 
-        // 2. Lazily create a buffer for any tab that lacks one.
-        for doc in &self.core.docs {
-            self.editors
-                .entry(doc.id)
-                .or_insert_with(|| text_editor::Content::with_text(doc.content()));
+            // 2. Lazily create a buffer for any tab that lacks one.
+            for doc in &self.core.docs {
+                self.editors
+                    .entry(doc.id)
+                    .or_insert_with(|| text_editor::Content::with_text(doc.content()));
+            }
         }
 
         // 3. Rebuild only the active buffer when the core rewrote its text.
@@ -4213,6 +4228,58 @@ mod tests {
         // Back to the first tab: the editor must show its content, not "bbb".
         let _ = shell.update(Message::TabSelected(0));
         assert_eq!(shell.active_editor().text().trim_end(), "aaa");
+    }
+
+    #[test]
+    fn the_editor_cache_reconciles_whenever_its_keys_drift_from_the_docs() {
+        // `sync_editor_cache` runs on every core round-trip (#126) and skips its
+        // prune/create passes while the cache already mirrors `core.docs`. The
+        // skip must be exact, so this stages each way the keys can drift and
+        // checks the slow path still runs. Nothing in production drifts the
+        // cache (the core is the only source of document ids), hence the staging.
+        let (mut shell, _) = Shell::new();
+        let first = shell.core.active_doc().id;
+        let _ = shell.update(Message::NewTab);
+        let second = shell.core.active_doc().id;
+        let ids = |shell: &Shell| {
+            let mut ids: Vec<TabId> = shell.editors.keys().copied().collect();
+            ids.sort_unstable();
+            ids
+        };
+        assert_eq!(ids(&shell), vec![first, second]);
+
+        // An orphan (a buffer for no document) is pruned on the next round-trip.
+        // `CloseFind` is a core no-op here, but it is a full `apply_core` pass.
+        shell
+            .editors
+            .insert(u64::MAX, text_editor::Content::with_text("ghost"));
+        let _ = shell.update(Message::CloseFind);
+        assert_eq!(ids(&shell), vec![first, second], "an orphan is pruned");
+
+        // A missing buffer is recreated from the document's text.
+        shell.editors.remove(&first);
+        let _ = shell.update(Message::CloseFind);
+        assert_eq!(
+            ids(&shell),
+            vec![first, second],
+            "a missing one is recreated"
+        );
+
+        // Same count, wrong key — an orphan standing in for a missing buffer. A
+        // length-only gate would wrongly take the fast path here.
+        let stray = shell.editors.remove(&first).expect("recreated above");
+        shell.editors.insert(u64::MAX, stray);
+        let _ = shell.update(Message::CloseFind);
+        assert_eq!(
+            ids(&shell),
+            vec![first, second],
+            "a swapped key is reconciled, not mistaken for in-step"
+        );
+        assert_eq!(
+            shell.editors[&first].text().trim_end(),
+            "",
+            "the buffer comes back from the (blank) document, not the stray"
+        );
     }
 
     #[test]

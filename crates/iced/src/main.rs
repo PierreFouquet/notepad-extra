@@ -4226,6 +4226,25 @@ mod tests {
     }
 
     #[test]
+    fn a_file_mixing_a_paragraph_separator_with_rtl_text_opens_and_renders() {
+        // #149: one line holding left-to-right text, U+2029 PARAGRAPH SEPARATOR,
+        // then Hebrew used to panic cosmic-text inside `Shell::update`, when the
+        // tab's editor buffer was built. The same sequence in a file *name*
+        // panicked the tab strip at the first `view`. Both now open and render,
+        // and the editor holds exactly the core's text.
+        let (mut shell, _) = Shell::new();
+        let text = "abc\u{2029}\u{5e9}\u{5dc}\u{5d5}\u{5dd}\nnext line\n";
+        let _ = shell.update(Message::FileRead {
+            path: PathBuf::from("/tmp/abc\u{2029}\u{5e9}\u{5dc}\u{5d5}\u{5dd}.txt"),
+            result: Ok(text.as_bytes().to_vec()),
+        });
+        assert!(shell.error.is_none());
+        assert_eq!(shell.core.active_doc().content(), text);
+        assert_eq!(shell.active_editor().text(), text);
+        let _ui = iced_test::simulator(shell.view());
+    }
+
+    #[test]
     fn a_failed_read_surfaces_an_error_without_touching_docs() {
         let (mut shell, _) = Shell::new();
         let _ = shell.update(Message::FileRead {

@@ -2859,4 +2859,104 @@ mod tests {
         assert_eq!(selection.len(), 250_001, "every character round-trips");
         assert!(selection.ends_with('Z'));
     }
+
+    // --- Mixed-direction bidi paragraphs on one buffer line (#149) ---
+
+    /// "shalom": four strong right-to-left letters.
+    const HEB: &str = "\u{5e9}\u{5dc}\u{5d5}\u{5dd}";
+
+    /// Single buffer lines that hold bidi paragraphs of different directions,
+    /// each with the direction of its first paragraph. cosmic-text breaks buffer
+    /// lines only at `\r` and `\n`, but unicode-bidi starts a paragraph after any
+    /// class-B character (U+2029, U+0085, U+001C-U+001E). cosmic-text 0.15.0
+    /// asserted that a line's paragraphs all share one direction, so every line
+    /// here panicked the widget. The panic also poisoned iced's shared font
+    /// system. The patched `vendor/cosmic-text` (upstream 1e0074c) lays the whole
+    /// line out in its first paragraph's direction instead.
+    fn mixed_direction_lines() -> Vec<(&'static str, String, bool)> {
+        vec![
+            ("LTR PS RTL", format!("abc\u{2029}{HEB}"), false),
+            ("RTL PS LTR", format!("{HEB}\u{2029}abc"), true),
+            ("PS RTL", format!("\u{2029}{HEB}"), false),
+            ("RTL PS PS", format!("{HEB}\u{2029}\u{2029}"), true),
+            ("RTL PS digits", format!("{HEB}\u{2029}123"), true),
+            ("RTL PS space", format!("{HEB}\u{2029} "), true),
+            ("LTR NEL RTL", format!("abc\u{85}{HEB}"), false),
+            ("LTR FS RTL", format!("abc\u{1c}{HEB}"), false),
+            ("LTR GS RTL", format!("abc\u{1d}{HEB}"), false),
+            ("LTR RS RTL", format!("abc\u{1e}{HEB}"), false),
+            (
+                "LTR PS Arabic",
+                "abc\u{2029}\u{645}\u{631}\u{62d}\u{628}\u{627}".to_string(),
+                false,
+            ),
+            ("RLM PS PS", "\u{200f}\u{2029}\u{2029}".to_string(), true),
+            (
+                "RTL PS isolated RTL",
+                format!("{HEB}\u{2029}\u{2067}{HEB}\u{2069}"),
+                true,
+            ),
+        ]
+    }
+
+    #[test]
+    fn a_line_of_mixed_direction_bidi_paragraphs_is_shaped_in_its_first_direction() {
+        // Straight through cosmic-text with a private font system, so a regression
+        // fails here without poisoning the font system the other tests share.
+        use iced_graphics::text::cosmic_text as ct;
+        let mut font_system = ct::FontSystem::new();
+        let attrs = ct::AttrsList::new(&ct::Attrs::new());
+        for (label, line, rtl) in mixed_direction_lines() {
+            for shaping in [ct::Shaping::Advanced, ct::Shaping::Basic] {
+                let shaped = ct::ShapeLine::new(&mut font_system, &line, &attrs, shaping, 8);
+                assert_eq!(shaped.rtl, rtl, "{label} ({shaping:?})");
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_direction_paragraph_lines_open_lay_out_draw_and_round_trip() {
+        // The open path: the shell builds a `Content` from the core's text, the
+        // widget lays it out and draws it, and every later edit hands the core
+        // `text()`, which must be the exact bytes (#149).
+        for (label, line, _) in mixed_direction_lines() {
+            let document = format!("first line\n{line}\nlast line");
+            let content = Content::<iced::Renderer>::with_text(&document);
+            let element: Element<'_, (), iced::Theme, iced::Renderer> =
+                text_editor(&content).height(Length::Fill).into();
+            let mut ui = iced_test::simulator(element);
+            let _ = ui.snapshot(&iced::Theme::Light).expect(label);
+            drop(ui);
+            assert_eq!(content.text(), document, "{label}");
+        }
+    }
+
+    #[test]
+    fn pasting_or_typing_a_paragraph_separator_before_rtl_text_lays_out() {
+        // The edit paths (#149): the edit itself only changes the buffer; the
+        // shaping, which used to panic, happens at the next layout.
+        let lay_out = |content: &Content<iced::Renderer>| {
+            let element: Element<'_, (), iced::Theme, iced::Renderer> =
+                text_editor(content).height(Length::Fill).into();
+            let _ui = iced_test::simulator(element);
+        };
+
+        let mut pasted = Content::<iced::Renderer>::with_text("abc");
+        lay_out(&pasted);
+        pasted.perform(Action::Move(Motion::DocumentEnd));
+        pasted.perform(Action::Edit(Edit::Paste(Arc::new(format!(
+            "\u{2029}{HEB}"
+        )))));
+        lay_out(&pasted);
+        assert_eq!(pasted.text(), format!("abc\u{2029}{HEB}"));
+
+        // U+2029 is not a control character, so the widget lets it be typed.
+        let mut typed = Content::<iced::Renderer>::with_text("abc");
+        typed.perform(Action::Move(Motion::DocumentEnd));
+        typed.perform(Action::Edit(Edit::Insert('\u{2029}')));
+        lay_out(&typed);
+        typed.perform(Action::Edit(Edit::Insert('\u{5e9}')));
+        lay_out(&typed);
+        assert_eq!(typed.text(), "abc\u{2029}\u{5e9}");
+    }
 }

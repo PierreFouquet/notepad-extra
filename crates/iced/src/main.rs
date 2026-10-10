@@ -7395,6 +7395,24 @@ mod ui_tests {
         );
     }
 
+    #[test]
+    fn typing_a_paragraph_separator_then_hebrew_lays_out() {
+        // #149, through the real key handler: U+2029 passes the editor's
+        // control-character filter, so it can be typed. Followed by a
+        // right-to-left letter, it used to panic cosmic-text at the next layout.
+        let (mut shell, _) = Shell::new();
+        let mut ui = simulator(shell.view());
+        ui.point_at(Point::new(400.0, 400.0)); // focus the editor, as above
+        let _ = ui.simulate(simulator::click());
+        let _ = ui.typewrite("abc\u{2029}\u{5e9}");
+        for message in ui.into_messages() {
+            let _ = shell.update(message);
+        }
+        assert_eq!(shell.core.active_doc().content(), "abc\u{2029}\u{5e9}");
+        assert_eq!(shell.active_editor().text(), "abc\u{2029}\u{5e9}");
+        let _ui = simulator(shell.view()); // lays the typed line out
+    }
+
     // ---- Large-file open guard, through the real widget tree (#102) ----
     // These drive the confirm bar the same way a user would: a real oversized
     // file trips it, then a real click on the rendered button resolves it. They

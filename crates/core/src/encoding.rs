@@ -508,6 +508,22 @@ mod tests {
             "hi"
         );
 
+        // No BOM and not valid UTF-8: the oracle's detector fallback (the one
+        // branch of `reference::decode` left to the proptest's luck before).
+        let latin1 = b"caf\xE9 au lait".to_vec();
+        assert_eq!(reference::decode(&latin1), decode(&latin1));
+        assert_eq!(reference::decode(&latin1), decode_owned(latin1.clone()));
+        let (guessed_text, guessed) = reference::decode(&latin1);
+        assert!(!guessed.bom);
+        assert_ne!(
+            guessed.enc, UTF_8,
+            "invalid UTF-8 must not be reported as UTF-8"
+        );
+        assert!(
+            guessed_text.starts_with("caf"),
+            "the ASCII prefix survives any guess"
+        );
+
         // A BOM that does *not* match, and a strict refusal: the other arms.
         let foreign = [0xFFu8, 0xFE, b'h'];
         assert_eq!(
@@ -688,6 +704,39 @@ mod tests {
         let (decoded, enc) = decode(&bytes);
         assert_eq!(decoded, text);
         assert_eq!(enc, fe("UTF-16 BE"));
+    }
+
+    #[test]
+    fn utf16_reopened_without_a_bom_saves_without_adding_one() {
+        // "Reopen as UTF-16" on a file that has no BOM yields a BOM-less
+        // `FileEncoding` (`decode_with` reports what the bytes carried), and
+        // saving it back must write exactly the bytes read, not grow the file by
+        // a BOM the user never had — in both byte orders. The labelled encodings
+        // always carry a BOM, so this is the only way the no-BOM UTF-16 save path
+        // is reached; it was covered by a proptest's luck before (#126).
+        for (label, bom) in [("UTF-16 LE", [0xFF, 0xFE]), ("UTF-16 BE", [0xFE, 0xFF])] {
+            let with_bom = encode_for_save("Hi 世", fe(label)).unwrap();
+            assert_eq!(
+                &with_bom[..2],
+                &bom,
+                "{label}: the labelled form writes its BOM"
+            );
+            let bare = &with_bom[2..];
+            let (text, enc) = decode_with(bare, fe(label));
+            assert_eq!(text, "Hi 世", "{label}: BOM-less bytes still decode");
+            assert!(
+                !enc.bom,
+                "{label}: no BOM in the bytes means none in the encoding"
+            );
+            assert_eq!(enc.enc, fe(label).enc);
+            assert_eq!(
+                decode_with_owned(bare.to_vec(), fe(label)),
+                (text.clone(), enc),
+                "{label}: the owned decoder agrees"
+            );
+            let saved = encode_for_save(&text, enc).unwrap();
+            assert_eq!(saved, bare, "{label}: a BOM-less encoding saves BOM-less");
+        }
     }
 
     #[test]

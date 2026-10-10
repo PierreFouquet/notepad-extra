@@ -994,16 +994,21 @@ mod tests {
         }
 
         /// One pass reports exactly what the two separate passes do, for any
-        /// start — a real match start, a non-start, or none.
+        /// start — a real match start, a non-start, or none. Both the `None` and
+        /// the `Some` form are checked on every case, so no line here depends on
+        /// which one a random draw picked (the coverage gate must not either).
         #[test]
         fn count_and_ordinal_matches_the_two_pass_form(
             pattern in "[ab]{1,2}|a\\*",
             text in "[abc]{0,60}",
-            start in proptest::option::of(0usize..64),
+            start in 0usize..64,
         ) {
             let m = Matcher::new(&pattern, opts(false, false, true)).unwrap();
-            let expected = (m.count(&text), start.map_or(0, |s| m.ordinal_of(&text, s)));
-            prop_assert_eq!(m.count_and_ordinal(&text, start), expected);
+            prop_assert_eq!(m.count_and_ordinal(&text, None), (m.count(&text), 0));
+            prop_assert_eq!(
+                m.count_and_ordinal(&text, Some(start)),
+                (m.count(&text), m.ordinal_of(&text, start))
+            );
         }
 
         /// `offset_at` maps any (line, column) — however far out of range — to an

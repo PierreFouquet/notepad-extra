@@ -16,7 +16,9 @@
 //! values alongside it:
 //!
 //! * the character and UAX #29 word totals ([`Document::char_count`],
-//!   [`Document::word_count`]),
+//!   [`Document::word_count`]), and the number of `\r`s, which says whether the
+//!   editor's lines can disagree with the line index ([`Document::has_cr`],
+//!   #153),
 //! * a **line-start index** — the byte offset of every line's first byte —
 //!   which doubles as the line count and makes `(line, column)` ↔ byte-offset
 //!   conversion a binary search ([`Document::line_start`],
@@ -111,12 +113,14 @@ pub struct Document {
 }
 
 /// Document-wide totals the status bar shows, cached so a frame reads two
-/// integers instead of walking the buffer (#126). Lines are not here: the
-/// line-start index's length *is* the line count.
+/// integers instead of walking the buffer (#126), plus the `\r` count the shell
+/// reads on every message (#153). Lines are not here: the line-start index's
+/// length *is* the line count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 struct Totals {
     chars: usize,
     words: usize,
+    crs: usize,
 }
 
 impl Totals {
@@ -125,6 +129,7 @@ impl Totals {
         Totals {
             chars: text.chars().count(),
             words: words(text),
+            crs: crs(text),
         }
     }
 }
@@ -189,6 +194,18 @@ impl Document {
     /// O(1): cached and maintained incrementally (#126).
     pub fn word_count(&self) -> usize {
         self.totals.words
+    }
+
+    /// Whether the text holds a `\r` (#153). The editor ends a line at a lone
+    /// `\r` and takes `\r\n` and `\n\r` as one ending each, while the line
+    /// index breaks at `\n` alone and counts a `\r` as a column, so the two
+    /// disagree on positions after one. The shell asks this before every
+    /// position conversion and, when it is true, converts through the editor's
+    /// own lines instead of [`Document::offset_at`] / [`Document::line_col_of`].
+    /// O(1): the count is kept with the other totals, so the check costs no
+    /// scan per message.
+    pub fn has_cr(&self) -> bool {
+        self.totals.crs > 0
     }
 
     /// Total number of lines: one more than the count of `\n`, exactly as
@@ -343,9 +360,29 @@ impl Document {
         let Some(edit) = crate::history::diff(&self.content, &new_content) else {
             return false;
         };
+        self.record(edit, new_content);
+        true
+    }
+
+    /// [`Document::commit`] for a rewrite the core makes itself (replace-next,
+    /// replace-all, the text operations), returning a copy of the applied
+    /// [`Edit`]. The shell applies that same span to the editor buffer it
+    /// already has instead of rebuilding the buffer from the whole text, which
+    /// made cosmic-text reshape every line (#137). The copy is O(edit). A
+    /// keystroke goes through `commit`: its text came from the editor, so the
+    /// buffer needs nothing.
+    pub(crate) fn commit_rewrite(&mut self, new_content: String) -> Option<Edit> {
+        let edit = crate::history::diff(&self.content, &new_content)?;
+        let applied = edit.clone();
+        self.record(edit, new_content);
+        Some(applied)
+    }
+
+    /// Adopt `new_content`, which `edit` turns the current text into, and
+    /// record the step in the history.
+    fn record(&mut self, edit: Edit, new_content: String) {
         self.splice(&edit, |content| *content = new_content);
         self.history.record(edit);
-        true
     }
 
     /// Undo the most recent step, applying it to the buffer and returning the
@@ -370,7 +407,7 @@ impl Document {
     /// change — a move of the editor's whole new string, or [`Edit::apply`] in
     /// place for undo/redo — and must realise exactly `edit`.
     ///
-    /// * chars: `+ chars(inserted) − chars(removed)`;
+    /// * chars and `\r`s: `+ count(inserted) − count(removed)`;
     /// * line index: the starts inside the removed range go, the starts from
     ///   the inserted text come in, and everything after shifts by the length
     ///   delta;
@@ -395,6 +432,8 @@ impl Document {
         let old_words = words(&self.content[span_start..line_end(&self.content, removed_end)]);
         let removed_chars = edit.removed.chars().count();
         let inserted_chars = edit.inserted.chars().count();
+        let removed_crs = crs(&edit.removed);
+        let inserted_crs = crs(&edit.inserted);
 
         rewrite(&mut self.content);
 
@@ -413,6 +452,7 @@ impl Document {
             *start = *start - edit.removed.len() + edit.inserted.len();
         }
         self.totals.chars = self.totals.chars - removed_chars + inserted_chars;
+        self.totals.crs = self.totals.crs - removed_crs + inserted_crs;
         self.totals.words = self.totals.words - old_words + new_words;
         self.refresh_dirty();
     }
@@ -437,7 +477,7 @@ impl Document {
         assert_eq!(
             self.totals,
             Totals::of(&self.content),
-            "chars/words drifted"
+            "chars/words/CRs drifted"
         );
         assert_eq!(
             self.line_starts,
@@ -463,6 +503,12 @@ impl Document {
 /// which is the more Unicode-correct behaviour the status bar aims for (#55).
 fn words(text: &str) -> usize {
     text.unicode_words().count()
+}
+
+/// Number of `\r`s in `text` (#153): a memchr-driven search, so a load pays
+/// one fast pass and an edit pays its own span.
+fn crs(text: &str) -> usize {
+    text.matches('\r').count()
 }
 
 /// The line-start index of `text` from scratch: `0`, then the byte after every
@@ -604,6 +650,34 @@ mod tests {
         assert_eq!(d.content(), "ab\ncd");
         assert!(!d.dirty());
         assert!(d.undo().is_none(), "the stack is drained");
+        d.assert_derived_data_matches_recount();
+    }
+
+    #[test]
+    fn the_cr_flag_follows_loads_edits_undo_and_redo() {
+        // #153: the shell picks its position conversion from this flag on every
+        // message, so it has to be exact after each kind of change.
+        assert!(!doc("one\ntwo").has_cr());
+        let mut d = doc("one\rtwo\rthree"); // a CR-only file keeps its CRs
+        assert!(d.has_cr());
+        // Removing one of two CRs leaves the other.
+        assert!(d.commit("one two\rthree".into()));
+        assert!(d.has_cr());
+        // A replacement that removes the last CR inside a wider span.
+        assert!(d.commit("one three".into()));
+        assert!(!d.has_cr());
+        d.assert_derived_data_matches_recount();
+        // A paste brings one back; undo takes it away and redo restores it.
+        assert!(d.commit("one\r\nthree".into()));
+        assert!(d.has_cr());
+        assert!(d.undo().is_some());
+        assert!(!d.has_cr());
+        assert!(d.redo().is_some());
+        assert!(d.has_cr());
+        d.assert_derived_data_matches_recount();
+        // A reload recounts from scratch.
+        d.load("plain".into(), EndOfLine::Lf, FileEncoding::default(), None);
+        assert!(!d.has_cr());
         d.assert_derived_data_matches_recount();
     }
 

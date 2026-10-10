@@ -1526,6 +1526,20 @@ mod tests {
     }
 
     #[test]
+    fn open_requested_only_asks_the_shell_for_a_path() {
+        // Opening is two-step: the request raises the native picker, and only the
+        // shell's `FileLoaded` reply changes the documents.
+        let mut s = State::default();
+        update(&mut s, Message::Edited("draft".into()));
+        assert_eq!(
+            update(&mut s, Message::OpenRequested),
+            vec![Effect::PickOpenPath]
+        );
+        assert_eq!(s.docs.len(), 1);
+        assert_eq!(s.active_doc().content(), "draft");
+    }
+
+    #[test]
     fn opening_into_pristine_blank_reuses_the_tab() {
         let mut s = State::default();
         load(&mut s, "/tmp/hello.rs", "fn main() {}\n");
@@ -2884,6 +2898,22 @@ mod tests {
     }
 
     #[test]
+    fn redo_with_nothing_to_redo_changes_nothing_and_reveals_nothing() {
+        let mut s = State::default();
+        update(&mut s, Message::Edited("hello".into()));
+        // Nothing has been undone yet, so there is nothing to redo: no retitle,
+        // no find refresh, and above all no reveal that would move the caret.
+        assert!(update(&mut s, Message::Redo).is_empty());
+        assert_eq!(s.active_doc().content(), "hello");
+
+        // Likewise once the one undone step has been redone.
+        update(&mut s, Message::Undo);
+        update(&mut s, Message::Redo);
+        assert!(update(&mut s, Message::Redo).is_empty());
+        assert_eq!(s.active_doc().content(), "hello");
+    }
+
+    #[test]
     fn regex_replace_all_expands_capture_groups() {
         let mut s = State::default();
         update(&mut s, Message::Edited("a1 b2".into()));
@@ -3663,6 +3693,21 @@ mod tests {
     }
 
     #[test]
+    fn save_as_asks_for_a_path_for_the_active_tab_even_when_titled() {
+        // Unlike Save, Save-As never writes straight back to the tab's own path:
+        // it always asks for a destination, and for the tab in front.
+        let mut s = State::default();
+        load(&mut s, "/t/a.txt", "abc");
+        load(&mut s, "/t/b.txt", "def");
+        let id = s.active_doc().id;
+        assert_ne!(id, s.docs[0].id);
+        assert_eq!(
+            update(&mut s, Message::SaveAsRequested),
+            vec![Effect::PickSavePath { id }]
+        );
+    }
+
+    #[test]
     fn disk_changed_for_an_unknown_id_is_a_noop() {
         let mut s = State::default();
         load_with_meta(&mut s, "/t/a.txt", "abc", meta(1, 3));
@@ -3677,6 +3722,73 @@ mod tests {
             .is_empty()
         );
         assert_eq!(s.active_doc().disk_status, DiskStatus::InSync);
+    }
+
+    #[test]
+    fn a_watch_event_with_no_load_baseline_adopts_the_fingerprint() {
+        // A load whose stat failed carries no baseline (`disk: None`). The first
+        // watch event can't prove the content changed, so it is adopted rather
+        // than raised as a conflict; from then on it is the baseline.
+        let mut s = State::default();
+        load(&mut s, "/t/a.txt", "abc");
+        let id = s.active_doc().id;
+        assert_eq!(s.active_doc().disk_meta(), None);
+        update(
+            &mut s,
+            Message::DiskChanged {
+                id,
+                meta: Some(meta(4, 3)),
+            },
+        );
+        assert_eq!(s.active_doc().disk_status, DiskStatus::InSync, "no alarm");
+        assert_eq!(s.active_doc().disk_meta(), Some(&meta(4, 3)), "adopted");
+
+        // The adopted fingerprint is a real baseline: a different one is a change.
+        update(
+            &mut s,
+            Message::DiskChanged {
+                id,
+                meta: Some(meta(5, 3)),
+            },
+        );
+        assert_eq!(s.active_doc().disk_status, DiskStatus::Modified(meta(5, 3)));
+    }
+
+    #[test]
+    fn answers_to_a_disk_prompt_for_a_closed_tab_touch_nothing() {
+        // The reload / keep-mine / overwrite answers carry the id of the tab they
+        // were raised for; if that tab has closed in the meantime they must not
+        // fall through to whichever tab is open now.
+        let mut s = State::default();
+        load_with_meta(&mut s, "/t/a.txt", "abc", meta(1, 3));
+        update(&mut s, Message::Edited("mine".into()));
+        let id = s.active_doc().id;
+        update(
+            &mut s,
+            Message::DiskChanged {
+                id,
+                meta: Some(meta(2, 9)),
+            },
+        );
+        let stale = id + 100;
+        assert!(update(&mut s, Message::ReloadFromDisk { id: stale }).is_empty());
+        assert!(update(&mut s, Message::KeepMine { id: stale }).is_empty());
+        assert!(update(&mut s, Message::OverwriteConfirmed { id: stale }).is_empty());
+        let doc = s.active_doc();
+        assert_eq!(doc.disk_status, DiskStatus::Modified(meta(2, 9)));
+        assert_eq!(doc.disk_meta(), Some(&meta(1, 3)));
+        assert_eq!(doc.content(), "mine");
+    }
+
+    #[test]
+    fn an_overwrite_confirmed_for_an_untitled_tab_writes_nothing() {
+        // The stale-save prompt is only raised for a tab with a path; an answer
+        // that reaches an untitled one has nowhere to write.
+        let mut s = State::default();
+        update(&mut s, Message::Edited("scratch".into()));
+        let id = s.active_doc().id;
+        assert!(update(&mut s, Message::OverwriteConfirmed { id }).is_empty());
+        assert!(s.active_doc().dirty());
     }
 
     proptest! {

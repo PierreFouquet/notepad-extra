@@ -10,12 +10,13 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
-  # Weekly, for the `audit` job only (every other job is gated off `schedule`
-  # below). A new advisory can land against an unchanged `Cargo.lock`, so a
-  # vulnerability gate that only runs on PRs can stay green for months while the
-  # tree is quietly affected (#129).
-  schedule:
-    - cron: "0 7 * * 1" # Mondays, 07:00 UTC
+  # Deliberately NO `schedule` trigger here (#133). GitHub disables a workflow
+  # that carries one after 60 days without repository activity — the *whole*
+  # workflow, every trigger — and that is exactly what happened to this file
+  # after #129 added the weekly `cargo audit` run: a PR opened during a quiet
+  # spell got no fmt / clippy / test / coverage gate at all, silently. The
+  # weekly advisory scan lives in its own `audit.yml` instead, so the worst an
+  # inactivity-disable can do is pause that one scan.
 
 env:
   CARGO_TERM_COLOR: always
@@ -23,8 +24,6 @@ env:
 jobs:
   core:
     name: "core — fmt · clippy · test"
-    # The weekly `schedule` run exists for the `audit` job alone (#129).
-    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -51,7 +50,6 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-    if: github.event_name != 'schedule'
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -101,7 +99,6 @@ jobs:
 
   coverage:
     name: "core + syntax — coverage gate"
-    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -117,7 +114,6 @@ jobs:
 
   fuzz:
     name: "core — fuzz targets"
-    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -153,38 +149,8 @@ jobs:
             echo "::endgroup::"
           done
 
-  audit:
-    name: "dependency vulnerability audit (#129)"
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: swatinem/rust-cache@v2
-      # Built from source rather than fetched via `taiki-e/install-action`: that
-      # action has no cargo-audit recipe and falls back to a pinned, old
-      # `cargo-binstall` which cannot parse cargo-audit's manifest (it inherits
-      # `package.edition` from its workspace), so the install fails outright.
-      # `cargo install` is slower on a cold cache but has no such dependency, and
-      # rust-cache keeps `~/.cargo/bin` warm afterwards. It is also exactly what a
-      # developer runs locally, so CI and local results cannot diverge.
-      - name: install cargo-audit
-        run: cargo install cargo-audit --locked
-      # Checks the committed Cargo.lock against the RustSec advisory database, so
-      # a dependency that picks up a published CVE fails here rather than at a
-      # distro reviewer's desk (#7/#8/#9/#12/#13 all lead to someone running this).
-      #
-      # Known, assessed advisories are ignored in `.cargo/audit.toml`, each with a
-      # written rationale and the condition that would let us drop it — without
-      # that list the job would be red from day one on advisories we cannot fix
-      # from this repo (they sit behind `wayland-scanner`, a build-time proc-macro
-      # pinned to an old `quick-xml`), and a permanently-red gate gets ignored.
-      # New advisories are still caught: the ignores name specific IDs.
-      - name: cargo audit
-        run: cargo audit
-
   licenses:
     name: "dependency licence audit (#17)"
-    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

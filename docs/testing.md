@@ -18,6 +18,11 @@ display**.
 | Coverage gate | `scripts/coverage.sh` | `scripts/coverage.sh` |
 
 CI wires all of these together in [`.github/workflows/native-ci.yml`](../.github/workflows/native-ci.yml).
+The RustSec advisory scan (`cargo audit`, #129) runs from its own
+[`.github/workflows/audit.yml`](../.github/workflows/audit.yml) on every PR *and*
+weekly — kept separate (#133) because GitHub disables a workflow that carries a
+`schedule` after 60 days of repository inactivity, and that must never take the
+PR gates down with it.
 
 ## Property tests
 

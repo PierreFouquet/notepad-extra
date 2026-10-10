@@ -1,0 +1,58 @@
+name: "audit"
+
+# The RustSec advisory gate (#129), in its own workflow (#133).
+#
+# It used to be a job inside `native-ci.yml`, which is where the weekly
+# `schedule` below also lived. GitHub disables a workflow that carries a
+# `schedule` after 60 days without repository activity — the whole workflow,
+# every trigger — so a quiet two months switched off every PR gate in that file
+# along with the scan. Keeping the schedule here, apart from the fmt / clippy /
+# test / coverage gates, means an inactivity-disable can pause only this weekly
+# scan; the PR-time audit below resumes with the first PR that re-enables it,
+# and the PR gates in `native-ci.yml` are never affected.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  # Weekly. A new advisory can land against an unchanged `Cargo.lock`, so a
+  # vulnerability gate that only runs on PRs can stay green for months while the
+  # tree is quietly affected (#129).
+  schedule:
+    - cron: "0 7 * * 1" # Mondays, 07:00 UTC
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  audit:
+    name: "dependency vulnerability audit (#129)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+      # Built from source rather than fetched via `taiki-e/install-action`: that
+      # action has no cargo-audit recipe and falls back to a pinned, old
+      # `cargo-binstall` which cannot parse cargo-audit's manifest (it inherits
+      # `package.edition` from its workspace), so the install fails outright.
+      # `cargo install` is slower on a cold cache but has no such dependency, and
+      # rust-cache keeps `~/.cargo/bin` warm afterwards. It is also exactly what a
+      # developer runs locally, so CI and local results cannot diverge.
+      - name: install cargo-audit
+        run: cargo install cargo-audit --locked
+      # Checks the committed Cargo.lock against the RustSec advisory database, so
+      # a dependency that picks up a published CVE fails here rather than at a
+      # distro reviewer's desk (#7/#8/#9/#12/#13 all lead to someone running this).
+      #
+      # Known, assessed advisories are ignored in `.cargo/audit.toml`, each with a
+      # written rationale and the condition that would let us drop it — without
+      # that list the job would be permanently red on maintenance-status
+      # warnings for transitive crates we cannot swap out from here (bincode and
+      # yaml-rust under syntect, ttf-parser under cosmic-text), and a
+      # permanently-red gate gets ignored. New advisories are still caught: the
+      # ignores name specific IDs, and an ignore whose condition has been met is
+      # dropped (#131 removed the two quick-xml ones once 0.39 left the tree).
+      - name: cargo audit
+        run: cargo audit
+

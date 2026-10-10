@@ -224,7 +224,11 @@ justify what does not.
 
 ## 6. Checks a change must pass
 
-Mirror of `.github/workflows/native-ci.yml`. Run them from the repository root.
+Mirror of `.github/workflows/native-ci.yml` (fmt, clippy, tests, coverage,
+fuzz, licences) and `.github/workflows/audit.yml` (`cargo audit`, also weekly).
+Run them from the repository root. Never add a `schedule` trigger to a workflow
+that gates PRs: GitHub disables such a workflow — every trigger — after 60 days
+of repository inactivity (#133); scheduled work gets its own workflow file.
 
 ```bash
 cargo fmt --all -- --check

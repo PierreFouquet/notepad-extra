@@ -119,9 +119,22 @@ pub fn text_editor<Message>(content: &Content) -> TextEditor<'_, highlighter::Pl
 // NOTEPAD-EXTRA(#34): the scroll offset the generic `Editor` trait doesn't expose.
 pub trait ScrollOffset {
     /// Pixels scrolled past the top of the content (0.0 when at the top).
-    fn scroll_top(&self) -> f32;
+    /// Convenience over [`ScrollOffset::vertical_extent`]; a caller that also
+    /// needs the content height should call that once instead (#126).
+    fn scroll_top(&self) -> f32 {
+        self.vertical_extent().scroll_top
+    }
     /// Full height of the whole document in pixels, independent of scroll.
-    fn content_height(&self) -> f32;
+    /// Convenience over [`ScrollOffset::vertical_extent`] (#126).
+    fn content_height(&self) -> f32 {
+        self.vertical_extent().content_height
+    }
+    // NOTEPAD-EXTRA(#126): both vertical-scrollbar inputs from at most one buffer walk.
+    /// `scroll_top` and `content_height` together, computed from at most one
+    /// pass over the buffer — O(1) when wrapping is off. Every per-frame and
+    /// per-event consumer (`draw`, `update`, `mouse_interaction`) goes through
+    /// this so a frame never walks the document twice for the scrollbar.
+    fn vertical_extent(&self) -> VerticalExtent;
     /// Pixels per line — translates a pixel scroll into iced's line-based
     /// `Action::Scroll` when dragging the vertical thumb (#34).
     fn line_height(&self) -> f32;
@@ -140,9 +153,22 @@ pub trait ScrollOffset {
     fn glyph_bounds(&self, line: usize, byte_col: usize) -> Option<(f32, f32, f32)>;
 }
 
+/// The vertical scrollbar's two inputs (#34), produced together by
+/// [`ScrollOffset::vertical_extent`] so a frame walks the buffer at most once
+/// (#126). `scroll_top / content_height` is the thumb's position along its
+/// track; `viewport / content_height` its length.
+#[derive(Debug, Clone, Copy, PartialEq)]
+// NOTEPAD-EXTRA(#126): the fused scrollbar inputs returned by `vertical_extent`.
+pub struct VerticalExtent {
+    /// Full height of the whole document in pixels, independent of scroll.
+    pub content_height: f32,
+    /// Pixels scrolled past the top of the content (0.0 when at the top).
+    pub scroll_top: f32,
+}
+
 // NOTEPAD-EXTRA(#34): read the concrete software-renderer editor's scroll state.
 impl ScrollOffset for iced_graphics::text::Editor {
-    fn scroll_top(&self) -> f32 {
+    fn vertical_extent(&self) -> VerticalExtent {
         // cosmic-text stores the scroll as `{ line, vertical, horizontal }`
         // where `line` is the *buffer line index* of the topmost visible line
         // and `vertical` is only the pixel offset *within* that line's wrapped
@@ -150,32 +176,54 @@ impl ScrollOffset for iced_graphics::text::Editor {
         // `scroll.vertical`). Returning `vertical` alone made the thumb jump
         // back to near-top on every new paragraph (#34). The absolute offset is
         // the height of every wrapped row above `scroll.line` plus `vertical`.
+        //
+        // The content height is NOT `min_bounds().height`: that routes through
+        // `text::measure`, which only walks `layout_runs()` — the *shaped,
+        // visible* window — so it reports ~one viewport tall no matter how long
+        // the document is. That made the thumb almost full-height and immovable
+        // (#34). Count every buffer line's wrapped rows instead, so the two stay
+        // proportional (a not-yet-shaped line counts as one row).
+        //
+        // Cost (#126). These used to be two separate full walks of
+        // `buffer.lines`, run on every frame (the caret blink repaints twice a
+        // second) and on every event. Two cases now:
+        //  * `Wrap::None` — cosmic-text lays every line out as exactly one row
+        //    (`ShapeLine::layout_to_buffer` puts all spans on one visual line
+        //    and pushes a single empty row for an empty line), so
+        //    `rows == lines.len()` and `rows_above == scroll.line`: O(1)
+        //    arithmetic, no walk. This keys on the *buffer's* own wrap, which
+        //    `layout()` sets from the widget's `wrapping` before any draw or
+        //    event reaches here, so it cannot disagree with how the lines were
+        //    actually laid out (`set_wrap` re-lays-out every shaped line at once).
+        //  * wrapping on — rows per line genuinely vary and cosmic-text keeps no
+        //    running total (no prefix sums, no total-height field; `layout_runs`
+        //    covers only the visible window), so one fused pass yields both
+        //    sums: `split_at(scroll.line)` gives the rows above, the remainder
+        //    completes the total. Half the previous traffic. A cached total is
+        //    deliberately not kept: edits reshape lines behind the `Editor`
+        //    trait with no invalidation hook we could observe.
         let buffer = self.buffer();
         let scroll = buffer.scroll();
         let line_height = buffer.metrics().line_height;
-        let top_line = scroll.line.min(buffer.lines.len());
-        let rows_above: usize = buffer.lines[..top_line]
-            .iter()
-            .map(|line| line.layout_opt().map_or(1, Vec::len))
-            .sum();
-        rows_above as f32 * line_height + scroll.vertical
-    }
+        let line_count = buffer.lines.len();
+        let top_line = scroll.line.min(line_count);
 
-    fn content_height(&self) -> f32 {
-        // NOT `min_bounds().height`: that routes through `text::measure`, which
-        // only walks `layout_runs()` — the *shaped, visible* window — so it
-        // reports ~one viewport tall no matter how long the document is. That
-        // made the thumb almost full-height and immovable (#34). Count every
-        // buffer line's wrapped rows instead, exactly as `scroll_top` does, so
-        // the two stay proportional (a not-yet-shaped line counts as one row).
-        let buffer = self.buffer();
-        let line_height = buffer.metrics().line_height;
-        let rows: usize = buffer
-            .lines
-            .iter()
-            .map(|line| line.layout_opt().map_or(1, Vec::len))
-            .sum();
-        rows as f32 * line_height
+        let (rows_above, rows) = if buffer.wrap() == iced_graphics::text::cosmic_text::Wrap::None {
+            (top_line, line_count)
+        } else {
+            let rows_of = |line: &iced_graphics::text::cosmic_text::BufferLine| {
+                line.layout_opt().map_or(1, Vec::len)
+            };
+            let (above, rest) = buffer.lines.split_at(top_line);
+            let rows_above: usize = above.iter().map(rows_of).sum();
+            let rows = rows_above + rest.iter().map(rows_of).sum::<usize>();
+            (rows_above, rows)
+        };
+
+        VerticalExtent {
+            content_height: rows as f32 * line_height,
+            scroll_top: rows_above as f32 * line_height + scroll.vertical,
+        }
     }
 
     fn line_height(&self) -> f32 {
@@ -999,8 +1047,39 @@ where
             Size::new((v.width - gutter).max(0.0), v.height)
         };
 
+        // Horizontal-overflow repaint fix (#34). iced's software compositor
+        // derives the editor's repaint region from the *bounds* it was handed
+        // (`editor.bounds`), not its content width. With wrapping off, long
+        // lines overflow and we pan the render sideways to scroll — but iced then
+        // only repaints `[left, left + bounds.width]`, leaving the revealed right
+        // strip stale (the smear). Handing the editor its true horizontal extent
+        // — the way a `Paragraph` reports one — marks the whole visible strip
+        // dirty.
+        //
+        // NOTEPAD-EXTRA(#126): the no-wrap width is a ratchet, never handed back down.
+        // The first `update` used to pass the bare viewport and the second the
+        // content width, so the editor's bounds bounced between the two on every
+        // layout — and cosmic-text's `set_size` runs `relayout()` over *every
+        // shaped line* on any size change (opening shapes the whole buffer, so
+        // that is all of them): two O(document) relayouts per layout, measured at
+        // ~1 s per layout for 20k × 300-char lines in a debug build. Starting
+        // from the width the editor already has makes the steady state a no-op
+        // (`update` bails on equal bounds); only a wider line scrolling into view
+        // for the first time still costs one relayout. A width above the
+        // viewport is harmless: under `Wrap::None` cosmic-text ignores it for
+        // layout (it only feeds `scroll.horizontal`, which iced never reads), the
+        // renderer clips to the widget, the repaint region is intersected with
+        // the clip, and the bar/pan maths use the *visible* `min_bounds()` width,
+        // not these bounds. Switching wrapping on passes the viewport again, so
+        // wrapped layout always uses the real width.
+        let bounds_width = if self.wrapping == Wrapping::None {
+            viewport.width.max(internal.editor.bounds().width)
+        } else {
+            viewport.width
+        };
+
         internal.editor.update(
-            viewport,
+            Size::new(bounds_width, viewport.height),
             font,
             text_size,
             self.line_height,
@@ -1008,19 +1087,9 @@ where
             state.highlighter.borrow_mut().deref_mut(),
         );
 
-        // Horizontal-overflow repaint fix (#34). iced's software compositor
-        // derives the editor's repaint region from the *viewport* width it was
-        // handed (`editor.bounds`), not its content width. With wrapping off,
-        // long lines overflow and we pan the render sideways to scroll — but iced
-        // then only repaints `[left, left + viewport]`, leaving the revealed
-        // right strip stale (the smear). Re-running `update` at the full content
-        // width makes the editor report its true horizontal extent — the way a
-        // `Paragraph` does — so the whole visible strip is marked dirty. Cheap:
-        // with wrapping off this only re-lays-out the visible window, and once
-        // the width settles the call is a no-op (`update` bails on equal bounds).
         if self.wrapping == Wrapping::None {
             let content_width = internal.editor.min_bounds().width;
-            if content_width > viewport.width {
+            if content_width > bounds_width {
                 internal.editor.update(
                     Size::new(content_width, viewport.height),
                     font,
@@ -1136,98 +1205,127 @@ where
         // it, so grabbing a bar scrolls instead of moving the caret. Vertical
         // scroll lives in the editor (line-based `Action::Scroll`); horizontal
         // is our own pan offset — hence the two thumbs take different updates.
+        //
+        // NOTEPAD-EXTRA(#126): bar geometry only for events that can touch a thumb.
+        // It needs `vertical_extent()` — a walk of every buffer line while
+        // wrapping is on — and this block used to compute it for *every* event
+        // (each key press, every pointer move, the twice-a-second caret-blink
+        // redraw). A release needs no geometry; a left press can only grab a
+        // thumb if the pointer is over the widget at all; a pointer move only
+        // matters mid-drag. The arms themselves are unchanged.
         {
             let bounds = layout.bounds();
-            let (content_width, content_height, scroll_top, line_height, gutter) = {
-                let internal = self.content.0.borrow();
-                let text_size = self.text_size.unwrap_or_else(|| renderer.default_size());
-                (
-                    internal.editor.min_bounds().width,
-                    internal.editor.content_height(),
-                    internal.editor.scroll_top(),
-                    internal.editor.line_height(),
-                    geometry::gutter_width(
-                        self.line_numbers,
-                        internal.editor.line_count(),
-                        text_size.0,
-                    ),
-                )
-            };
-            // The horizontal bar lives in the text area, right of the gutter (#41).
-            let text_bounds = inset_left(bounds.shrink(self.padding), gutter);
-            let has_h_bar = content_width > text_bounds.width + 1.0;
-            let has_v_bar = content_height > text_bounds.height + 1.0;
-
-            match event {
+            if let Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) = event
+                && state.thumb_drag.is_some()
+            {
+                state.thumb_drag = None;
+                shell.request_redraw();
+                return;
+            }
+            let may_touch_thumb = match event {
                 Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
-                    if let Some(position) = cursor.position() {
-                        if has_v_bar {
-                            let bar = vertical_bar(bounds, text_bounds, content_height, scroll_top);
-                            if bar.thumb.contains(position) {
-                                state.thumb_drag = Some(ThumbDrag::Vertical {
-                                    grab: position.y - bar.thumb.y,
-                                });
-                                shell.request_redraw();
-                                return;
+                    cursor.is_over(bounds)
+                }
+                Event::Mouse(mouse::Event::CursorMoved { .. }) => state.thumb_drag.is_some(),
+                _ => false,
+            };
+            if may_touch_thumb {
+                let (content_width, extent, line_height, gutter) = {
+                    let internal = self.content.0.borrow();
+                    let text_size = self.text_size.unwrap_or_else(|| renderer.default_size());
+                    (
+                        internal.editor.min_bounds().width,
+                        internal.editor.vertical_extent(),
+                        internal.editor.line_height(),
+                        geometry::gutter_width(
+                            self.line_numbers,
+                            internal.editor.line_count(),
+                            text_size.0,
+                        ),
+                    )
+                };
+                let VerticalExtent {
+                    content_height,
+                    scroll_top,
+                } = extent;
+                // The horizontal bar lives in the text area, right of the gutter (#41).
+                let text_bounds = inset_left(bounds.shrink(self.padding), gutter);
+                let has_h_bar = content_width > text_bounds.width + 1.0;
+                let has_v_bar = content_height > text_bounds.height + 1.0;
+
+                match event {
+                    Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+                        if let Some(position) = cursor.position() {
+                            if has_v_bar {
+                                let bar =
+                                    vertical_bar(bounds, text_bounds, content_height, scroll_top);
+                                if bar.thumb.contains(position) {
+                                    state.thumb_drag = Some(ThumbDrag::Vertical {
+                                        grab: position.y - bar.thumb.y,
+                                    });
+                                    shell.request_redraw();
+                                    return;
+                                }
                             }
-                        }
-                        if has_h_bar {
-                            let bar =
-                                horizontal_bar(text_bounds, content_width, state.horizontal_offset);
-                            if bar.thumb.contains(position) {
-                                state.thumb_drag = Some(ThumbDrag::Horizontal {
-                                    grab: position.x - bar.thumb.x,
-                                });
-                                shell.request_redraw();
-                                return;
+                            if has_h_bar {
+                                let bar = horizontal_bar(
+                                    text_bounds,
+                                    content_width,
+                                    state.horizontal_offset,
+                                );
+                                if bar.thumb.contains(position) {
+                                    state.thumb_drag = Some(ThumbDrag::Horizontal {
+                                        grab: position.x - bar.thumb.x,
+                                    });
+                                    shell.request_redraw();
+                                    return;
+                                }
                             }
                         }
                     }
-                }
-                Event::Mouse(mouse::Event::CursorMoved { .. }) => {
-                    match (cursor.position(), state.thumb_drag) {
-                        (Some(position), Some(ThumbDrag::Horizontal { grab })) => {
-                            let bar =
-                                horizontal_bar(text_bounds, content_width, state.horizontal_offset);
-                            let travel = bar.track.width - bar.thumb.width;
-                            let ratio = if travel > 0.0 {
-                                ((position.x - grab - bar.track.x) / travel).clamp(0.0, 1.0)
-                            } else {
-                                0.0
-                            };
-                            state.horizontal_offset = ratio * bar.max_offset;
-                            shell.request_redraw();
-                            return;
-                        }
-                        (Some(position), Some(ThumbDrag::Vertical { grab })) => {
-                            let bar = vertical_bar(bounds, text_bounds, content_height, scroll_top);
-                            let travel = bar.track.height - bar.thumb.height;
-                            let ratio = if travel > 0.0 {
-                                ((position.y - grab - bar.track.y) / travel).clamp(0.0, 1.0)
-                            } else {
-                                0.0
-                            };
-                            // Vertical scroll is line-quantised, so translate the
-                            // target pixel offset into a relative line delta.
-                            let desired = ratio * bar.max_offset;
-                            let delta_lines = ((desired - scroll_top) / line_height).round() as i32;
-                            if delta_lines != 0 {
-                                shell.publish(on_edit(Action::Scroll { lines: delta_lines }));
+                    Event::Mouse(mouse::Event::CursorMoved { .. }) => {
+                        match (cursor.position(), state.thumb_drag) {
+                            (Some(position), Some(ThumbDrag::Horizontal { grab })) => {
+                                let bar = horizontal_bar(
+                                    text_bounds,
+                                    content_width,
+                                    state.horizontal_offset,
+                                );
+                                let travel = bar.track.width - bar.thumb.width;
+                                let ratio = if travel > 0.0 {
+                                    ((position.x - grab - bar.track.x) / travel).clamp(0.0, 1.0)
+                                } else {
+                                    0.0
+                                };
+                                state.horizontal_offset = ratio * bar.max_offset;
+                                shell.request_redraw();
+                                return;
                             }
-                            shell.request_redraw();
-                            return;
+                            (Some(position), Some(ThumbDrag::Vertical { grab })) => {
+                                let bar =
+                                    vertical_bar(bounds, text_bounds, content_height, scroll_top);
+                                let travel = bar.track.height - bar.thumb.height;
+                                let ratio = if travel > 0.0 {
+                                    ((position.y - grab - bar.track.y) / travel).clamp(0.0, 1.0)
+                                } else {
+                                    0.0
+                                };
+                                // Vertical scroll is line-quantised, so translate the
+                                // target pixel offset into a relative line delta.
+                                let desired = ratio * bar.max_offset;
+                                let delta_lines =
+                                    ((desired - scroll_top) / line_height).round() as i32;
+                                if delta_lines != 0 {
+                                    shell.publish(on_edit(Action::Scroll { lines: delta_lines }));
+                                }
+                                shell.request_redraw();
+                                return;
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     }
+                    _ => {}
                 }
-                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
-                    if state.thumb_drag.is_some() =>
-                {
-                    state.thumb_drag = None;
-                    shell.request_redraw();
-                    return;
-                }
-                _ => {}
             }
         }
 
@@ -1625,16 +1723,16 @@ where
         // --- Vertical scrollbar (#34) ---
         // iced's stock `text_editor` draws none, which left long documents with
         // no visible indication they scroll. Having vendored the widget we can:
-        // `min_bounds()` gives the full (wrapped) content height and
-        // `scroll_top()` the live offset, so the thumb mirrors the real view.
-        let content_height = internal.editor.content_height();
+        // `content_height` is the full (wrapped) document height and
+        // `scroll_top` the live offset, so the thumb mirrors the real view.
+        // NOTEPAD-EXTRA(#126): one `vertical_extent()` per frame — O(1) with wrapping
+        // off, a single fused pass with it on — where two full walks used to run.
+        let VerticalExtent {
+            content_height,
+            scroll_top,
+        } = internal.editor.vertical_extent();
         if content_height > text_bounds.height + 1.0 {
-            let bar = vertical_bar(
-                bounds,
-                text_bounds,
-                content_height,
-                internal.editor.scroll_top(),
-            );
+            let bar = vertical_bar(bounds, text_bounds, content_height, scroll_top);
             let radius = bar.track.width / 2.0;
             renderer.fill_quad(
                 renderer::Quad {
@@ -1772,15 +1870,17 @@ where
         if state.thumb_drag.is_some() {
             return mouse::Interaction::Grabbing;
         }
-        if let Some(position) = cursor.position() {
-            let bounds = layout.bounds();
-            let (content_width, content_height, scroll_top, gutter) = {
+        // NOTEPAD-EXTRA(#126): only a pointer over the widget can hover a thumb, so
+        // the bar geometry (a buffer walk while wrapping is on) is skipped for a
+        // pointer anywhere else, and both vertical inputs come from one call.
+        let bounds = layout.bounds();
+        if let Some(position) = cursor.position_over(bounds) {
+            let (content_width, extent, gutter) = {
                 let internal = self.content.0.borrow();
                 let text_size = self.text_size.unwrap_or_else(|| renderer.default_size());
                 (
                     internal.editor.min_bounds().width,
-                    internal.editor.content_height(),
-                    internal.editor.scroll_top(),
+                    internal.editor.vertical_extent(),
                     geometry::gutter_width(
                         self.line_numbers,
                         internal.editor.line_count(),
@@ -1788,6 +1888,10 @@ where
                     ),
                 )
             };
+            let VerticalExtent {
+                content_height,
+                scroll_top,
+            } = extent;
             // The horizontal bar sits in the text area, right of the gutter (#41).
             let text_bounds = inset_left(bounds.shrink(self.padding), gutter);
             let over_h = content_width > text_bounds.width + 1.0
@@ -2305,6 +2409,7 @@ mod tests {
                 "fn inset_left(rect: Rectangle, gutter: f32) -> Rectangle {",
             ),
             (126, "    pub fn text(&self) -> String {"),
+            (126, "pub struct VerticalExtent {"),
         ];
         for &(issue, anchor) in anchors {
             let idx = lines
@@ -2417,6 +2522,137 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(2),
             "text() on 8k lines took {elapsed:?}; it should be a single cheap pass"
+        );
+    }
+
+    // --- Scrollbar inputs (#126) ---
+
+    /// `vertical_extent()` must agree with the per-line walk it replaced — in
+    /// both wrap modes (the O(1) `Wrap::None` arithmetic and the fused pass) and
+    /// at several scroll positions — and the `scroll_top()` / `content_height()`
+    /// conveniences must report the same numbers, so the thumb geometry is
+    /// identical to before.
+    #[test]
+    fn vertical_extent_matches_the_per_line_walk_in_both_wrap_modes() {
+        fn walk(editor: &iced_graphics::text::Editor) -> VerticalExtent {
+            let buffer = editor.buffer();
+            let scroll = buffer.scroll();
+            let line_height = buffer.metrics().line_height;
+            let rows = |line: &iced_graphics::text::cosmic_text::BufferLine| {
+                line.layout_opt().map_or(1, Vec::len)
+            };
+            let top = scroll.line.min(buffer.lines.len());
+            let above: usize = buffer.lines[..top].iter().map(rows).sum();
+            let all: usize = buffer.lines.iter().map(rows).sum();
+            VerticalExtent {
+                content_height: all as f32 * line_height,
+                scroll_top: above as f32 * line_height + scroll.vertical,
+            }
+        }
+        let relayout = |editor: &mut iced_graphics::text::Editor, wrapping: Wrapping| {
+            editor.update(
+                Size::new(120.0, 200.0),
+                iced_core::Font::default(),
+                Pixels(14.0),
+                LineHeight::default(),
+                wrapping,
+                &mut highlighter::PlainText,
+            );
+        };
+
+        // Lines of varying length (some empty) so wrapping yields varying row counts.
+        let text: String = (0..300)
+            .map(|i| format!("{}\n", "word ".repeat(i % 13)))
+            .collect();
+        let content = Content::<iced::Renderer>::with_text(&text);
+        let mut internal = content.0.borrow_mut();
+        let line_count = internal.editor.line_count();
+
+        for wrapping in [Wrapping::None, Wrapping::Word, Wrapping::None] {
+            relayout(&mut internal.editor, wrapping);
+            for lines in [0, 7, 50, 1000, -30, -5000] {
+                internal.editor.perform(Action::Scroll { lines });
+                // Let the editor normalise the scroll the way a frame's `layout` would.
+                relayout(&mut internal.editor, wrapping);
+                let want = walk(&internal.editor);
+                assert_eq!(
+                    internal.editor.vertical_extent(),
+                    want,
+                    "{wrapping:?} after scrolling {lines}"
+                );
+                assert_eq!(internal.editor.scroll_top(), want.scroll_top);
+                assert_eq!(internal.editor.content_height(), want.content_height);
+            }
+            let rows = internal.editor.content_height() / internal.editor.line_height();
+            if wrapping == Wrapping::None {
+                assert_eq!(
+                    rows as usize, line_count,
+                    "one row per line without wrapping"
+                );
+            } else {
+                assert!(
+                    rows as usize > line_count,
+                    "the 120-px viewport must actually wrap something ({rows} rows)"
+                );
+            }
+        }
+    }
+
+    // --- No-wrap width ratchet (#126) ---
+
+    /// With wrapping off, `layout()` hands the editor a width that only grows:
+    /// once a long line has widened the bounds, laying out again — even after
+    /// that line scrolls out of view — leaves them untouched, so cosmic-text's
+    /// `set_size` → whole-buffer `relayout` is not re-run on every layout. The
+    /// smear fix (#34) still holds (bounds at least as wide as the visible
+    /// content), and turning wrapping on hands the real viewport width back.
+    #[test]
+    fn no_wrap_layout_width_ratchets_and_wrapping_restores_the_viewport() {
+        // One line far wider than the simulator's 1024-px window, then enough
+        // short lines to scroll it off-screen.
+        let text = format!("{}\n{}", "x".repeat(400), "short\n".repeat(200));
+        let mut content = Content::<iced::Renderer>::with_text(&text);
+        let lay_out = |content: &Content<iced::Renderer>, wrapping: Wrapping| {
+            let element: Element<'_, (), iced::Theme, iced::Renderer> = text_editor(content)
+                .wrapping(wrapping)
+                .height(Length::Fill)
+                .into();
+            // Building the simulator lays the tree out (no window, no draw).
+            let _ui = iced_test::simulator(element);
+        };
+        let measure = |content: &Content<iced::Renderer>| {
+            let internal = content.0.borrow();
+            (internal.editor.bounds(), internal.editor.min_bounds().width)
+        };
+
+        lay_out(&content, Wrapping::None);
+        let (first, content_width) = measure(&content);
+        assert!(
+            content_width > 1024.0,
+            "the long line must overflow the window ({content_width})"
+        );
+        assert!(
+            first.width >= content_width,
+            "bounds widen to the content: {first:?} vs {content_width}"
+        );
+
+        // Scroll the long line out of view and lay out again: the visible content
+        // is narrow now, but the bounds must not ratchet down.
+        content.perform(Action::Scroll { lines: 100 });
+        lay_out(&content, Wrapping::None);
+        let (second, visible_width) = measure(&content);
+        assert!(
+            visible_width < 1024.0,
+            "only short lines are visible now ({visible_width})"
+        );
+        assert_eq!(second, first, "the no-wrap width never ratchets down");
+
+        // Wrapping on: wrapped layout needs the real viewport width back.
+        lay_out(&content, Wrapping::Word);
+        let (wrapped, _) = measure(&content);
+        assert!(
+            wrapped.width < first.width && wrapped.width <= 1024.0,
+            "wrapping restores the viewport width: {wrapped:?}"
         );
     }
 

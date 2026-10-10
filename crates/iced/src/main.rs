@@ -809,7 +809,8 @@ fn large_open_prompt(pending: &PendingLargeOpen) -> String {
         |n| n.to_string_lossy().into_owned(),
     );
     let bytes = pending.content.len();
-    let size = format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0));
+    // Binary units, labelled as such: the size gate is `LARGE_FILE_BYTES` in MiB.
+    let size = format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0));
     let scale = if pending.lines >= LARGE_FILE_LINES {
         format!("has {} lines ({size})", pending.lines)
     } else if bytes >= LARGE_FILE_BYTES {
@@ -4640,7 +4641,7 @@ mod tests {
         assert_eq!(pending.lines, LARGE_FILE_LINES);
         assert_eq!(
             large_open_prompt(pending),
-            "\u{201c}huge.log\u{201d} has 50000 lines (0.1 MB). Opening it may take a while \
+            "\u{201c}huge.log\u{201d} has 50000 lines (0.1 MiB). Opening it may take a while \
              and, for the largest files, use several GB of memory."
         );
         assert_eq!(shell.core.docs.len(), 1);
@@ -4671,7 +4672,7 @@ mod tests {
         );
         assert_eq!(
             large_open_prompt(pending),
-            "\u{201c}wide.csv\u{201d} is 9.8 MB. Opening it may take a while and, for the \
+            "\u{201c}wide.csv\u{201d} is 9.8 MiB. Opening it may take a while and, for the \
              largest files, use several GB of memory."
         );
         assert_eq!(shell.core.docs.len(), 1);

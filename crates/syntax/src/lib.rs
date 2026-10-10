@@ -17,6 +17,8 @@
 //! binary dumps (no runtime fetch), and syntect is built with its **fancy-regex**
 //! backend (pure Rust) instead of oniguruma — see `Cargo.toml`.
 
+use std::borrow::Cow;
+use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
@@ -110,42 +112,100 @@ const EXT_ALIASES: &[(&str, &str)] = &[
 ///
 /// The returned `&'static str` borrows the process-wide [`syntax_set`], so it is
 /// cheap to store on a document and compare.
+///
+/// Each step is one hash lookup in the once-built [`Index`] (#126). syntect's
+/// own `find_syntax_by_extension` is a linear scan over every syntax's
+/// extension list (~750 case-folding string compares), and this used to run it
+/// up to three times per call plus two `to_ascii_lowercase` allocations; the
+/// steps, their order and their results are unchanged.
 pub fn detect(path: &str) -> &'static str {
-    let set = syntax_set();
+    let index = index();
     let name = basename(path);
+    let ext = extension_of(path);
 
-    // 1. Extension match. syntect stores extension tokens case-sensitively, so try
-    //    the extension as-written, then a lowercased copy (`MAIN.RS` → Rust).
-    if let Some(ext) = extension_of(path)
-        && let Some(syntax) = set
-            .find_syntax_by_extension(ext)
-            .or_else(|| set.find_syntax_by_extension(&ext.to_ascii_lowercase()))
+    // 1. Extension match. syntect matches extension tokens ignoring ASCII case
+    //    (`MAIN.RS` → Rust), so the index is keyed on the folded token and the
+    //    query is folded the same way — allocating only if it has upper case.
+    let ext_lower = ext.map(ascii_lowercase);
+    if let Some(ext) = &ext_lower
+        && let Some(&syntax) = index.by_token.get(ext.as_ref())
     {
-        return syntax.name.as_str();
+        return syntax;
     }
 
     // 2. Whole-filename match. syntect lists bare names (Dockerfile, Makefile, …)
     //    in its extension tables, so a file with no dotted extension can still be
     //    recognised by its full name.
     if !name.is_empty()
-        && let Some(syntax) = set.find_syntax_by_extension(name)
+        && let Some(&syntax) = index.by_token.get(ascii_lowercase(name).as_ref())
     {
-        return syntax.name.as_str();
+        return syntax;
     }
 
     // 3. Alias supplement for extensions the bundled grammars omit (e.g. `.jsonc`).
-    if let Some(ext) = extension_of(path) {
-        let lower = ext.to_ascii_lowercase();
-        if let Some(name) = EXT_ALIASES
-            .iter()
-            .find(|(alias, _)| *alias == lower)
-            .and_then(|(_, name)| canonical(name))
-        {
-            return name;
-        }
+    if let Some(ext) = &ext_lower
+        && let Some(&syntax) = index.aliases.get(ext.as_ref())
+    {
+        return syntax;
     }
 
     PLAIN_TEXT
+}
+
+/// `s` folded to ASCII lower case — borrowed as-is when it already is (the
+/// common case for an extension), so the fold costs nothing then (#126).
+fn ascii_lowercase(s: &str) -> Cow<'_, str> {
+    if s.bytes().any(|b| b.is_ascii_uppercase()) {
+        Cow::Owned(s.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(s)
+    }
+}
+
+/// Hash indexes over the [`syntax_set`] for the lookups [`detect`] and
+/// [`canonical`] make (#126). Built once, on first use, from the same set the
+/// shell highlights with, so detection and rendering still cannot disagree.
+struct Index {
+    /// ASCII-lower-cased extension / file-name token → syntax name. Where two
+    /// syntaxes claim one token the **later** one in set order wins, exactly as
+    /// syntect's `find_syntax_by_extension` (a reverse scan) resolves it.
+    by_token: HashMap<String, &'static str>,
+    /// Exact syntax name → that name as the canonical `&'static str`. Later
+    /// duplicates win here too, mirroring `find_syntax_by_name`.
+    by_name: HashMap<&'static str, &'static str>,
+    /// [`EXT_ALIASES`] with each target resolved through `by_name`; an alias whose
+    /// target is not in the set is dropped, as `canonical` would have returned
+    /// `None` for it.
+    aliases: HashMap<&'static str, &'static str>,
+}
+
+fn index() -> &'static Index {
+    static INDEX: OnceLock<Index> = OnceLock::new();
+    INDEX.get_or_init(build_index)
+}
+
+fn build_index() -> Index {
+    let syntaxes = syntax_set().syntaxes();
+    let mut by_token = HashMap::new();
+    let mut by_name = HashMap::new();
+    // Forward order with overwriting inserts, so the last syntax wins — the
+    // same answer syntect's `.iter().rev().find(..)` gives.
+    for syntax in syntaxes {
+        let name = syntax.name.as_str();
+        for token in &syntax.file_extensions {
+            by_token.insert(token.to_ascii_lowercase(), name);
+        }
+        by_name.insert(name, name);
+    }
+    let aliases = EXT_ALIASES
+        .iter()
+        .filter_map(|&(alias, target)| by_name.get(target).map(|&name| (alias, name)))
+        .collect();
+    Index {
+        by_token,
+        by_name,
+        aliases,
+    }
 }
 
 /// The last path component (after either separator), or the whole string when it
@@ -159,13 +219,14 @@ fn basename(path: &str) -> &str {
 /// The plain-text sentinel resolves to [`PLAIN_TEXT`]. This lets a caller turn a
 /// runtime `String` (e.g. a picker selection) into the same `&'static str`
 /// detection produces, so both sides compare and store identically.
+///
+/// One hash lookup (#126) in place of syntect's linear `find_syntax_by_name`
+/// scan; same result.
 pub fn canonical(name: &str) -> Option<&'static str> {
     if name == PLAIN_TEXT {
         return Some(PLAIN_TEXT);
     }
-    syntax_set()
-        .find_syntax_by_name(name)
-        .map(|syntax| syntax.name.as_str())
+    index().by_name.get(name).copied()
 }
 
 /// Whether `name` is a syntax notepad-extra knows about (present in the set, or
@@ -471,6 +532,98 @@ mod tests {
         }
     }
 
+    /// The pre-#126 bodies — syntect's own linear scans, three of them per
+    /// call — kept verbatim as the oracle the indexed forms are checked against.
+    mod reference {
+        use super::super::{EXT_ALIASES, PLAIN_TEXT, basename, extension_of, syntax_set};
+
+        pub fn detect(path: &str) -> &'static str {
+            let set = syntax_set();
+            let name = basename(path);
+            if let Some(ext) = extension_of(path)
+                && let Some(syntax) = set
+                    .find_syntax_by_extension(ext)
+                    .or_else(|| set.find_syntax_by_extension(&ext.to_ascii_lowercase()))
+            {
+                return syntax.name.as_str();
+            }
+            if !name.is_empty()
+                && let Some(syntax) = set.find_syntax_by_extension(name)
+            {
+                return syntax.name.as_str();
+            }
+            if let Some(ext) = extension_of(path) {
+                let lower = ext.to_ascii_lowercase();
+                if let Some(name) = EXT_ALIASES
+                    .iter()
+                    .find(|(alias, _)| *alias == lower)
+                    .and_then(|(_, name)| canonical(name))
+                {
+                    return name;
+                }
+            }
+            PLAIN_TEXT
+        }
+
+        pub fn canonical(name: &str) -> Option<&'static str> {
+            if name == PLAIN_TEXT {
+                return Some(PLAIN_TEXT);
+            }
+            syntax_set()
+                .find_syntax_by_name(name)
+                .map(|syntax| syntax.name.as_str())
+        }
+    }
+
+    #[test]
+    fn indexed_detection_matches_syntects_scans_for_every_known_token() {
+        // Exhaustive over the live set: every extension / file-name token any
+        // syntax declares — as written, upper-cased, behind a directory, and as a
+        // dotted extension on a stem — resolves to exactly what the three linear
+        // syntect scans resolved to (including which duplicate claimant wins).
+        let mut checked = 0usize;
+        for syntax in syntax_set().syntaxes() {
+            for token in &syntax.file_extensions {
+                for path in [
+                    token.clone(),
+                    token.to_ascii_uppercase(),
+                    format!("/some/dir/{token}"),
+                    format!("stem.{token}"),
+                    format!(r"C:\dir\STEM.{}", token.to_ascii_uppercase()),
+                ] {
+                    assert_eq!(detect(&path), reference::detect(&path), "{path:?}");
+                    checked += 1;
+                }
+            }
+            // And every syntax name canonicalises to the same name as before.
+            assert_eq!(canonical(&syntax.name), reference::canonical(&syntax.name));
+        }
+        assert!(checked > 500, "the set should declare hundreds of tokens");
+        // Aliases, an unknown extension and the plain-text sentinel agree too.
+        for path in [
+            "x.jsonc",
+            "X.MJS",
+            "a.nope",
+            "",
+            ".",
+            "Dockerfile",
+            "README",
+        ] {
+            assert_eq!(detect(path), reference::detect(path), "{path:?}");
+        }
+        assert_eq!(canonical(PLAIN_TEXT), reference::canonical(PLAIN_TEXT));
+        assert_eq!(canonical("Nope"), reference::canonical("Nope"));
+    }
+
+    #[test]
+    fn lowercase_fold_borrows_when_already_lower() {
+        // The common case — an extension typed in lower case — must not allocate.
+        assert!(matches!(ascii_lowercase("rs"), Cow::Borrowed("rs")));
+        assert!(matches!(ascii_lowercase("日本.txt"), Cow::Borrowed(_)));
+        assert_eq!(ascii_lowercase("RS"), Cow::<str>::Owned("rs".into()));
+        assert_eq!(ascii_lowercase("Main.RS").as_ref(), "main.rs");
+    }
+
     #[test]
     fn unknown_and_extensionless_paths_are_plain_text() {
         assert_eq!(detect("notes.unknownext"), PLAIN_TEXT);
@@ -598,11 +751,27 @@ mod tests {
 
     proptest! {
         /// `detect` never panics and always returns a known syntax name for any
-        /// input string (arbitrary bytes-as-str, paths, separators).
+        /// input string (arbitrary bytes-as-str, paths, separators) — and the
+        /// indexed lookup agrees with syntect's linear scans on all of them.
         #[test]
         fn detect_never_panics_and_returns_known(path in ".{0,200}") {
             let name = detect(&path);
             prop_assert!(is_known(name), "detect returned unknown name: {name:?}");
+            prop_assert_eq!(name, reference::detect(&path));
+        }
+
+        /// Paths built from real-looking stems and extensions (mixed case, both
+        /// separators, dotfiles) detect identically through the index and the scans.
+        #[test]
+        fn indexed_detect_matches_scans_on_path_shapes(
+            dir in "(/[a-z]{1,4}|C:\\\\[A-Z]{1,3}){0,2}",
+            stem in "[.]?[A-Za-z_]{0,6}",
+            ext in "(rs|RS|Py|toml|JSONC|mjs|txt|nope|md|Dockerfile|gitignore|)",
+        ) {
+            let path = format!("{dir}/{stem}.{ext}");
+            prop_assert_eq!(detect(&path), reference::detect(&path));
+            let bare = format!("{dir}/{stem}{ext}");
+            prop_assert_eq!(detect(&bare), reference::detect(&bare));
         }
     }
 }

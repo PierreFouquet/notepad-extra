@@ -27,6 +27,9 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 export LC_ALL=C
+# With no vendor/ crates left (the patch dropped), the loops below see nothing
+# rather than a literal `vendor/*`.
+shopt -s nullglob
 
 # Files in each vendor/<crate>/ that are ours, not the release's.
 OURS=" VENDORED.md notepad-extra.patch upstream.toml "
@@ -87,7 +90,7 @@ do_check() {
 do_audit() {
   local tmp names
   command -v cargo-audit >/dev/null || { echo "error: cargo-audit is required" >&2; exit 2; }
-  names=$(for f in vendor/*/upstream.toml; do [ -f "$f" ] && field "$f" crate; done)
+  names=$(for f in vendor/*/upstream.toml; do field "$f" crate; done)
   tmp=$(mktemp -d)
   # Give each vendored package, which has no `source` line, the crates.io one.
   # A crates.io package of the same name already has a `source` line after its

@@ -44,17 +44,24 @@ impl Edit {
 /// the common prefix and suffix. Returns `None` when the strings are equal
 /// (a cursor move produces no edit). The result is always char-boundary aligned,
 /// so it never splits a UTF-8 codepoint even when bytes happen to match mid-char.
+///
+/// The two scans compare the bytes in blocks ([`common_prefix`],
+/// [`common_suffix`]) rather than one at a time: the widget hands the core the
+/// whole buffer on every keystroke, so this runs over the entire document per
+/// edit and was 75–80 % of the core's per-keystroke cost on a big file. A
+/// byte loop ran 6–9× slower than a plain `memcmp` on 13 MB (release: 6.9 ms
+/// for a change at the end, 11.4 ms at the start, against 1.1 ms for `==`),
+/// and the blockwise form brings both scans down to that `memcmp` figure (#126).
+/// There is no up-front `old == new`: a common prefix spanning two equal-length
+/// strings *is* equality, so the first scan answers that question for free.
 pub fn diff(old: &str, new: &str) -> Option<Edit> {
-    if old == new {
-        return None;
-    }
     let (ob, nb) = (old.as_bytes(), new.as_bytes());
 
     // Longest common prefix, in bytes, backed off to a char boundary.
     let max_pre = ob.len().min(nb.len());
-    let mut p = 0;
-    while p < max_pre && ob[p] == nb[p] {
-        p += 1;
+    let mut p = common_prefix(&ob[..max_pre], &nb[..max_pre]);
+    if p == max_pre && ob.len() == nb.len() {
+        return None;
     }
     while p > 0 && !old.is_char_boundary(p) {
         p -= 1;
@@ -64,10 +71,7 @@ pub fn diff(old: &str, new: &str) -> Option<Edit> {
     // both strings (the trailing bytes are shared, but the *start* of the suffix
     // could land inside a multi-byte char).
     let max_suf = (ob.len() - p).min(nb.len() - p);
-    let mut s = 0;
-    while s < max_suf && ob[ob.len() - 1 - s] == nb[nb.len() - 1 - s] {
-        s += 1;
-    }
+    let mut s = common_suffix(&ob[ob.len() - max_suf..], &nb[nb.len() - max_suf..]);
     while s > 0 && (!old.is_char_boundary(old.len() - s) || !new.is_char_boundary(new.len() - s)) {
         s -= 1;
     }
@@ -77,6 +81,48 @@ pub fn diff(old: &str, new: &str) -> Option<Edit> {
         removed: old[p..old.len() - s].to_string(),
         inserted: new[p..new.len() - s].to_string(),
     })
+}
+
+/// Block sizes for [`common_prefix`] / [`common_suffix`], coarse to fine. A
+/// slice compare of each block is one `memcmp` call (`<[u8]>::eq` is
+/// specialised to it), so the scan runs at memory speed until the first block
+/// that differs, then narrows inside that block with the next size down, and
+/// finishes byte by byte within the last 64 (#126). The 4 KiB coarse block
+/// keeps the call count small (one per page) while bounding the re-scan of the
+/// differing block to a trivial 4 KiB.
+const COARSE_BLOCK: usize = 4096;
+const FINE_BLOCK: usize = 64;
+
+/// Length of the longest common prefix of two equal-length byte slices.
+fn common_prefix(a: &[u8], b: &[u8]) -> usize {
+    debug_assert_eq!(a.len(), b.len());
+    let mut p = 0;
+    for block in [COARSE_BLOCK, FINE_BLOCK] {
+        while p + block <= a.len() && a[p..p + block] == b[p..p + block] {
+            p += block;
+        }
+    }
+    while p < a.len() && a[p] == b[p] {
+        p += 1;
+    }
+    p
+}
+
+/// Length of the longest common suffix of two equal-length byte slices: the
+/// mirror of [`common_prefix`], walking in from the end.
+fn common_suffix(a: &[u8], b: &[u8]) -> usize {
+    debug_assert_eq!(a.len(), b.len());
+    let n = a.len();
+    let mut s = 0;
+    for block in [COARSE_BLOCK, FINE_BLOCK] {
+        while s + block <= n && a[n - s - block..n - s] == b[n - s - block..n - s] {
+            s += block;
+        }
+    }
+    while s < n && a[n - 1 - s] == b[n - 1 - s] {
+        s += 1;
+    }
+    s
 }
 
 /// Upper bound on undo depth. Past this the oldest entries are dropped so a
@@ -249,8 +295,202 @@ impl History {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     // ---- diff ----
+
+    /// The byte-at-a-time `diff` the blockwise scans replaced (#126), kept
+    /// verbatim as the oracle: the new function must return exactly what this
+    /// one does for every input, including the char-boundary back-offs and the
+    /// no-overlap cap on the suffix.
+    fn reference_diff(old: &str, new: &str) -> Option<Edit> {
+        if old == new {
+            return None;
+        }
+        let (ob, nb) = (old.as_bytes(), new.as_bytes());
+
+        let max_pre = ob.len().min(nb.len());
+        let mut p = 0;
+        while p < max_pre && ob[p] == nb[p] {
+            p += 1;
+        }
+        while p > 0 && !old.is_char_boundary(p) {
+            p -= 1;
+        }
+
+        let max_suf = (ob.len() - p).min(nb.len() - p);
+        let mut s = 0;
+        while s < max_suf && ob[ob.len() - 1 - s] == nb[nb.len() - 1 - s] {
+            s += 1;
+        }
+        while s > 0
+            && (!old.is_char_boundary(old.len() - s) || !new.is_char_boundary(new.len() - s))
+        {
+            s -= 1;
+        }
+
+        Some(Edit {
+            at: p,
+            removed: old[p..old.len() - s].to_string(),
+            inserted: new[p..new.len() - s].to_string(),
+        })
+    }
+
+    /// `unit` repeated until the result is at least `target` bytes long (empty
+    /// for an empty unit), so a shared prefix or suffix can be stretched across
+    /// the coarse and fine block sizes without hand-writing kilobyte literals.
+    fn stretch(unit: &str, target: usize) -> String {
+        unit.repeat(target / unit.len().max(1) + 1)
+    }
+
+    /// Pieces mixing ASCII with 2-, 3- and 4-byte chars — including the `é` /
+    /// `©` pair whose trailing bytes agree while the chars differ, which is what
+    /// drives the suffix scan into its mid-char back-off.
+    fn seam_text(max: usize) -> impl Strategy<Value = String> {
+        prop::collection::vec(
+            prop_oneof![
+                Just("a"),
+                Just("b"),
+                Just("\n"),
+                Just("é"),
+                Just("©"),
+                Just("你"),
+                Just("😀"),
+            ],
+            0..max,
+        )
+        .prop_map(|parts| parts.concat())
+    }
+
+    /// Lengths that put a shared prefix or suffix on either side of, and exactly
+    /// on, the 64-byte and 4 KiB block sizes.
+    fn block_straddling_len() -> impl Strategy<Value = usize> {
+        prop_oneof![Just(0usize), 0usize..130, 4000usize..4200, 8100usize..8300,]
+    }
+
+    proptest! {
+        /// The blockwise scans return exactly what the byte loop did, for any
+        /// pair of strings: equal or empty, sharing nothing, or sharing a prefix
+        /// and suffix of any length around the block sizes, with the change
+        /// itself made of multi-byte chars whose bytes partially coincide (#126).
+        #[test]
+        fn chunked_diff_matches_the_reference(
+            pre_unit in seam_text(6),
+            pre_len in block_straddling_len(),
+            old_mid in seam_text(6),
+            new_mid in seam_text(6),
+            suf_unit in seam_text(6),
+            suf_len in block_straddling_len(),
+        ) {
+            let pre = stretch(&pre_unit, pre_len);
+            let suf = stretch(&suf_unit, suf_len);
+            let old = format!("{pre}{old_mid}{suf}");
+            let new = format!("{pre}{new_mid}{suf}");
+            let edit = diff(&old, &new);
+            prop_assert_eq!(&edit, &reference_diff(&old, &new));
+            prop_assert_eq!(diff(&new, &old), reference_diff(&new, &old));
+            prop_assert_eq!(diff(&old, &old), None);
+            prop_assert_eq!(diff(&new, &new), None);
+            // `None` means equal, and an edit applied to `old` reproduces `new`
+            // (with no edit, `buf` is `old`, which must then already be `new`).
+            prop_assert_eq!(edit.is_none(), old == new);
+            let mut buf = old.clone();
+            if let Some(edit) = &edit {
+                edit.apply(&mut buf);
+            }
+            prop_assert_eq!(buf, new);
+        }
+    }
+
+    #[test]
+    fn the_reference_diff_agrees_with_diff_on_every_hand_written_case() {
+        // The oracle itself must take every branch deterministically — the
+        // equal-strings early return and both char-boundary back-offs — not only
+        // when the proptest happens to generate such a pair, or the coverage gate
+        // flakes with the random seed. These are the cases the unit tests above
+        // pin for `diff`, run through both functions side by side.
+        for (old, new) in [
+            ("", ""),
+            ("same", "same"),
+            ("ab", "abc"),
+            ("b", "ab"),
+            ("cat", "carat"),
+            ("abc", "ac"),
+            ("cat", "cut"),
+            ("abcXbc", "abc"),
+            ("ab", "abab"),
+            ("a😀b", "a🎉b"), // prefix back-off: the emoji share their first bytes
+            ("café", "cafe"),
+            ("e", "e\u{0301}"),
+            ("é", "©"), // suffix back-off: trailing bytes agree, chars differ
+            ("aéaa", "aèaa"),
+            ("line1\nline2", "line1\nCHANGED\nline2"),
+        ] {
+            assert_eq!(
+                diff(old, new),
+                reference_diff(old, new),
+                "{old:?} -> {new:?}"
+            );
+            assert_eq!(
+                diff(new, old),
+                reference_diff(new, old),
+                "{new:?} -> {old:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn diff_narrows_to_the_byte_at_every_block_boundary() {
+        // One changed byte, placed first, in the middle and last, in buffers whose
+        // length sits on, just under and just over the 64-byte and 4 KiB blocks
+        // (and a multiple of both). The expected edit is the single char, so a
+        // scan that overshoots a block, stops a block early or mis-sizes the
+        // final partial block is caught here rather than by the proptest's luck.
+        for len in [
+            1, 2, 63, 64, 65, 127, 128, 129, 4095, 4096, 4097, 4159, 4160, 4161, 8191, 8192, 8193,
+            12_289,
+        ] {
+            let base: String = (0..len)
+                .map(|i| char::from(b'a' + (i % 26) as u8))
+                .collect();
+            assert_eq!(diff(&base, &base), None, "len {len}: equal is None");
+            for at in [0, len / 2, len - 1] {
+                let mut changed = base.clone();
+                changed.replace_range(at..at + 1, "Z");
+                let expected = Some(Edit {
+                    at,
+                    removed: base[at..at + 1].to_string(),
+                    inserted: "Z".into(),
+                });
+                assert_eq!(diff(&base, &changed), expected, "len {len}, change at {at}");
+                assert_eq!(diff(&changed, &base), expected.map(|e| e.invert()));
+                assert_eq!(
+                    diff(&base, &changed),
+                    reference_diff(&base, &changed),
+                    "len {len}, change at {at}: disagrees with the byte loop"
+                );
+            }
+            // A pure insertion and a pure deletion straddling the block seam, so
+            // the two buffers have *different* lengths and the suffix scan starts
+            // from different offsets in each.
+            let mut grown = base.clone();
+            grown.insert_str(len / 2, "XY");
+            assert_eq!(
+                diff(&base, &grown),
+                Some(Edit {
+                    at: len / 2,
+                    removed: String::new(),
+                    inserted: "XY".into(),
+                }),
+                "len {len}: insertion"
+            );
+            assert_eq!(
+                diff(&grown, &base),
+                reference_diff(&grown, &base),
+                "len {len}: deletion"
+            );
+        }
+    }
 
     #[test]
     fn diff_of_equal_is_none() {

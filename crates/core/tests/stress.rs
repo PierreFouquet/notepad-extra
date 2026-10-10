@@ -608,6 +608,51 @@ fn typing_into_a_200k_line_document_keeps_the_cached_totals_exact() {
     assert_eq!(doc.word_count(), 200_000 * 5);
 }
 
+#[test]
+fn typing_at_the_top_of_a_200k_line_document_diffs_at_memory_speed() {
+    // Every keystroke reaches the core as the whole new text, and `diff` finds
+    // the one changed span by scanning both buffers from each end. A keystroke
+    // at the very top leaves no common prefix, so the suffix scan covers the
+    // entire document: with the old byte-at-a-time loop that was ~26 ms per
+    // keystroke on this 5.4 MB fixture in a debug build (2.7 s for a hundred),
+    // against ~2 ms once the scans compare 4 KiB blocks with `memcmp` (#126).
+    // Two hundred keystrokes take ~0.5 s with the blockwise scans and ~5.3 s
+    // with the byte loop; the bound is deliberately loose for a slow CI runner
+    // (about six times the measured cost) and still well under what the byte
+    // loop needs on a fast machine.
+    let mut s = two_hundred_thousand_lines();
+    let baseline_chars = s.active_doc().char_count();
+    let started = Instant::now();
+    for i in 0..200u8 {
+        let text = s.active_doc().content();
+        let mut next = String::with_capacity(text.len() + 1);
+        next.push(char::from(b'a' + i % 26));
+        next.push_str(text);
+        update(&mut s, Message::Edited(next));
+    }
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "200 keystrokes at the top took {elapsed:?}: `diff` is scanning byte by byte again (#126)"
+    );
+
+    // The edits really landed, as single-character edits with exact totals.
+    let doc = s.active_doc();
+    let typed: String = (0..200u8)
+        .rev()
+        .map(|i| char::from(b'a' + i % 26))
+        .collect();
+    assert!(doc.content().starts_with(&typed));
+    assert_eq!(doc.char_count(), baseline_chars + 200);
+    assert_eq!(doc.line_count(), 200_001);
+    assert_eq!(
+        doc.word_count(),
+        200_000 * 5 + 1,
+        "the letters joined the first word"
+    );
+    assert_eq!(doc.content().len(), 5_400_001 + 200);
+}
+
 // ---- Bracket matching (#41) ----
 
 #[test]

@@ -460,9 +460,15 @@ fn words(text: &str) -> usize {
 }
 
 /// The line-start index of `text` from scratch: `0`, then the byte after every
-/// `\n`. Its length is [`find::line_count`].
+/// `\n`. Its length is [`find::line_count`], and the vector is sized to exactly
+/// that up front: `match_indices` gives `extend` no length hint, so a growing
+/// `Vec` doubles its way up and ends at up to twice the entries it holds — on a
+/// 200k-line file, a megabyte of index pinned for the life of the tab for
+/// nothing. Counting the newlines first is a vectorised pass far cheaper than
+/// the index walk itself (#126).
 fn line_starts(text: &str) -> Vec<usize> {
-    let mut starts = vec![0];
+    let mut starts = Vec::with_capacity(find::line_count(text));
+    starts.push(0);
     starts.extend(text.match_indices('\n').map(|(i, _)| i + 1));
     starts
 }
@@ -565,6 +571,10 @@ mod tests {
         assert!(!d.dirty());
         assert!(!d.is_pristine_blank());
         d.assert_derived_data_matches_recount();
+        // The index is allocated once at its exact final size, never grown
+        // (#126): a doubling `Vec` would sit at 4 here, not 3.
+        assert_eq!(d.line_starts.capacity(), d.line_starts.len());
+        assert_eq!(d.line_starts.len(), 3);
     }
 
     #[test]

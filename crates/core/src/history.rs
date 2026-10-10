@@ -8,6 +8,8 @@
 //! [`Edit`] rather than a per-keystroke snapshot. Undo/redo return the [`Edit`]
 //! to apply back to the buffer, keeping the whole thing pure and testable.
 
+use std::collections::VecDeque;
+
 /// A single contiguous replacement: the bytes `content[at..at + removed.len()]`
 /// become `inserted`. This is the only shape an edit can take, because the shell
 /// hands us whole-buffer text and [`diff`] reduces each change to one span.
@@ -106,7 +108,13 @@ enum Clean {
 /// truth for the unsaved-changes ("•") flag via [`History::dirty`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct History {
-    undo: Vec<Entry>,
+    /// Oldest at the front, newest at the back. A deque, not a `Vec`, because
+    /// the depth cap evicts from the *front*: once a long session sits at
+    /// [`MAX_UNDO`], every keystroke evicts one entry, and `Vec::drain(0..1)`
+    /// shifted the whole stack down each time — O(depth) per record. `pop_front`
+    /// is O(1) (#126; measured 5× faster for records at the cap).
+    undo: VecDeque<Entry>,
+    /// Only ever pushed, popped and cleared at the back, so a `Vec` is right.
     redo: Vec<Entry>,
     clean: Clean,
     next_id: u64,
@@ -118,7 +126,7 @@ pub struct History {
 impl Default for History {
     fn default() -> Self {
         History {
-            undo: Vec::new(),
+            undo: VecDeque::new(),
             redo: Vec::new(),
             clean: Clean::Empty,
             next_id: 0,
@@ -139,14 +147,14 @@ impl History {
         match self.clean {
             Clean::Gone => true,
             Clean::Empty => !self.undo.is_empty(),
-            Clean::At(id) => self.undo.last().map(|e| e.id) != Some(id),
+            Clean::At(id) => self.undo.back().map(|e| e.id) != Some(id),
         }
     }
 
     /// Mark the current content as saved: the present stack position becomes the
     /// clean baseline, so undoing back to it later will clear the dirty flag.
     pub fn mark_saved(&mut self) {
-        self.clean = match self.undo.last() {
+        self.clean = match self.undo.back() {
             Some(e) => Clean::At(e.id),
             None => Clean::Empty,
         };
@@ -158,20 +166,20 @@ impl History {
     pub fn record(&mut self, edit: Edit) {
         self.redo.clear();
 
-        if self.can_coalesce(&edit) {
-            self.undo
-                .last_mut()
-                .unwrap()
-                .edit
-                .inserted
-                .push_str(&edit.inserted);
-            // Still an open run of typing; leave `coalescible` set.
-        } else {
-            let id = self.next_id;
-            self.next_id += 1;
-            // A pure, newline-free insertion can start/continue a typing run.
-            self.coalescible = edit.removed.is_empty() && !edit.inserted.contains('\n');
-            self.undo.push(Entry { edit, id });
+        // A pure, newline-free insertion can start/continue a typing run.
+        // Decided once here: it gates coalescing *and* seeds `coalescible`.
+        let typing = edit.removed.is_empty() && !edit.inserted.contains('\n');
+        match self.coalescible_top(&edit, typing) {
+            // Append in place — the new text is moved onto the open step, with
+            // no clone of either side.
+            Some(top) => top.edit.inserted.push_str(&edit.inserted),
+            // Still an open run of typing; `coalescible` stays set.
+            None => {
+                let id = self.next_id;
+                self.next_id += 1;
+                self.coalescible = typing;
+                self.undo.push_back(Entry { edit, id });
+            }
         }
 
         self.enforce_cap();
@@ -180,7 +188,7 @@ impl History {
     /// Undo the most recent step, returning the [`Edit`] the caller must apply
     /// to the buffer to revert it. `None` when there is nothing to undo.
     pub fn undo(&mut self) -> Option<Edit> {
-        let entry = self.undo.pop()?;
+        let entry = self.undo.pop_back()?;
         let inverse = entry.edit.invert();
         self.redo.push(entry);
         self.coalescible = false;
@@ -192,45 +200,43 @@ impl History {
     pub fn redo(&mut self) -> Option<Edit> {
         let entry = self.redo.pop()?;
         let forward = entry.edit.clone();
-        self.undo.push(entry);
+        self.undo.push_back(entry);
         self.coalescible = false;
         Some(forward)
     }
 
-    /// Whether `edit` should merge into the current top entry instead of pushing
-    /// a new step: an open typing run, both sides pure insertions, textually
-    /// adjacent, no newline, and not sitting on the saved boundary (merging
-    /// there would silently keep the buffer "clean" after an edit).
-    fn can_coalesce(&self, edit: &Edit) -> bool {
-        if !self.coalescible || !edit.removed.is_empty() || edit.inserted.contains('\n') {
-            return false;
+    /// The top entry `edit` should merge into instead of becoming a new step —
+    /// or `None` to push. Merging needs an open typing run, both sides pure
+    /// newline-free insertions (`typing`, computed by the caller), textual
+    /// adjacency, and the top not sitting on the saved boundary (merging there
+    /// would silently keep the buffer "clean" after an edit).
+    fn coalescible_top(&mut self, edit: &Edit, typing: bool) -> Option<&mut Entry> {
+        if !self.coalescible || !typing {
+            return None;
         }
-        match self.undo.last() {
-            Some(top) => {
-                top.edit.removed.is_empty()
-                    && edit.at == top.edit.at + top.edit.inserted.len()
-                    && !matches!(self.clean, Clean::At(id) if id == top.id)
-            }
-            None => false,
-        }
+        let clean = self.clean;
+        self.undo.back_mut().filter(|top| {
+            top.edit.removed.is_empty()
+                && edit.at == top.edit.at + top.edit.inserted.len()
+                && !matches!(clean, Clean::At(id) if id == top.id)
+        })
     }
 
     /// Drop the oldest entries once the stack exceeds [`MAX_UNDO`]. If the saved
-    /// baseline is among the evicted entries it becomes unreachable.
+    /// baseline is among the evicted entries it becomes unreachable. Each
+    /// eviction is an O(1) `pop_front` (#126) — `record` pushes one entry, so
+    /// at the cap this loop runs exactly once per keystroke.
     fn enforce_cap(&mut self) {
-        if self.undo.len() <= MAX_UNDO {
-            return;
+        while self.undo.len() > MAX_UNDO
+            && let Some(evicted) = self.undo.pop_front()
+        {
+            match self.clean {
+                // The empty-stack baseline is now behind us.
+                Clean::Empty => self.clean = Clean::Gone,
+                Clean::At(id) if id == evicted.id => self.clean = Clean::Gone,
+                Clean::At(_) | Clean::Gone => {}
+            }
         }
-        let overflow = self.undo.len() - MAX_UNDO;
-        let clean_evicted = match self.clean {
-            Clean::Empty => true, // the empty-stack baseline is now behind us
-            Clean::At(id) => self.undo[..overflow].iter().any(|e| e.id == id),
-            Clean::Gone => false,
-        };
-        if clean_evicted {
-            self.clean = Clean::Gone;
-        }
-        self.undo.drain(0..overflow);
     }
 
     /// Current undo depth (used by tests and stress assertions).
@@ -600,6 +606,25 @@ mod tests {
         assert!(!h.dirty(), "one undo lands back on the saved baseline");
     }
 
+    #[test]
+    fn coalescing_appends_in_place_and_keeps_the_step_id() {
+        // The merge path extends the open step's text without replacing the
+        // entry: the same id stays on top (so a saved marker pinned to it still
+        // matches) and the inserted text grows by exactly the new keystroke.
+        let mut h = History::new();
+        let mut c = String::new();
+        type_into(&mut h, &mut c, "a");
+        let id = h.undo.back().expect("one step").id;
+        type_into(&mut h, &mut c, "ab");
+        type_into(&mut h, &mut c, "abc");
+        let top = h.undo.back().expect("still one step");
+        assert_eq!((top.id, top.edit.inserted.as_str()), (id, "abc"));
+        assert_eq!(h.undo_depth(), 1);
+        // Non-adjacent typing (a gap at the start) must not merge, even mid-run.
+        type_into(&mut h, &mut c, "Xabc");
+        assert_eq!(h.undo_depth(), 2);
+    }
+
     // ---- History: depth cap ----
 
     #[test]
@@ -612,6 +637,16 @@ mod tests {
             type_into(&mut h, &mut c, &next);
         }
         assert_eq!(h.undo_depth(), MAX_UNDO, "history is bounded");
+        // The *oldest* steps were the ones evicted: undoing everything that is
+        // left walks back exactly MAX_UNDO steps and stops on the first surviving
+        // line, never reaching the evicted start of the session.
+        let mut undone = 0;
+        while undo(&mut h, &mut c) {
+            undone += 1;
+        }
+        assert_eq!(undone, MAX_UNDO);
+        assert!(c.starts_with("0\n") && c.ends_with("199\n"), "{c:?}");
+        assert_eq!(c.lines().count(), 200, "the 200 evicted steps stay applied");
     }
 
     #[test]

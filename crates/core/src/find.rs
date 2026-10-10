@@ -299,6 +299,11 @@ pub fn resume_after(text: &str, m: Match) -> usize {
 /// Number of lines in `text`: one more than the count of `\n`. An empty string
 /// is one (empty) line; a trailing `\n` yields a final empty line — the cursor
 /// model an editor uses (and what [`goto_line_offset`] clamps against).
+///
+/// A pure helper over the text, not a production hot path: the shell reads the
+/// cached [`crate::Document::line_count`] and go-to-line uses the document's
+/// line index (#126). It is kept for the tests and fuzz targets that check those
+/// against a from-scratch count, and for the `Document`'s own recount at load.
 pub fn line_count(text: &str) -> usize {
     count_newlines(text.as_bytes()) + 1
 }
@@ -323,9 +328,12 @@ fn newlines_in_block(block: &[u8]) -> usize {
 /// obvious `bytes().filter(..).count()` is a scalar loop the compiler does not
 /// vectorise well; summing a `u8` tally over fixed-size blocks does vectorise,
 /// and measured ~11× faster on a 10 MB buffer whether the newlines are dense
-/// (every 5 bytes), typical (every 80) or absent. The status bar and the find
-/// bar's `line_count` run this on every edit, so it is worth the care; it needs
-/// no `memchr` dependency.
+/// (every 5 bytes), typical (every 80) or absent. Nothing runs it per edit any
+/// more — the `Document` keeps its line count in its index and go-to-line reads
+/// that — but [`line_count`] stays the pure helper the tests, the fuzz targets
+/// and the `Document`'s own from-scratch recount (sizing the index at load)
+/// rely on, and [`goto_line_offset`] skips whole blocks with it; it needs no
+/// `memchr` dependency.
 fn count_newlines(bytes: &[u8]) -> usize {
     bytes.chunks(NEWLINE_BLOCK).map(newlines_in_block).sum()
 }

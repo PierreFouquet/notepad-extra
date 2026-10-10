@@ -65,8 +65,9 @@ performance budgets every change is measured against, and the exact checks to ru
 
 - Rust (latest stable) via [rustup](https://rustup.rs/)
 - **Linux only** — the editor is software-rendered (no GPU required), but it dlopens the
-  X11/Wayland, xkbcommon and fontconfig client libraries at runtime. On a typical desktop
-  they are already installed; CI adds just:
+  X11/Wayland, xkbcommon and fontconfig client libraries at runtime, plus `libdbus-1` for
+  the Open/Save dialogs (spoken to the desktop portal; falls back to `zenity` without it).
+  On a typical desktop they are already installed; CI adds just:
 
   ```bash
   sudo apt-get update && sudo apt-get install -y \

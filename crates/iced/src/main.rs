@@ -781,13 +781,16 @@ fn large_file_lines(content: &str) -> Option<usize> {
 /// The caret-dependent readouts [`Shell::view`] shows, computed **once per state
 /// change** and only *read* per frame (#126).
 ///
-/// `view` runs on every redraw — every keystroke, scroll and pointer event, and
-/// the editor's 500 ms caret blink — and used to derive the status bar and the
-/// bracket highlight afresh each time. The status bar itself is cheap now (the
-/// document caches its totals and line index), but
-/// [`core::brackets::match_at`] walks the text from the caret to its partner —
-/// the rest of the document for an unmatched opener — so an idle editor with a
-/// stray `(` re-scanned the whole buffer twice a second, forever.
+/// `view` is rebuilt after every message batch — every keystroke, every scroll
+/// step and every pointer movement over the editor (the shell tracks the pointer
+/// for the context menu, so motion alone is a message) — and used to derive the
+/// status bar and the bracket highlight afresh each time. (The 500 ms caret
+/// blink is a redraw of the existing widget tree: it re-runs the widgets'
+/// `draw`/`layout`, not `view`.) The status bar itself is cheap now (the document
+/// caches its totals and line index), but [`core::brackets::match_at`] walks the
+/// text from the caret to its partner — the rest of the document for an
+/// unmatched opener — so merely moving the mouse across a document with a stray
+/// `(` re-scanned the whole buffer on every motion event.
 ///
 /// Both inputs change only inside [`Shell::dispatch`]: the caret moves only
 /// through `Content::perform` / `move_to` there (an `Edit` action, a reveal, a

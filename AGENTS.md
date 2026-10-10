@@ -139,20 +139,23 @@ crates/iced     notepad-iced    thin iced shell: renders State, executes Effects
 
 ## 4. Performance model
 
-Why: `Shell::view` runs on **every redraw** — each keystroke, scroll and mouse
-event, and the caret blink every 500 ms (`Focus::CURSOR_BLINK_INTERVAL_MILLIS` in
-the vendored widget) — and every `Shell::update` forces a full repaint
-(`repaint_nudge`, a software-renderer damage workaround). Work placed in `view`,
-or in anything `view` calls, is paid several times a second while the app is
-idle. Issue #126 was exactly this: the status bar re-segmented the whole document
-into words per frame (~50 ms per frame at 200 000 lines).
+Why: `Shell::view` is rebuilt after **every message batch** — each keystroke,
+scroll step and pointer movement over the editor (pointer motion is a message,
+the shell tracks it for the context menu) — and every `Shell::update` forces a
+full repaint (`repaint_nudge`, a software-renderer damage workaround). The
+widgets' `draw`/`layout` run on **every redraw**, which includes the caret blink
+every 500 ms (`Focus::CURSOR_BLINK_INTERVAL_MILLIS` in the vendored widget) even
+while the app is otherwise idle. Work placed in `view`, or in anything `view`
+calls, is paid on every mouse movement; work in `draw`/`layout` is paid twice a
+second forever. Issue #126 was exactly this: the status bar re-segmented the
+whole document into words on every `view` (~50 ms at 200 000 lines).
 
 ### Budgets per code path
 
 | Path | Runs | Allowed cost |
 | --- | --- | --- |
 | `Shell::view`; widget `draw`, `layout`, `mouse_interaction` | every redraw (≥ 2/s idle) | O(viewport + chrome). MUST NOT scan the document or call anything that does. |
-| `Shell::update` / `Shell::dispatch` | every message | O(log n) lookups + O(viewport). May refresh the per-update readout cache. |
+| `Shell::update` / `Shell::dispatch` | every message | O(log n) lookups + O(viewport), plus the per-update readout refresh: O(selection) for the status bar and O(distance to the bracket partner) for bracket matching — O(document) for an unmatched opener, once per message, never per frame. |
 | edit path: `Message::Edit` → `Content::text()` → `core::Message::Edited` → `Document::commit` | every keystroke | O(n) is inherent (the widget hands over the whole text) but only with memcpy-class constants: one `text()` pass, one byte prefix/suffix `diff`, then **incremental** updates in O(edit + affected lines). No Unicode-aware full pass. |
 | load / reload / save | once per file | O(n), single pass, minimal copies: `encoding::decode_owned` (zero-copy UTF-8), `EndOfLine::normalize` (LF text untouched, CRLF compacted in place), fingerprint hashed before decode. |
 | highlighter | per visible line after an edit / scroll | parse from the nearest checkpoint; memory O(lines / 32). |
@@ -172,7 +175,7 @@ into words per frame (~50 ms per frame at 200 000 lines).
 | `highlight::Settings.syntax` is a `&'static str` borrowed from the syntax set, so the per-frame `Settings` the widget compares and clones is a pointer copy. | `highlight.rs` | the `Settings` type is `Copy`; `theme_mode_changes_the_palette` |
 | `Content::text()` is one borrow, one allocation, no per-line `String`. | `text_editor.rs` | `text_round_trips_every_line_ending_shape`, `text_matches_the_upstream_lines_formulation_after_edits` |
 | Scrollbar inputs (`vertical_extent`) are O(1) with wrapping off (one row per line) and one fused pass with wrapping on; thumb geometry unchanged. | `text_editor.rs` | `vertical_extent_matches_the_per_line_walk_in_both_wrap_modes` |
-| With wrapping off, `layout()` never hands the editor a narrower width than it already has (cosmic-text relayouts every shaped line on any size change). | `text_editor.rs` | `no_wrap_layout_width_ratchets_and_wrapping_restores_the_viewport` |
+| With wrapping off, `layout()` never hands the editor a narrower width than it already has (cosmic-text relayouts every shaped line on any size change) — except while a right-to-left run is on screen, when the width falls back to the visible extent because cosmic-text right-aligns RTL paragraphs to the buffer width. | `text_editor.rs` | `no_wrap_layout_width_ratchets_and_wrapping_restores_the_viewport`, `no_wrap_width_yields_to_the_visible_extent_while_rtl_text_is_on_screen` |
 | The highlighter checkpoints parser state every `CHECKPOINT_INTERVAL` (32) lines; `change_line(k)` resumes from the nearest checkpoint and is equivalent to a fresh run. | `highlight.rs` | `resuming_from_a_checkpoint_reproduces_a_fresh_run_for_every_line`, `resuming_after_an_edit_matches_a_fresh_run_of_the_edited_buffer`, `checkpoints_are_one_per_interval` |
 | Load path copies: `EndOfLine::normalize` returns LF text in the same allocation; `decode_owned` reuses the byte buffer for UTF-8. | `text.rs`, `encoding.rs` | `normalize_returns_an_lf_buffer_untouched_without_copying`, `owned_decode_of_valid_utf8_reuses_the_buffer`, `owned_and_borrowed_decoders_agree` |
 | Find readouts are one regex pass (`count_and_ordinal`); replace-all expands into the output buffer. | `find.rs` | `count_and_ordinal_matches_the_two_pass_form`, `replace_all_matches_a_per_match_splice` |

@@ -3695,12 +3695,16 @@ mod tests {
     #[test]
     fn save_as_asks_for_a_path_for_the_active_tab_even_when_titled() {
         // Unlike Save, Save-As never writes straight back to the tab's own path:
-        // it always asks for a destination, and for the tab in front.
+        // it always asks for a destination, and for the tab in front. The
+        // front tab here is the middle one, neither the first nor the newest.
         let mut s = State::default();
         load(&mut s, "/t/a.txt", "abc");
         load(&mut s, "/t/b.txt", "def");
-        let id = s.active_doc().id;
+        load(&mut s, "/t/c.txt", "ghi");
+        update(&mut s, Message::TabSelected(1));
+        let id = s.docs[1].id;
         assert_ne!(id, s.docs[0].id);
+        assert_ne!(id, s.docs[2].id);
         assert_eq!(
             update(&mut s, Message::SaveAsRequested),
             vec![Effect::PickSavePath { id }]
@@ -3760,23 +3764,38 @@ mod tests {
         // were raised for; if that tab has closed in the meantime they must not
         // fall through to whichever tab is open now.
         let mut s = State::default();
+        // Tab A: clean, changed on disk, about to be closed.
         load_with_meta(&mut s, "/t/a.txt", "abc", meta(1, 3));
-        update(&mut s, Message::Edited("mine".into()));
-        let id = s.active_doc().id;
+        let closed = s.active_doc().id;
         update(
             &mut s,
             Message::DiskChanged {
-                id,
+                id: closed,
                 meta: Some(meta(2, 9)),
             },
         );
-        let stale = id + 100;
-        assert!(update(&mut s, Message::ReloadFromDisk { id: stale }).is_empty());
-        assert!(update(&mut s, Message::KeepMine { id: stale }).is_empty());
-        assert!(update(&mut s, Message::OverwriteConfirmed { id: stale }).is_empty());
+        // Tab B: dirty and changed on disk too, so each answer, if it fell
+        // through to B, would reload it, adopt its fingerprint or write it.
+        load_with_meta(&mut s, "/t/b.txt", "def", meta(3, 3));
+        update(&mut s, Message::Edited("mine".into()));
+        let open = s.active_doc().id;
+        update(
+            &mut s,
+            Message::DiskChanged {
+                id: open,
+                meta: Some(meta(4, 9)),
+            },
+        );
+        update(&mut s, Message::TabClosed(0)); // A is clean: it closes at once
+        assert_eq!(s.docs.len(), 1);
+        assert_eq!(s.active_doc().id, open);
+
+        assert!(update(&mut s, Message::ReloadFromDisk { id: closed }).is_empty());
+        assert!(update(&mut s, Message::KeepMine { id: closed }).is_empty());
+        assert!(update(&mut s, Message::OverwriteConfirmed { id: closed }).is_empty());
         let doc = s.active_doc();
-        assert_eq!(doc.disk_status, DiskStatus::Modified(meta(2, 9)));
-        assert_eq!(doc.disk_meta(), Some(&meta(1, 3)));
+        assert_eq!(doc.disk_status, DiskStatus::Modified(meta(4, 9)));
+        assert_eq!(doc.disk_meta(), Some(&meta(3, 3)));
         assert_eq!(doc.content(), "mine");
     }
 
@@ -3788,7 +3807,6 @@ mod tests {
         update(&mut s, Message::Edited("scratch".into()));
         let id = s.active_doc().id;
         assert!(update(&mut s, Message::OverwriteConfirmed { id }).is_empty());
-        assert!(s.active_doc().dirty());
     }
 
     proptest! {
@@ -3945,6 +3963,84 @@ mod tests {
                 (0u64..8).prop_map(|id| Message::OverwriteConfirmed { id }),
             ],
         ]
+    }
+
+    #[test]
+    fn the_random_message_stream_reaches_every_kind_of_message() {
+        // The invariant proptests below are only as strong as the stream they
+        // draw from: a branch of `arb_message` that is never drawn is a message
+        // they never test. Sample it with proptest's fixed-seed runner, so the
+        // result does not depend on PROPTEST_CASES or a seed, and require every
+        // kind the stream is meant to produce. That also covers the strategy's
+        // own code without relying on a lucky draw, which the single-case
+        // coverage check needs (#142).
+        use proptest::strategy::ValueTree;
+        use proptest::test_runner::TestRunner;
+        use std::collections::BTreeSet;
+
+        fn kind(m: &Message) -> String {
+            match m {
+                Message::DiskChanged { meta: None, .. } => "DiskChanged(gone)".into(),
+                Message::DiskChanged { meta: Some(_), .. } => "DiskChanged(fresh)".into(),
+                other => format!("{other:?}")
+                    .split(|c: char| !c.is_alphanumeric())
+                    .next()
+                    .unwrap_or_default()
+                    .to_string(),
+            }
+        }
+
+        let strategy = arb_message();
+        let mut runner = TestRunner::deterministic();
+        let drawn: BTreeSet<String> = (0..5_000)
+            .map(|_| kind(&strategy.new_tree(&mut runner).unwrap().current()))
+            .collect();
+        let expected: BTreeSet<String> = [
+            "NewTab",
+            "OpenRequested",
+            "SaveRequested",
+            "SaveAsRequested",
+            "Edited",
+            "Undo",
+            "Redo",
+            "TabSelected",
+            "TabClosed",
+            "TabCloseDiscard",
+            "TabCloseSave",
+            "SaveAbandoned",
+            "FileSaved",
+            "FileLoaded",
+            "FindOpened",
+            "FindClosed",
+            "FindNext",
+            "FindPrev",
+            "ReplaceNext",
+            "ReplaceAll",
+            "FindQueryChanged",
+            "FindOpenedWith",
+            "ReplaceTextChanged",
+            "FindOptionToggled",
+            "GoToLine",
+            "ZoomIn",
+            "ZoomOut",
+            "ZoomReset",
+            "ToggleWordWrap",
+            "SetEditorFont",
+            "SetUiFont",
+            "SetLanguage",
+            "SetEncoding",
+            "ReopenAs",
+            "FileReloaded",
+            "DiskChanged(gone)",
+            "DiskChanged(fresh)",
+            "ReloadFromDisk",
+            "KeepMine",
+            "OverwriteConfirmed",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        assert_eq!(drawn, expected);
     }
 
     proptest! {

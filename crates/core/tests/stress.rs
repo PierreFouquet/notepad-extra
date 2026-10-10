@@ -70,18 +70,18 @@ fn million_line_paste_is_a_single_undo_step() {
     let mut s = State::default();
     let huge: String = "x\n".repeat(1_000_000);
     update(&mut s, Message::Edited(huge.clone()));
-    assert_eq!(s.active_doc().content.len(), huge.len());
+    assert_eq!(s.active_doc().content().len(), huge.len());
 
     update(&mut s, Message::Undo);
     assert_eq!(
-        s.active_doc().content,
+        s.active_doc().content(),
         "",
         "one undo removes the whole paste"
     );
     assert!(!s.active_doc().dirty());
 
     update(&mut s, Message::Redo);
-    assert_eq!(s.active_doc().content, huge, "one redo restores it");
+    assert_eq!(s.active_doc().content(), huge, "one redo restores it");
     assert!(s.active_doc().dirty());
 }
 
@@ -95,12 +95,12 @@ fn huge_single_line_edit_then_undo() {
     let mut edited = base.clone();
     edited.replace_range(0..1, "B"); // replace the first char — a replacement, not an insert
     update(&mut s, Message::Edited(edited.clone()));
-    assert_eq!(s.active_doc().content, edited);
+    assert_eq!(s.active_doc().content(), edited);
 
     update(&mut s, Message::Undo);
-    assert_eq!(s.active_doc().content, base);
+    assert_eq!(s.active_doc().content(), base);
     update(&mut s, Message::Undo);
-    assert_eq!(s.active_doc().content, "");
+    assert_eq!(s.active_doc().content(), "");
 }
 
 #[test]
@@ -113,7 +113,7 @@ fn edit_storm_then_full_undo_walks_back_consistently() {
     for i in 0..3000 {
         content = format!("{content}line{i}\n");
         update(&mut s, Message::Edited(content.clone()));
-        assert_eq!(s.active_doc().content, content);
+        assert_eq!(s.active_doc().content(), content);
     }
     // Undo far more times than the (capped) history depth; each step must leave a
     // valid buffer and never panic.
@@ -123,9 +123,9 @@ fn edit_storm_then_full_undo_walks_back_consistently() {
     }
     // The oldest edits were capped away, so undo can't reach the empty buffer;
     // what matters is it stayed panic-free and consistent throughout.
-    let remaining = s.active_doc().content.clone();
+    let remaining = s.active_doc().content().to_string();
     update(&mut s, Message::Redo);
-    assert!(s.active_doc().content.starts_with(&remaining));
+    assert!(s.active_doc().content().starts_with(&remaining));
 }
 
 #[test]
@@ -170,7 +170,7 @@ fn rapid_tab_switch_storm_stays_consistent() {
         assert!(s.active < s.docs.len());
     }
     for (i, doc) in s.docs.iter().enumerate() {
-        assert_eq!(doc.content, format!("content {i}\n"));
+        assert_eq!(doc.content(), format!("content {i}\n"));
     }
 }
 
@@ -304,7 +304,7 @@ fn many_large_tabs_are_retained_then_freed() {
     }
     assert_eq!(s.docs.len(), 250);
     for doc in &s.docs {
-        assert_eq!(doc.content.len(), big.len());
+        assert_eq!(doc.content().len(), big.len());
     }
     // Freshly loaded tabs are clean, so each closes without a confirmation.
     for _ in 0..250 {
@@ -312,7 +312,7 @@ fn many_large_tabs_are_retained_then_freed() {
         assert!(!s.docs.is_empty());
     }
     assert_eq!(s.docs.len(), 1);
-    assert!(s.active_doc().content.is_empty(), "ends on a fresh blank");
+    assert!(s.active_doc().content().is_empty(), "ends on a fresh blank");
 }
 
 // ---- Find / Replace / Go-to-line adversarial cases (#33) ----
@@ -342,10 +342,10 @@ fn replace_all_on_a_huge_document_is_bounded_and_undoable() {
     update(&mut s, Message::ReplaceTextChanged("qux".into()));
     update(&mut s, Message::ReplaceAll);
     assert_eq!(s.find.count, 0);
-    assert!(s.active_doc().content.starts_with("qux bar\n"));
+    assert!(s.active_doc().content().starts_with("qux bar\n"));
     // The whole replace-all collapses to a single undo step.
     update(&mut s, Message::Undo);
-    assert!(s.active_doc().content.starts_with("foo bar\n"));
+    assert!(s.active_doc().content().starts_with("foo bar\n"));
 }
 
 #[test]
@@ -357,7 +357,7 @@ fn search_a_million_line_document() {
     assert_eq!(s.find.count, 1_000_000);
     update(&mut s, Message::FindNext);
     let hit = s.find.current.expect("a match");
-    assert!(hit.end <= s.active_doc().content.len());
+    assert!(hit.end <= s.active_doc().content().len());
 }
 
 #[test]
@@ -382,7 +382,7 @@ fn thousands_of_find_next_calls_stay_in_bounds() {
     for _ in 0..10_000 {
         update(&mut s, Message::FindNext);
         let hit = s.find.current.expect("always on a match");
-        assert!(hit.end <= s.active_doc().content.len());
+        assert!(hit.end <= s.active_doc().content().len());
     }
 }
 
@@ -419,7 +419,7 @@ fn status_on_a_huge_single_line_stays_correct() {
         },
     );
     let doc = s.active_doc();
-    let end = doc.content.len();
+    let end = doc.content().len();
     let st = status(doc, end, None);
     assert_eq!(st.line, 1);
     assert_eq!(st.column, 1_000_001);
@@ -446,7 +446,7 @@ fn status_on_a_million_line_document_stays_correct() {
         },
     );
     let doc = s.active_doc();
-    let st = status(doc, doc.content.len(), None);
+    let st = status(doc, doc.content().len(), None);
     assert_eq!(st.lines, 1_000_001);
     assert_eq!(st.line, 1_000_001);
     assert_eq!(st.column, 1);
@@ -460,7 +460,7 @@ fn rapid_zoom_storm_stays_within_bounds_and_leaves_editing_intact() {
     // undo history — zoom is an app-wide view setting, not a document edit.
     let mut s = State::default();
     update(&mut s, Message::Edited("hello".into()));
-    let before = s.active_doc().content.clone();
+    let before = s.active_doc().content().to_string();
 
     for i in 0..50_000 {
         let msg = match i % 3 {
@@ -477,10 +477,10 @@ fn rapid_zoom_storm_stays_within_bounds_and_leaves_editing_intact() {
     }
 
     // The buffer, dirty flag and undo are untouched by all that zooming.
-    assert_eq!(s.active_doc().content, before);
+    assert_eq!(s.active_doc().content(), before);
     assert!(s.active_doc().dirty());
     update(&mut s, Message::Undo);
-    assert_eq!(s.active_doc().content, "");
+    assert_eq!(s.active_doc().content(), "");
 }
 
 #[test]

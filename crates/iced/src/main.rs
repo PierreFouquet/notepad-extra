@@ -923,7 +923,7 @@ impl Shell {
         let mut editors = HashMap::new();
         editors.insert(
             core.active_doc().id,
-            text_editor::Content::with_text(&core.active_doc().content),
+            text_editor::Content::with_text(core.active_doc().content()),
         );
         let title = window_title(&core);
         (
@@ -1757,14 +1757,14 @@ impl Shell {
         for doc in &self.core.docs {
             self.editors
                 .entry(doc.id)
-                .or_insert_with(|| text_editor::Content::with_text(&doc.content));
+                .or_insert_with(|| text_editor::Content::with_text(doc.content()));
         }
 
         // 3. Rebuild only the active buffer when the core rewrote its text.
         if resync {
             let doc = self.core.active_doc();
             self.editors
-                .insert(doc.id, text_editor::Content::with_text(&doc.content));
+                .insert(doc.id, text_editor::Content::with_text(doc.content()));
         }
     }
 
@@ -1869,7 +1869,7 @@ impl Shell {
             // canonical text the editor holds; `line_col_of` converts them to the
             // (line, byte-column) the widget's cursor speaks.
             Effect::RevealRange { start, end } => {
-                let content = &self.core.active_doc().content;
+                let content = self.core.active_doc().content();
                 let (sl, sc) = core::find::line_col_of(content, start);
                 let cursor = if start == end {
                     Cursor {
@@ -1946,10 +1946,10 @@ impl Shell {
         let doc = self.core.active_doc();
         let cursor = self.active_editor().cursor();
         let caret =
-            core::find::offset_at(&doc.content, cursor.position.line, cursor.position.column);
+            core::find::offset_at(doc.content(), cursor.position.line, cursor.position.column);
         let anchor = cursor
             .selection
-            .map(|a| core::find::offset_at(&doc.content, a.line, a.column));
+            .map(|a| core::find::offset_at(doc.content(), a.line, a.column));
         core::status(doc, caret, anchor)
     }
 
@@ -1958,7 +1958,7 @@ impl Shell {
     /// (no renderer needed, so it stays headless-testable) and is what a line/
     /// text operation (#54) is scoped to — the core widens or clamps it.
     fn selection_range(&self) -> Option<(usize, usize)> {
-        let content = &self.core.active_doc().content;
+        let content = self.core.active_doc().content();
         let cursor = self.active_editor().cursor();
         let caret = core::find::offset_at(content, cursor.position.line, cursor.position.column);
         let anchor = cursor
@@ -1974,7 +1974,7 @@ impl Shell {
     /// brackets match, and maps the result back to the widget's `(line, column)`
     /// positions with `find::line_col_of` — the same conversion `RevealRange` uses.
     fn active_bracket(&self) -> Option<BracketHighlight> {
-        let content = &self.core.active_doc().content;
+        let content = self.core.active_doc().content();
         let cursor = self.active_editor().cursor();
         let caret = core::find::offset_at(content, cursor.position.line, cursor.position.column);
         let m = core::brackets::match_at(content, caret)?;
@@ -3537,7 +3537,7 @@ mod tests {
         assert_eq!(shell.core.docs[0].path.as_deref(), Some(a.as_path()));
         assert_eq!(shell.core.docs[1].path.as_deref(), Some(b.as_path()));
         assert_eq!(shell.core.active_doc().path.as_deref(), Some(b.as_path()));
-        assert_eq!(shell.core.active_doc().content, "fn beta() {}");
+        assert_eq!(shell.core.active_doc().content(), "fn beta() {}");
         // The editor buffer shows the focused file, and nothing is dirty.
         assert_eq!(shell.active_editor().text().trim_end(), "fn beta() {}");
         assert!(shell.core.docs.iter().all(|d| !d.dirty()));
@@ -3562,7 +3562,7 @@ mod tests {
             shell.core.active_doc().path.as_deref(),
             Some(good.as_path())
         );
-        assert_eq!(shell.core.active_doc().content, "# ok");
+        assert_eq!(shell.core.active_doc().content(), "# ok");
         assert!(
             shell.error.is_some(),
             "the failed read is surfaced in the status bar"
@@ -3710,7 +3710,7 @@ mod tests {
         assert!(
             !shell.core.active_doc().dirty(),
             "back at the saved baseline, content={:?}",
-            shell.core.active_doc().content,
+            shell.core.active_doc().content(),
         );
         assert!(
             !shell.title.starts_with('\u{2022}'),
@@ -3808,7 +3808,7 @@ mod tests {
         assert!(!shell.core.active_doc().dirty());
         let _ = shell.update(Message::Edit(paste("hello")));
         assert!(shell.core.active_doc().dirty());
-        assert_eq!(shell.core.active_doc().content.trim_end(), "hello");
+        assert_eq!(shell.core.active_doc().content().trim_end(), "hello");
     }
 
     #[test]
@@ -3958,7 +3958,7 @@ mod tests {
         assert_eq!(shell.active_editor().text().trim_end(), "start END");
         // It went *through the core*, not just the widget, so the core's buffer
         // matches — which is what keeps paste undoable.
-        assert_eq!(shell.core.active_doc().content.trim_end(), "start END");
+        assert_eq!(shell.core.active_doc().content().trim_end(), "start END");
 
         let before = shell.active_editor().text();
         let _ = shell.update(Message::ContextPasteReady(None));
@@ -4600,7 +4600,7 @@ mod tests {
         let _ = shell.update(Message::Edit(paste("a\nb")));
         let _ = shell.update(Message::GoToInputChanged("not-a-number".into()));
         let _ = shell.update(Message::GoToSubmit); // must not panic
-        assert_eq!(shell.core.active_doc().content, "a\nb");
+        assert_eq!(shell.core.active_doc().content(), "a\nb");
     }
 
     #[test]
@@ -4611,7 +4611,7 @@ mod tests {
         let _ = shell.update(Message::FindQueryChanged("ab".into()));
         let _ = shell.update(Message::ReplaceQueryChanged("X".into()));
         let _ = shell.update(Message::ReplaceOne);
-        assert_eq!(shell.core.active_doc().content, "X ab ab");
+        assert_eq!(shell.core.active_doc().content(), "X ab ab");
         assert_eq!(shell.active_editor().text().trim_end(), "X ab ab");
         // The editor resynced and the selection landed on the next match.
         assert_eq!(shell.active_editor().selection().as_deref(), Some("ab"));
@@ -4756,7 +4756,7 @@ mod tests {
             path: PathBuf::from("/tmp/u16.txt"),
             result: Ok(bytes),
         });
-        assert_eq!(shell.core.active_doc().content, "hi");
+        assert_eq!(shell.core.active_doc().content(), "hi");
         assert_eq!(shell.status().encoding, "UTF-16 LE");
         assert!(shell.error.is_none());
     }
@@ -4775,7 +4775,7 @@ mod tests {
             shell.error.is_none(),
             "a non-UTF-8 file opens, never errors"
         );
-        assert!(!shell.core.active_doc().content.is_empty());
+        assert!(!shell.core.active_doc().content().is_empty());
     }
 
     #[test]
@@ -4793,7 +4793,7 @@ mod tests {
             encoding: core::FileEncoding::from_label("Windows-1252").unwrap(),
             result: Ok(vec![b'a', 0x97, b'b']),
         });
-        assert_eq!(shell.core.active_doc().content, "a—b");
+        assert_eq!(shell.core.active_doc().content(), "a—b");
         assert_eq!(shell.status().encoding, "Windows-1252");
     }
 
@@ -4819,7 +4819,7 @@ mod tests {
             "a non-decodable reopen is blocked with an error"
         );
         assert_eq!(
-            shell.core.active_doc().content,
+            shell.core.active_doc().content(),
             "plain",
             "the buffer is untouched"
         );
@@ -5757,7 +5757,7 @@ mod tests {
         let _ = shell.update(Message::OpenLink("javascript:alert(1)".to_string()));
         let _ = shell.update(Message::LinkOpened);
         assert_eq!(shell.core.docs.len(), 1);
-        assert_eq!(shell.core.active_doc().content.trim_end(), "body");
+        assert_eq!(shell.core.active_doc().content().trim_end(), "body");
         assert!(shell.error.is_none());
     }
 

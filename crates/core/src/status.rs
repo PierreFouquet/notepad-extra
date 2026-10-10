@@ -5,16 +5,20 @@
 //! selection the render shell reads from its editor widget — no window, no I/O —
 //! so the whole readout is asserted headlessly (epic #25's testing standard).
 //! The shell only converts its cursor to byte offsets (via
-//! [`crate::find::offset_at`]) and renders the returned [`StatusBar`]; all the
+//! [`Document::offset_at`]) and renders the returned [`StatusBar`]; all the
 //! counting lives here.
 //!
 //! Every count is **character**-based, not byte-based: a multi-byte glyph is a
 //! single column and a single selected character, which is what a user expects
 //! (bytes would over-count `é`, `😀`, …).
+//!
+//! The shell calls this on **every redraw**, so it must not scale with the
+//! document (#126): the three document-wide totals are the [`Document`]'s cached
+//! counts, and the caret line comes from its line index, leaving only the
+//! caret's own line (for the character column) and the selection to be walked.
 
-use crate::app::Document;
+use crate::document::Document;
 use crate::find;
-use unicode_segmentation::UnicodeSegmentation;
 
 /// A snapshot of everything the status bar displays, derived purely from a
 /// document's text and the caret / selection.
@@ -54,15 +58,15 @@ pub struct StatusBar {
 /// widget supplies — stale, mid-glyph, or out of range — is safe: this never
 /// panics. `anchor == Some(caret)` (an empty selection) reports `selection: 0`.
 pub fn status(doc: &Document, caret: usize, anchor: Option<usize>) -> StatusBar {
-    let text = &doc.content;
-    let (line, column) = char_position(text, caret);
+    let text = doc.content();
+    let (line, column) = char_position(doc, caret);
     StatusBar {
         line: line + 1,
         column: column + 1,
         selection: anchor.map_or(0, |a| char_span(text, a, caret)),
-        chars: text.chars().count(),
-        words: word_count(text),
-        lines: find::line_count(text),
+        chars: doc.char_count(),
+        words: doc.word_count(),
+        lines: doc.line_count(),
         eol: doc.eol.label(),
         encoding: doc.encoding.label().to_string(),
         language: doc.language(),
@@ -70,26 +74,17 @@ pub fn status(doc: &Document, caret: usize, anchor: Option<usize>) -> StatusBar 
 }
 
 /// 0-based (line, character-column) of byte `offset`, clamped into range and
-/// onto a char boundary. Unlike [`find::line_col_of`] (which returns a *byte*
-/// column for the widget's cursor), the column here counts characters, so a
-/// multi-byte glyph advances it by one.
-fn char_position(text: &str, offset: usize) -> (usize, usize) {
+/// onto a char boundary. Unlike [`Document::line_col_of`] (which returns a
+/// *byte* column for the widget's cursor), the column here counts characters,
+/// so a multi-byte glyph advances it by one. The line is a binary search over
+/// the document's line index and the column a walk of the caret's line only, so
+/// this costs O(log lines + caret line), never O(document) (#126).
+fn char_position(doc: &Document, offset: usize) -> (usize, usize) {
+    let text = doc.content();
     let offset = find::floor_boundary(text, offset);
-    let prefix = &text[..offset];
-    let line = prefix.bytes().filter(|&b| b == b'\n').count();
-    let line_start = prefix.rfind('\n').map_or(0, |i| i + 1);
-    let column = text[line_start..offset].chars().count();
+    let (line, _) = doc.line_col_of(offset);
+    let column = text[doc.line_start(line)..offset].chars().count();
     (line, column)
-}
-
-/// Number of words in `text`, per Unicode word segmentation (UAX #29). This
-/// counts only *word-like* segments — runs of letters/numbers, apostrophe-joined
-/// words like `don't`, and individual CJK ideographs — while whitespace and
-/// standalone punctuation contribute nothing. It therefore differs from a plain
-/// whitespace split (`"a,b,c"` is three words, not one; `"你好"` is two, not one),
-/// which is the more Unicode-correct behaviour this module aims for.
-fn word_count(text: &str) -> usize {
-    text.unicode_words().count()
 }
 
 /// Number of characters in the byte range between `a` and `b` (order doesn't
@@ -104,7 +99,6 @@ fn char_span(text: &str, a: usize, b: usize) -> usize {
 mod tests {
     use super::*;
     use crate::FileEncoding;
-    use crate::history::History;
     use crate::text::EndOfLine;
     use proptest::prelude::*;
 
@@ -115,20 +109,10 @@ mod tests {
     }
 
     fn doc_with(content: &str, eol: EndOfLine, language: &'static str) -> Document {
-        Document {
-            id: 1,
-            path: None,
-            content: content.to_string(),
-            eol,
-            detected_lang: language,
-            manual_lang: None,
-            encoding: FileEncoding::default(),
-            history: History::new(),
-            saved_content: content.to_string(),
-            saved_encoding: FileEncoding::default(),
-            disk_status: crate::app::DiskStatus::InSync,
-            disk: None,
-        }
+        let mut d = Document::blank(1);
+        d.load(content.to_string(), eol, FileEncoding::default(), None);
+        d.detected_lang = language;
+        d
     }
 
     #[test]

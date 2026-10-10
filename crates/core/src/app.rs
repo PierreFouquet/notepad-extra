@@ -7,9 +7,8 @@
 
 use crate::encoding::FileEncoding;
 use crate::find::{self, Match, Matcher, SearchError, SearchOptions};
-use crate::history::History;
 use crate::prefs::Preferences;
-use crate::text::{self, EndOfLine};
+use crate::text::EndOfLine;
 use notepad_syntax::ThemeMode;
 use std::path::PathBuf;
 use std::time::SystemTime;
@@ -68,112 +67,10 @@ pub enum DiskStatus {
     Gone,
 }
 
-/// One open document.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Document {
-    pub id: TabId,
-    /// `None` until the buffer is first saved to disk.
-    pub path: Option<PathBuf>,
-    /// Canonical text, always `\n`-terminated internally (see [`EndOfLine`]).
-    pub content: String,
-    /// The on-disk line ending to restore on save.
-    pub eol: EndOfLine,
-    /// The syntax auto-detected from the file's extension (#32), or
-    /// [`notepad_syntax::PLAIN_TEXT`] for an unsaved / unknown buffer. Refreshed
-    /// on every load and save; the manual override, if any, takes precedence.
-    pub detected_lang: &'static str,
-    /// A per-tab manual language override set from the picker (#32). `None` means
-    /// "auto-detect" (use [`Document::detected_lang`]). It is deliberately *not*
-    /// touched by load/save, so opening or re-saving a file never clobbers a
-    /// language the user chose by hand; it lasts the tab's lifetime.
-    pub manual_lang: Option<&'static str>,
-    /// The text encoding this document reads and writes on disk (#50/#59/#103).
-    /// Detected on open, changed via the status-bar picker
-    /// ([`Message::SetEncoding`]), and used to encode the bytes on save. The
-    /// internal [`Document::content`] is always UTF-8 regardless; this only names
-    /// the on-disk representation, orthogonally to [`Document::eol`].
-    pub encoding: FileEncoding,
-    /// Undo/redo history; also the source of truth for the unsaved-changes
-    /// ("•") marker (see [`Document::dirty`]).
-    pub history: History,
-    /// The last content that was saved to disk. Used to decide whether the
-    /// current buffer still matches the saved baseline.
-    pub(crate) saved_content: String,
-    /// The encoding the on-disk baseline was written with. Mirrors
-    /// [`Document::saved_content`]: choosing a different save encoding on a
-    /// buffer that is otherwise unchanged still marks it dirty (a *convert*), so
-    /// the next Save re-encodes it.
-    pub(crate) saved_encoding: FileEncoding,
-    /// How the buffer currently relates to the file on disk (#51). Set by the
-    /// external-change watch; `InSync` for a fresh or in-sync tab. Read by the
-    /// shell to raise the reload / conflict / "source gone" bar.
-    pub disk_status: DiskStatus,
-    /// The on-disk fingerprint captured at the last load/save (#51), or `None` for
-    /// a never-saved buffer. The baseline the watch compares fresh stats against
-    /// to tell an external change from our own write.
-    pub(crate) disk: Option<DiskMeta>,
-}
-
-impl Document {
-    fn blank(id: TabId) -> Self {
-        Document {
-            id,
-            path: None,
-            content: String::new(),
-            eol: EndOfLine::default(),
-            detected_lang: notepad_syntax::PLAIN_TEXT,
-            manual_lang: None,
-            encoding: FileEncoding::default(),
-            history: History::new(),
-            saved_content: String::new(),
-            saved_encoding: FileEncoding::default(),
-            disk_status: DiskStatus::InSync,
-            disk: None,
-        }
-    }
-
-    /// The effective language: the manual override if the user set one, otherwise
-    /// the extension-detected syntax. This is what the status bar shows and what
-    /// the render shell highlights with (#32).
-    pub fn language(&self) -> &'static str {
-        self.manual_lang.unwrap_or(self.detected_lang)
-    }
-
-    /// Whether the buffer has unsaved changes (the tab's "•" marker), based on
-    /// whether the current content still matches the last saved baseline.
-    pub fn dirty(&self) -> bool {
-        self.content != self.saved_content || self.encoding != self.saved_encoding
-    }
-
-    /// The on-disk fingerprint captured at the last load/save (#51), or `None` for
-    /// a never-saved buffer. The shell reads it to do the cheap `mtime`/`len` gate
-    /// before deciding whether to hash the file on a watch event.
-    pub fn disk_meta(&self) -> Option<&DiskMeta> {
-        self.disk.as_ref()
-    }
-
-    /// The tab / window title: the file name, or `Untitled` for a fresh buffer.
-    ///
-    /// Deliberately the basename, not the full path (#97 item 4). The window shows
-    /// just the file name (the shell appends " — Notepad Extra"), so a deep
-    /// path can't crowd the app name out of the title bar.
-    pub fn title(&self) -> &str {
-        match &self.path {
-            Some(p) => {
-                let s = p.to_str().unwrap_or("");
-                let name = text::basename(s);
-                if name.is_empty() { "Untitled" } else { name }
-            }
-            None => "Untitled",
-        }
-    }
-
-    /// A lone, untouched `Untitled` buffer that opening a file should replace
-    /// rather than leave behind (ports `logic.js`'s `shouldReuseBlankTab`).
-    fn is_pristine_blank(&self) -> bool {
-        self.path.is_none() && !self.dirty() && self.content.is_empty()
-    }
-}
+// `Document` lives in its own module since #126 (it owns the buffer plus the
+// cached totals, line index and dirty flag the shell reads every frame); it is
+// re-exported here so existing `app::Document` paths keep resolving.
+pub use crate::document::Document;
 
 /// Which search option a [`Message::FindOptionToggled`] flips.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -635,9 +532,10 @@ pub enum Message {
     /// *convert*. The label is parsed via
     /// [`crate::encoding::FileEncoding::from_label`]; an unknown one is ignored
     /// (like [`Message::SetLanguage`]). The chosen encoding is recorded and the
-    /// tab goes dirty (via `saved_encoding`), so the next Save re-encodes the
-    /// buffer's current text — and blocks if that text is not representable there
-    /// ([`Effect::WriteFile`]). It never re-reads the file; to recover from a
+    /// tab goes dirty (it no longer matches the saved baseline's encoding), so
+    /// the next Save re-encodes the buffer's current text — and blocks if that
+    /// text is not representable there ([`Effect::WriteFile`]). It never
+    /// re-reads the file; to recover from a
     /// wrong auto-detect, re-decode the on-disk bytes with [`Message::ReopenAs`].
     SetEncoding(String),
 
@@ -788,8 +686,7 @@ pub fn update(state: &mut State, message: Message) -> Vec<Effect> {
             encoding,
             disk,
         } => {
-            let eol = EndOfLine::detect(&content);
-            let normalized = EndOfLine::to_lf(&content);
+            let (eol, normalized) = canonicalize(content);
             let language = notepad_syntax::detect(path.to_str().unwrap_or(""));
 
             let reuse = state.docs.len() == 1 && state.docs[0].is_pristine_blank();
@@ -799,33 +696,17 @@ pub fn update(state: &mut State, message: Message) -> Vec<Effect> {
                 // carried (this is a new document, not an existing manual pick).
                 let doc = &mut state.docs[0];
                 doc.path = Some(path);
-                doc.content = normalized.clone();
-                doc.eol = eol;
                 doc.detected_lang = language;
                 doc.manual_lang = None;
-                doc.encoding = encoding;
-                doc.history = History::new(); // loaded content is the clean baseline
-                doc.saved_content = normalized.clone();
-                doc.saved_encoding = encoding;
-                doc.disk_status = DiskStatus::InSync;
-                doc.disk = disk;
+                doc.load(normalized, eol, encoding, disk);
                 state.active = 0;
             } else {
                 let id = state.alloc_id();
-                state.docs.push(Document {
-                    id,
-                    path: Some(path),
-                    content: normalized.clone(),
-                    eol,
-                    detected_lang: language,
-                    manual_lang: None,
-                    encoding,
-                    history: History::new(),
-                    saved_content: normalized.clone(),
-                    saved_encoding: encoding,
-                    disk_status: DiskStatus::InSync,
-                    disk,
-                });
+                let mut doc = Document::blank(id);
+                doc.path = Some(path);
+                doc.detected_lang = language;
+                doc.load(normalized, eol, encoding, disk);
+                state.docs.push(doc);
                 state.active = state.docs.len() - 1;
             }
             resync_find_after_doc_change(state);
@@ -842,17 +723,9 @@ pub fn update(state: &mut State, message: Message) -> Vec<Effect> {
             // fresh load (re-detect EOL, reset history + baseline, adopt the fresh
             // on-disk fingerprint and clear any external-change status), but keep
             // the path and language.
-            let eol = EndOfLine::detect(&content);
-            let normalized = EndOfLine::to_lf(&content);
+            let (eol, normalized) = canonicalize(content);
             if let Some(doc) = state.doc_mut(id) {
-                doc.content = normalized.clone();
-                doc.eol = eol;
-                doc.encoding = encoding;
-                doc.history = History::new();
-                doc.saved_content = normalized;
-                doc.saved_encoding = encoding;
-                doc.disk_status = DiskStatus::InSync;
-                doc.disk = disk;
+                doc.load(normalized, eol, encoding, disk);
             }
             resync_find_after_doc_change(state);
             title_effect(state)
@@ -865,11 +738,9 @@ pub fn update(state: &mut State, message: Message) -> Vec<Effect> {
         }
 
         Message::Undo => {
-            let doc = &mut state.docs[state.active];
-            let Some(edit) = doc.history.undo() else {
+            let Some(edit) = state.docs[state.active].undo() else {
                 return vec![];
             };
-            edit.apply(&mut doc.content);
             // Land the caret on what the undo changed rather than at (0,0): the
             // edit now occupies `at..at + inserted.len()`, so reveal its end so a
             // shell resync doesn't leave the view scrolled to the top (#94).
@@ -884,11 +755,9 @@ pub fn update(state: &mut State, message: Message) -> Vec<Effect> {
         }
 
         Message::Redo => {
-            let doc = &mut state.docs[state.active];
-            let Some(edit) = doc.history.redo() else {
+            let Some(edit) = state.docs[state.active].redo() else {
                 return vec![];
             };
-            edit.apply(&mut doc.content);
             // Reveal the redone edit's end, mirroring `Undo` above (#94).
             let caret = edit.at + edit.inserted.len();
             let mut fx = title_effect(state);
@@ -937,12 +806,10 @@ pub fn update(state: &mut State, message: Message) -> Vec<Effect> {
                 // manual language override untouched — saving must not clobber it.
                 doc.detected_lang = notepad_syntax::detect(path.to_str().unwrap_or(""));
                 doc.path = Some(path);
-                doc.saved_content = doc.content.clone();
-                // The write used the document's current encoding, so that is now
-                // the on-disk baseline — this clears the dirty marker a *convert*
-                // set (mirrors `saved_content`).
-                doc.saved_encoding = doc.encoding;
-                doc.history.mark_saved();
+                // The write used the document's current text and encoding, so they
+                // are now the on-disk baseline — clearing the dirty marker whether
+                // an edit or a *convert* set it.
+                doc.mark_saved();
                 // Our own write is now the on-disk truth: adopt its fingerprint as
                 // the new baseline and clear any external-change status, so the
                 // watch event this save triggers reads as a no-op (#51).
@@ -1035,7 +902,7 @@ pub fn update(state: &mut State, message: Message) -> Vec<Effect> {
                     Some(path) => Effect::WriteFile {
                         id,
                         path: path.clone(),
-                        content: doc.eol.join(&doc.content),
+                        content: doc.eol.join(doc.content()),
                         encoding: doc.encoding,
                     },
                     None => Effect::PickSavePath { id },
@@ -1082,7 +949,7 @@ pub fn update(state: &mut State, message: Message) -> Vec<Effect> {
                     Some(path) => Effect::WriteFile {
                         id: doc.id,
                         path: path.clone(),
-                        content: doc.eol.join(&doc.content),
+                        content: doc.eol.join(doc.content()),
                         encoding: doc.encoding,
                     },
                     None => Effect::PickSavePath { id: doc.id },
@@ -1145,7 +1012,9 @@ pub fn update(state: &mut State, message: Message) -> Vec<Effect> {
         Message::ReplaceAll => replace_all_matches(state),
 
         Message::GoToLine(line) => {
-            let offset = find::goto_line_offset(&state.docs[state.active].content, line);
+            // `GoToLine` is 1-based and clamps like `find::goto_line_offset`; the
+            // document's line index answers it without a scan (#126).
+            let offset = state.docs[state.active].line_start(line.max(1) - 1);
             vec![Effect::RevealRange {
                 start: offset,
                 end: offset,
@@ -1237,7 +1106,7 @@ pub fn update(state: &mut State, message: Message) -> Vec<Effect> {
 
         // ---- Character encoding selection (#50/#59/#103) ----
         // The status-bar picker always *converts*: record the chosen save
-        // encoding, which marks the tab dirty (via `saved_encoding`) so the next
+        // encoding, which marks the tab dirty (it differs from the saved baseline's) so the next
         // Save re-encodes the buffer's current text — blocking there if it isn't
         // representable. It never touches the file. An unknown label is ignored,
         // like `SetLanguage`.
@@ -1388,7 +1257,7 @@ fn write_effect(doc: &Document, path: PathBuf) -> Effect {
     Effect::WriteFile {
         id: doc.id,
         path,
-        content: doc.eol.join(&doc.content),
+        content: doc.eol.join(doc.content()),
         encoding: doc.encoding,
     }
 }
@@ -1416,15 +1285,24 @@ fn close_doc_at(state: &mut State, index: usize) {
 /// transition when the document is reverted to its saved baseline.
 fn apply_edit(state: &mut State, new_content: String) -> Vec<Effect> {
     let doc = &mut state.docs[state.active];
-    if let Some(edit) = crate::history::diff(&doc.content, &new_content) {
-        let was_dirty = doc.dirty();
-        doc.history.record(edit);
-        doc.content = new_content;
-        if was_dirty != doc.dirty() {
-            return title_effect(state);
-        }
+    let was_dirty = doc.dirty();
+    if doc.commit(new_content) && was_dirty != doc.dirty() {
+        return title_effect(state);
     }
     vec![]
+}
+
+/// Detect a freshly-read file's line-ending style and canonicalise its text to
+/// `\n` for the buffer. An LF file is passed through **by move**: `to_lf` would
+/// only reproduce it byte-for-byte, and that copy was one of the two or three a
+/// load used to make (#126). Only a CRLF file pays for the rewrite.
+fn canonicalize(content: String) -> (EndOfLine, String) {
+    let eol = EndOfLine::detect(&content);
+    let normalized = match eol {
+        EndOfLine::Crlf => EndOfLine::to_lf(&content),
+        EndOfLine::Lf => content,
+    };
+    (eol, normalized)
 }
 
 /// Compile the active pattern, or record its error / return `None` for an empty
@@ -1457,7 +1335,7 @@ fn refresh_find(state: &mut State, select_first: bool) -> Vec<Effect> {
         return vec![];
     }
     let matcher = compile_query(&mut state.find);
-    let content = &state.docs[state.active].content;
+    let content = state.docs[state.active].content();
     let (count, current, ordinal, effect) = match &matcher {
         Some(m) => {
             let count = m.count(content);
@@ -1512,7 +1390,7 @@ fn navigate(state: &mut State, forward: bool) -> Vec<Effect> {
         state.find.ordinal = 0;
         return vec![];
     };
-    let content = &state.docs[state.active].content;
+    let content = state.docs[state.active].content();
     let current = state.find.current;
     let next = if forward {
         let from = current.map_or(0, |c| find::resume_after(content, c));
@@ -1548,14 +1426,14 @@ fn replace_current(state: &mut State) -> Vec<Effect> {
     };
     let from = state.find.current.map_or(0, |c| c.start);
     let replaced = {
-        let content = &state.docs[state.active].content;
+        let content = state.docs[state.active].content();
         matcher.replace_next(content, from, &state.find.replacement)
     };
     let Some(rep) = replaced else {
         return vec![];
     };
     let mut fx = apply_edit(state, rep.text);
-    let content = &state.docs[state.active].content;
+    let content = state.docs[state.active].content();
     let after = find::resume_after(content, rep.range);
     let next = matcher
         .find_from(content, after)
@@ -1580,7 +1458,7 @@ fn replace_all_matches(state: &mut State) -> Vec<Effect> {
         return vec![];
     };
     let (new_content, replaced) = {
-        let content = &state.docs[state.active].content;
+        let content = state.docs[state.active].content();
         matcher.replace_all(content, &state.find.replacement)
     };
     if replaced == 0 {
@@ -1590,7 +1468,7 @@ fn replace_all_matches(state: &mut State) -> Vec<Effect> {
     state.find.current = None;
     state.find.ordinal = 0;
     // The replacement may re-introduce the pattern, so recount on the new text.
-    state.find.count = matcher.count(&state.docs[state.active].content);
+    state.find.count = matcher.count(state.docs[state.active].content());
     fx
 }
 
@@ -1605,7 +1483,7 @@ fn text_operation(
     op: crate::textops::TextOp,
     selection: Option<(usize, usize)>,
 ) -> Vec<Effect> {
-    let content = &state.docs[state.active].content;
+    let content = state.docs[state.active].content();
     let applied = crate::textops::apply_to(content, op, selection);
     if applied.content == *content {
         return vec![];
@@ -1683,7 +1561,7 @@ mod tests {
         assert_eq!(s.docs.len(), files.len(), "one tab per dropped file");
         assert_eq!(s.active, files.len() - 1, "focus follows the last drop");
         for (i, (_, content)) in files.iter().enumerate() {
-            assert_eq!(s.docs[i].content, EndOfLine::to_lf(content));
+            assert_eq!(s.docs[i].content(), EndOfLine::to_lf(content));
         }
         assert_eq!(s.active_doc().title(), "c.md");
     }
@@ -1786,7 +1664,7 @@ mod tests {
         let mut s = State::default();
         load(&mut s, "/tmp/win.txt", "a\r\nb\r\n");
         assert_eq!(s.active_doc().eol, EndOfLine::Crlf);
-        assert_eq!(s.active_doc().content, "a\nb\n"); // stored canonical
+        assert_eq!(s.active_doc().content(), "a\nb\n"); // stored canonical
         let fx = update(&mut s, Message::SaveRequested);
         assert_eq!(
             fx,
@@ -1829,7 +1707,7 @@ mod tests {
     fn a_blank_tab_whose_encoding_was_picked_is_not_pristine() {
         // Every other `is_pristine_blank` assertion is on a *genuinely* untouched
         // tab, where all three clauses agree — so they can't tell `&&` from `||`.
-        // `SetEncoding` dirties a tab via `saved_encoding` without touching the
+        // `SetEncoding` dirties a tab via the baseline's encoding without touching the
         // text, which is the one reachable way to be dirty *and* empty *and*
         // untitled: the clauses disagree, and the buffer must not be recycled.
         let mut s = State::default();
@@ -1844,7 +1722,7 @@ mod tests {
             "picking an encoding dirties the tab"
         );
         assert!(
-            s.active_doc().content.is_empty(),
+            s.active_doc().content().is_empty(),
             "…while the buffer stays empty"
         );
         assert!(
@@ -2186,7 +2064,7 @@ mod tests {
                 disk: None,
             },
         );
-        assert_eq!(s.active_doc().content, "x\ny\nz"); // stored canonical LF
+        assert_eq!(s.active_doc().content(), "x\ny\nz"); // stored canonical LF
         assert_eq!(s.active_doc().eol, EndOfLine::Crlf); // re-detected
         assert_eq!(s.active_doc().encoding, enc("Windows-1252"));
         assert!(
@@ -2296,11 +2174,11 @@ mod tests {
         // the active buffer, or dirty anything.
         let mut s = State::default();
         update(&mut s, Message::Edited("keep".into()));
-        let content = s.active_doc().content.clone();
+        let content = s.active_doc().content().to_string();
         let dirty = s.active_doc().dirty();
         update(&mut s, Message::ToggleTheme);
         assert_eq!(s.docs.len(), 1);
-        assert_eq!(s.active_doc().content, content);
+        assert_eq!(s.active_doc().content(), content);
         assert_eq!(s.active_doc().dirty(), dirty);
     }
 
@@ -2355,7 +2233,7 @@ mod tests {
         assert!(confirm_close(&fx).is_some());
         assert_eq!(s.docs.len(), 1);
         assert!(s.active_doc().dirty());
-        assert_eq!(s.active_doc().content, "keep me");
+        assert_eq!(s.active_doc().content(), "keep me");
     }
 
     #[test]
@@ -2368,7 +2246,7 @@ mod tests {
         update(&mut s, Message::TabClosed(1)); // asks (dirty)
         update(&mut s, Message::TabCloseDiscard(id)); // user chose "Don't Save"
         assert_eq!(s.docs.len(), 1);
-        assert_eq!(s.active_doc().content, "a"); // focus fell back to doc 0
+        assert_eq!(s.active_doc().content(), "a"); // focus fell back to doc 0
     }
 
     #[test]
@@ -2388,7 +2266,7 @@ mod tests {
         update(&mut s, Message::TabCloseDiscard(dirty_id));
         assert_eq!(s.docs.len(), 2);
         assert_eq!(s.active_doc().id, active_id, "focus stays on the same doc");
-        assert_eq!(s.active_doc().content, "ccc");
+        assert_eq!(s.active_doc().content(), "ccc");
     }
 
     #[test]
@@ -2423,7 +2301,7 @@ mod tests {
         );
         assert_eq!(s.docs.len(), 1, "the write landed → the tab closed");
         assert_eq!(s.pending_close, None);
-        assert_eq!(s.active_doc().content, ""); // the blank doc 1 remains
+        assert_eq!(s.active_doc().content(), ""); // the blank doc 1 remains
     }
 
     #[test]
@@ -2909,7 +2787,7 @@ mod tests {
         find_for(&mut s, "ab");
         update(&mut s, Message::ReplaceTextChanged("X".into()));
         let fx = update(&mut s, Message::ReplaceNext);
-        assert_eq!(s.active_doc().content, "X ab ab");
+        assert_eq!(s.active_doc().content(), "X ab ab");
         assert!(s.active_doc().dirty());
         assert_eq!(s.find.current, Some(Match { start: 2, end: 4 }));
         assert_eq!(reveal(&fx), Some((2, 4)));
@@ -2925,7 +2803,7 @@ mod tests {
         find_for(&mut s, "ab");
         update(&mut s, Message::ReplaceTextChanged("XYZ".into()));
         let fx = update(&mut s, Message::ReplaceNext);
-        assert_eq!(s.active_doc().content, "XYZ");
+        assert_eq!(s.active_doc().content(), "XYZ");
         assert!(s.active_doc().dirty(), "replacing dirties a clean doc");
         assert!(fx.contains(&Effect::SetTitle {
             title: "only.txt".into(),
@@ -2950,7 +2828,7 @@ mod tests {
         );
         find_for(&mut s, "zzz");
         let fx = update(&mut s, Message::ReplaceNext);
-        assert_eq!(s.active_doc().content, "hello");
+        assert_eq!(s.active_doc().content(), "hello");
         assert!(!s.active_doc().dirty(), "a no-match replace must not dirty");
         assert!(fx.is_empty());
     }
@@ -2972,7 +2850,7 @@ mod tests {
         find_for(&mut s, "a");
         update(&mut s, Message::ReplaceTextChanged("a".into())); // same text
         let fx = update(&mut s, Message::ReplaceNext);
-        assert_eq!(s.active_doc().content, "a");
+        assert_eq!(s.active_doc().content(), "a");
         assert!(
             !s.active_doc().dirty(),
             "an identity replace must not dirty"
@@ -2987,12 +2865,12 @@ mod tests {
         find_for(&mut s, "ab");
         update(&mut s, Message::ReplaceTextChanged("X".into()));
         update(&mut s, Message::ReplaceAll);
-        assert_eq!(s.active_doc().content, "X X X");
+        assert_eq!(s.active_doc().content(), "X X X");
         assert_eq!(s.find.count, 0);
         assert!(s.active_doc().dirty());
         // A single undo restores the whole original buffer.
         update(&mut s, Message::Undo);
-        assert_eq!(s.active_doc().content, "ab ab ab");
+        assert_eq!(s.active_doc().content(), "ab ab ab");
     }
 
     #[test]
@@ -3004,12 +2882,12 @@ mod tests {
         // Undo removes "BIG "; the caret reveals the edit site (byte 6), not the
         // top of the document — the shell would otherwise resync to (0,0) (#94).
         let undo_fx = update(&mut s, Message::Undo);
-        assert_eq!(s.active_doc().content, "hello world");
+        assert_eq!(s.active_doc().content(), "hello world");
         assert_eq!(reveal(&undo_fx), Some((6, 6)));
 
         // Redo re-inserts it; the reveal lands at the end of the restored span.
         let redo_fx = update(&mut s, Message::Redo);
-        assert_eq!(s.active_doc().content, "hello BIG world");
+        assert_eq!(s.active_doc().content(), "hello BIG world");
         assert_eq!(reveal(&redo_fx), Some((10, 10)));
     }
 
@@ -3022,7 +2900,7 @@ mod tests {
         update(&mut s, Message::FindQueryChanged(r"(\w)(\d)".into()));
         update(&mut s, Message::ReplaceTextChanged("$2$1".into()));
         update(&mut s, Message::ReplaceAll);
-        assert_eq!(s.active_doc().content, "1a 2b");
+        assert_eq!(s.active_doc().content(), "1a 2b");
     }
 
     #[test]
@@ -3041,7 +2919,7 @@ mod tests {
         find_for(&mut s, "zzz");
         update(&mut s, Message::ReplaceTextChanged("X".into()));
         let fx = update(&mut s, Message::ReplaceAll);
-        assert_eq!(s.active_doc().content, "hello");
+        assert_eq!(s.active_doc().content(), "hello");
         assert!(
             !s.active_doc().dirty(),
             "a no-match replace-all must not dirty"
@@ -3083,12 +2961,12 @@ mod tests {
         assert_eq!(s.find.current, Some(Match { start: 0, end: 3 }));
         // Undo empties the buffer out from under the highlight.
         update(&mut s, Message::Undo);
-        assert_eq!(s.active_doc().content, "");
+        assert_eq!(s.active_doc().content(), "");
         assert_eq!(s.find.current, None);
         assert_eq!(s.find.count, 0);
         // Redo restores the text; the readout recomputes, highlight stays cleared.
         update(&mut s, Message::Redo);
-        assert_eq!(s.active_doc().content, "abcdef");
+        assert_eq!(s.active_doc().content(), "abcdef");
         assert_eq!(s.find.current, None);
         assert_eq!(s.find.count, 1);
     }
@@ -3459,7 +3337,7 @@ mod tests {
         update(&mut s, Message::Edited("keep me".into()));
         update(&mut s, Message::AboutOpened);
         update(&mut s, Message::AboutClosed);
-        assert_eq!(s.active_doc().content, "keep me");
+        assert_eq!(s.active_doc().content(), "keep me");
         assert!(s.active_doc().dirty());
         assert_eq!(s.docs.len(), 1);
     }
@@ -3535,7 +3413,11 @@ mod tests {
             "marking is pure state — the bar is derived in view"
         );
         assert_eq!(s.active_doc().disk_status, DiskStatus::Modified(meta(2, 4)));
-        assert_eq!(s.active_doc().content, "abc", "the buffer is never touched");
+        assert_eq!(
+            s.active_doc().content(),
+            "abc",
+            "the buffer is never touched"
+        );
     }
 
     #[test]
@@ -3556,7 +3438,7 @@ mod tests {
         );
         assert_eq!(s.active_doc().disk_status, DiskStatus::Modified(meta(2, 9)));
         assert_eq!(
-            s.active_doc().content,
+            s.active_doc().content(),
             "abc + mine",
             "unsaved edits survive"
         );
@@ -3628,7 +3510,7 @@ mod tests {
         update(&mut s, Message::DiskChanged { id, meta: None });
         assert_eq!(s.active_doc().disk_status, DiskStatus::Gone);
         assert_eq!(
-            s.active_doc().content,
+            s.active_doc().content(),
             "abc",
             "the buffer is kept in memory"
         );
@@ -3666,7 +3548,7 @@ mod tests {
                 disk: Some(meta(2, 3)),
             },
         );
-        assert_eq!(s.active_doc().content, "new from disk");
+        assert_eq!(s.active_doc().content(), "new from disk");
         assert_eq!(s.active_doc().disk_status, DiskStatus::InSync);
         assert_eq!(s.active_doc().disk_meta(), Some(&meta(2, 3)));
         assert!(
@@ -3701,7 +3583,7 @@ mod tests {
 
         update(&mut s, Message::KeepMine { id });
         assert_eq!(s.active_doc().disk_status, DiskStatus::InSync);
-        assert_eq!(s.active_doc().content, "mine", "the buffer is kept");
+        assert_eq!(s.active_doc().content(), "mine", "the buffer is kept");
         assert!(s.active_doc().dirty(), "and stays dirty for the next save");
         assert_eq!(s.active_doc().disk_meta(), Some(&fresh), "baseline adopted");
 
@@ -3833,7 +3715,7 @@ mod tests {
                 };
                 update(&mut s, msg);
                 update(&mut s, Message::KeepMine { id });
-                prop_assert_eq!(&s.active_doc().content, &content, "buffer must be untouched");
+                prop_assert_eq!(s.active_doc().content(), &content, "buffer must be untouched");
             }
         }
     }
@@ -4013,21 +3895,21 @@ mod tests {
                     content = next;
                 }
             }
-            let final_content = s.active_doc().content.clone();
+            let final_content = s.active_doc().content().to_string();
             prop_assert_eq!(&final_content, &content);
 
             // Undo enough times to drain any coalesced history back to empty.
             for _ in 0..=steps {
                 update(&mut s, Message::Undo);
             }
-            prop_assert_eq!(&s.active_doc().content, "");
+            prop_assert_eq!(s.active_doc().content(), "");
             prop_assert!(!s.active_doc().dirty());
 
             // Redo everything back to the final content.
             for _ in 0..=steps {
                 update(&mut s, Message::Redo);
             }
-            prop_assert_eq!(s.active_doc().content.clone(), final_content);
+            prop_assert_eq!(s.active_doc().content().to_string(), final_content);
         }
 
         /// The stored content and the history's applied edits never disagree:
@@ -4040,13 +3922,13 @@ mod tests {
                 update(&mut s, Message::Edited(e));
                 // The active buffer is always valid UTF-8 and matches what the
                 // last edit set (no torn state from diff/apply).
-                prop_assert!(s.active_doc().content.is_char_boundary(0));
+                prop_assert!(s.active_doc().content().is_char_boundary(0));
             }
-            let top = s.active_doc().content.clone();
+            let top = s.active_doc().content().to_string();
             // Undo a lot, then redo a lot: we must return to the same top.
             for _ in 0..60 { update(&mut s, Message::Undo); }
             for _ in 0..60 { update(&mut s, Message::Redo); }
-            prop_assert_eq!(s.active_doc().content.clone(), top);
+            prop_assert_eq!(s.active_doc().content().to_string(), top);
         }
 
         /// Any interleaving of zoom in/out/reset keeps the font size within the
@@ -4096,7 +3978,7 @@ mod tests {
             let mut s = State::default();
             for m in seq {
                 let effects = update(&mut s, m);
-                let content = &s.active_doc().content;
+                let content = s.active_doc().content();
                 if let Some(hit) = s.find.current {
                     prop_assert!(hit.start <= hit.end);
                     prop_assert!(hit.end <= content.len());
@@ -4137,11 +4019,11 @@ mod tests {
     fn text_operation_rewrites_the_whole_document_and_marks_it_dirty() {
         let mut s = State::default();
         update(&mut s, Message::Edited("banana\napple\ncherry".into()));
-        s.docs[s.active].saved_content = s.docs[s.active].content.clone();
+        s.docs[s.active].mark_saved();
         assert!(!s.active_doc().dirty());
 
         text_op(&mut s, SORT_ASC);
-        assert_eq!(s.active_doc().content, "apple\nbanana\ncherry");
+        assert_eq!(s.active_doc().content(), "apple\nbanana\ncherry");
         assert!(s.active_doc().dirty());
     }
 
@@ -4150,17 +4032,17 @@ mod tests {
         let mut s = State::default();
         update(&mut s, Message::Edited("banana\napple\ncherry".into()));
         text_op(&mut s, SORT_ASC);
-        assert_eq!(s.active_doc().content, "apple\nbanana\ncherry");
+        assert_eq!(s.active_doc().content(), "apple\nbanana\ncherry");
         // One undo restores the pre-sort buffer verbatim.
         update(&mut s, Message::Undo);
-        assert_eq!(s.active_doc().content, "banana\napple\ncherry");
+        assert_eq!(s.active_doc().content(), "banana\napple\ncherry");
     }
 
     #[test]
     fn a_no_op_text_operation_records_nothing() {
         let mut s = State::default();
         update(&mut s, Message::Edited("apple\nbanana".into()));
-        s.docs[s.active].saved_content = s.docs[s.active].content.clone();
+        s.docs[s.active].mark_saved();
         // Already sorted: the op changes nothing, so no dirty flip and no effects.
         let fx = text_op(&mut s, SORT_ASC);
         assert!(fx.is_empty());
@@ -4168,7 +4050,7 @@ mod tests {
         // The no-op added no undo step, so the one available Undo reverts the
         // earlier edit (back to the blank buffer) rather than a phantom step.
         update(&mut s, Message::Undo);
-        assert_eq!(s.active_doc().content, "");
+        assert_eq!(s.active_doc().content(), "");
     }
 
     #[test]
@@ -4183,7 +4065,7 @@ mod tests {
                 selection: Some((6, 11)),
             },
         );
-        assert_eq!(s.active_doc().content, "hello WORLD");
+        assert_eq!(s.active_doc().content(), "hello WORLD");
         // The transformed span is re-selected so the shell keeps it highlighted.
         assert_eq!(reveal(&fx), Some((6, 11)));
     }

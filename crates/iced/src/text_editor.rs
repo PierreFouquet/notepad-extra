@@ -151,6 +151,12 @@ pub trait ScrollOffset {
     /// currently laid out / on-screen. Positions the bracket-match highlight
     /// (#41); an off-screen or end-of-line position simply draws nothing.
     fn glyph_bounds(&self, line: usize, byte_col: usize) -> Option<(f32, f32, f32)>;
+    /// Whether any run currently laid out on screen is a right-to-left
+    /// paragraph (#126). cosmic-text anchors such a run at the buffer *width*
+    /// (its default `Align::Right` for RTL), so `layout` must not leave the
+    /// no-wrap width ratchet wider than the visible extent while one is shown.
+    /// O(visible runs).
+    fn visible_runs_include_rtl(&self) -> bool;
 }
 
 /// The vertical scrollbar's two inputs (#34), produced together by
@@ -252,6 +258,10 @@ impl ScrollOffset for iced_graphics::text::Editor {
             y += line.layout_opt().map_or(1, Vec::len) as f32 * line_height;
         }
         tops
+    }
+
+    fn visible_runs_include_rtl(&self) -> bool {
+        self.buffer().layout_runs().any(|run| run.rtl)
     }
 
     fn glyph_bounds(&self, line: usize, byte_col: usize) -> Option<(f32, f32, f32)> {
@@ -1072,6 +1082,16 @@ where
         // the clip, and the bar/pan maths use the *visible* `min_bounds()` width,
         // not these bounds. Switching wrapping on passes the viewport again, so
         // wrapped layout always uses the real width.
+        //
+        // The one thing `Wrap::None` layout *does* read the width for is the
+        // alignment of right-to-left paragraphs: cosmic-text anchors an RTL line
+        // at `width` (its default `Align::Right` for RTL), so a ratchet wider than
+        // what is on screen would park a Hebrew or Arabic line at a stale x beyond
+        // the clip — and the pan clamp, which measures glyph widths, would offer no
+        // bar to reach it. So after the layout below, if any *visible* run is RTL
+        // and the ratchet exceeds the visible extent, the width is handed back
+        // down to that extent (the pre-#126 behaviour): one relayout, paid only
+        // while RTL text is on screen, never for a left-to-right document.
         let bounds_width = if self.wrapping == Wrapping::None {
             viewport.width.max(internal.editor.bounds().width)
         } else {
@@ -1089,9 +1109,23 @@ where
 
         if self.wrapping == Wrapping::None {
             let content_width = internal.editor.min_bounds().width;
+            let visible_extent = viewport.width.max(content_width);
             if content_width > bounds_width {
+                // A line wider than any seen before scrolled into view: widen so
+                // the repaint region covers the whole visible strip (see above).
                 internal.editor.update(
                     Size::new(content_width, viewport.height),
+                    font,
+                    text_size,
+                    self.line_height,
+                    self.wrapping,
+                    state.highlighter.borrow_mut().deref_mut(),
+                );
+            } else if bounds_width > visible_extent && internal.editor.visible_runs_include_rtl() {
+                // RTL text is on screen and the ratchet is wider than what is
+                // visible: give the paragraph alignment the real extent (see above).
+                internal.editor.update(
+                    Size::new(visible_extent, viewport.height),
                     font,
                     text_size,
                     self.line_height,
@@ -2654,6 +2688,69 @@ mod tests {
             wrapped.width < first.width && wrapped.width <= 1024.0,
             "wrapping restores the viewport width: {wrapped:?}"
         );
+    }
+
+    /// cosmic-text right-aligns a right-to-left paragraph to the buffer width even
+    /// with wrapping off, so the no-wrap width ratchet must give way while RTL text
+    /// is on screen: with the ratchet alone, a Hebrew line is laid out at a stale
+    /// x beyond the clip, and the pan clamp (which measures glyph widths) offers no
+    /// bar to reach it (#126 review). Here a long LTR line first ratchets the width
+    /// far past the window; once it is scrolled away and a Hebrew line is visible,
+    /// the bounds must shrink back to the viewport and every glyph of the RTL run
+    /// must lie inside them.
+    #[test]
+    fn no_wrap_width_yields_to_the_visible_extent_while_rtl_text_is_on_screen() {
+        // Line 0 is far wider than the simulator's 1024-px window; the Hebrew line
+        // sits among short lines, well below the first screenful.
+        let text = format!(
+            "{}\n{}\u{5e9}\u{5dc}\u{5d5}\u{5dd} \u{5e2}\u{5d5}\u{5dc}\u{5dd}\n{}",
+            "x".repeat(400),
+            "short\n".repeat(150),
+            "short\n".repeat(60)
+        );
+        let mut content = Content::<iced::Renderer>::with_text(&text);
+        let lay_out = |content: &Content<iced::Renderer>| {
+            let element: Element<'_, (), iced::Theme, iced::Renderer> = text_editor(content)
+                .wrapping(Wrapping::None)
+                .height(Length::Fill)
+                .into();
+            let _ui = iced_test::simulator(element);
+        };
+
+        lay_out(&content);
+        let ratcheted = content.0.borrow().editor.bounds().width;
+        assert!(
+            ratcheted > 1024.0,
+            "the long LTR line must ratchet the width past the window ({ratcheted})"
+        );
+
+        // Scroll so the long line is gone and the Hebrew line is on screen.
+        content.perform(Action::Scroll { lines: 140 });
+        lay_out(&content);
+
+        let internal = content.0.borrow();
+        let bounds = internal.editor.bounds();
+        let runs: Vec<_> = internal.editor.buffer().layout_runs().collect();
+        let rtl_runs: Vec<_> = runs.iter().filter(|run| run.rtl).collect();
+        assert!(
+            !rtl_runs.is_empty(),
+            "the Hebrew line must be visible and laid out right-to-left"
+        );
+        assert!(
+            bounds.width <= 1024.0,
+            "with RTL text on screen the width falls back to the visible extent, got {bounds:?}"
+        );
+        for run in rtl_runs {
+            for glyph in run.glyphs {
+                assert!(
+                    glyph.x >= -0.5 && glyph.x + glyph.w <= bounds.width + 0.5,
+                    "RTL glyph at x={} w={} lies outside the {}-px bounds",
+                    glyph.x,
+                    glyph.w,
+                    bounds.width
+                );
+            }
+        }
     }
 
     // --- `Content::text()` round-trip (#126) ---

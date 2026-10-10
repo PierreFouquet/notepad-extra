@@ -301,7 +301,7 @@ cargo test --locked --package notepad-core --package notepad-syntax --all-target
 cargo test --locked --package notepad-iced --all-targets
 cargo build --locked --package notepad-iced && xvfb-run -a timeout 10 ./target/debug/notepad-extra   # windowed smoke (Linux, software renderer): exit 124 = the window stayed up
 bash scripts/coverage.sh                      # core + syntax: ≥ 99 % lines, aggregate AND per file (needs cargo-llvm-cov, jq)
-PROPTEST_CASES=1 bash scripts/coverage.sh     # the same gate with one proptest case: it must still hold (no proptest luck)
+PROPTEST_CASES=1 bash scripts/coverage.sh     # the same gate with one proptest case: it must still hold (no proptest luck); CI pins PROPTEST_RNG_SEED=1
 cargo metadata --locked --format-version 1 --manifest-path crates/core/fuzz/Cargo.toml >/dev/null   # fuzz lockfile in sync
 cargo check --locked --manifest-path crates/core/fuzz/Cargo.toml   # fuzz targets still compile against the core API (running them needs nightly + cargo-fuzz)
 LICENSE_AUDIT_ONLINE=1 bash scripts/license-audit.sh --check       # no copyleft-only dependency; packaging/CRATE-LICENSES.md matches Cargo.lock

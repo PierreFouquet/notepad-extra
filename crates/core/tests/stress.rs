@@ -613,16 +613,43 @@ fn typing_at_the_top_of_a_200k_line_document_diffs_at_memory_speed() {
     // Every keystroke reaches the core as the whole new text, and `diff` finds
     // the one changed span by scanning both buffers from each end. A keystroke
     // at the very top leaves no common prefix, so the suffix scan covers the
-    // entire document: with the old byte-at-a-time loop that was ~26 ms per
-    // keystroke on this 5.4 MB fixture in a debug build (2.7 s for a hundred),
-    // against ~2 ms once the scans compare 4 KiB blocks with `memcmp` (#126).
-    // Two hundred keystrokes take ~0.5 s with the blockwise scans and ~5.3 s
-    // with the byte loop; the bound is deliberately loose for a slow CI runner
-    // (about six times the measured cost) and still well under what the byte
-    // loop needs on a fast machine.
+    // entire document. This pins the scan alone, with nothing else in the timed
+    // region (no `String` rebuild, no line-index shift), so the ratio between
+    // the two implementations is the whole signal: on this 5.4 MB fixture in a
+    // debug build one scan is ~0.5 ms once the prefix and suffix compare 4 KiB
+    // blocks with `memcmp`, against ~25 ms with the byte-at-a-time loop (#126).
+    // Four hundred scans take ~0.2 s and ~10 s respectively; the 2 s bound is
+    // ten times the measured cost (a slow CI runner) and a fifth of what the byte
+    // loop needs on a fast machine, so the un-optimised code cannot meet it.
+    let text = "lorem ipsum dolor sit amet\n".repeat(200_000);
+    let mut next = String::with_capacity(text.len() + 1);
+    next.push('x');
+    next.push_str(&text);
+    let started = Instant::now();
+    for i in 0..400u32 {
+        let edit = if i % 2 == 0 {
+            notepad_core::diff(&text, &next)
+        } else {
+            notepad_core::diff(&next, &text)
+        }
+        .expect("the buffers differ");
+        assert_eq!(edit.at, 0, "the change is the single char at the top");
+        assert_eq!(edit.removed.len() + edit.inserted.len(), 1);
+    }
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "400 whole-document diffs took {elapsed:?}: `diff` is scanning byte by byte again (#126)"
+    );
+}
+
+#[test]
+fn typing_at_the_top_of_a_200k_line_document_lands_single_char_edits() {
+    // The same keystrokes through the real `update()` path: each one reaches the
+    // core as the whole new text and must land as a single-character edit with
+    // exact cached totals, and undo must walk every one of them back (#126).
     let mut s = two_hundred_thousand_lines();
     let baseline_chars = s.active_doc().char_count();
-    let started = Instant::now();
     for i in 0..200u8 {
         let text = s.active_doc().content();
         let mut next = String::with_capacity(text.len() + 1);
@@ -630,11 +657,6 @@ fn typing_at_the_top_of_a_200k_line_document_diffs_at_memory_speed() {
         next.push_str(text);
         update(&mut s, Message::Edited(next));
     }
-    let elapsed = started.elapsed();
-    assert!(
-        elapsed < Duration::from_secs(3),
-        "200 keystrokes at the top took {elapsed:?}: `diff` is scanning byte by byte again (#126)"
-    );
 
     // The edits really landed, as single-character edits with exact totals.
     let doc = s.active_doc();

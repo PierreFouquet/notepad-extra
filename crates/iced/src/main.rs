@@ -824,35 +824,123 @@ fn end_of(start: Position, text: &str) -> Position {
     }
 }
 
-/// Replace `edit.removed` at `start` in the buffer with `edit.inserted`, then
-/// put the user's caret and selection back where they were relative to the
-/// text around them (#137). The core's [`Effect::RevealRange`] that follows
-/// undo, redo and replace-next then moves the caret on purpose; replace-all
-/// and whole-document text operations send none, so an edit elsewhere leaves
-/// the caret where the user had it. The editor scrolls only to keep a moved
-/// caret in view, so a caret that was on screen keeps the view still too.
+/// Which way [`editor_position`] moves an offset that falls inside a two-byte
+/// line ending (`\r\n`, `\n\r`), where no cursor can stand (#153).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Round {
+    /// To the end of the line's text: a selection's start, so the selection
+    /// still covers the offset.
+    Back,
+    /// To the start of the next line: a selection's end, or a caret.
+    Forward,
+}
+
+/// The editor position of byte `offset` of `doc`'s text, where `editor` is
+/// the buffer holding that text. Without a `\r`, the editor's lines are the
+/// document's `\n`-lines, and the line index converts in O(log n) (#126).
+/// With one, they are not: the editor also breaks lines at `\r`, in a way that
+/// depends on its edit history. A conversion through the line index then put
+/// the caret past a line's end, and the next keystroke panicked inside
+/// cosmic-text, so the position comes from the buffer's own lines instead, in
+/// O(lines) (#153).
+fn editor_position(
+    doc: &core::Document,
+    editor: &text_editor::Content,
+    offset: usize,
+    round: Round,
+) -> Position {
+    if !doc.has_cr() {
+        let (line, column) = doc.line_col_of(offset);
+        return Position { line, column };
+    }
+    match editor.position_of(offset) {
+        (position, 0) => position,
+        (position, _) if round == Round::Back => position,
+        (position, _) => Position {
+            line: position.line + 1,
+            column: 0,
+        },
+    }
+}
+
+/// The byte offset in `doc`'s text of `position` in `editor`, the buffer
+/// holding that text: [`editor_position`]'s inverse, through the same two
+/// paths (#153).
+fn doc_offset(doc: &core::Document, editor: &text_editor::Content, position: Position) -> usize {
+    if doc.has_cr() {
+        editor.offset_of(position)
+    } else {
+        doc.offset_at(position.line, position.column)
+    }
+}
+
+/// Where an edit lies in a buffer still holding the text from before it, for
+/// text with a `\r` (#153): the edit's start, the end of the text it removes,
+/// and the text to insert there. Both positions come from the buffer's own
+/// lines ([`text_editor::Content::position_of`]), whose breaks at `\r` the
+/// core's line index does not know.
 ///
-/// `start` is in the coordinates of the text before the edit, which is what
-/// the buffer holds. It is the same before and after, since nothing before
-/// `edit.at` changes. The removed span's end follows from the removed text
-/// itself, in O(edit), with no scan of the document.
-fn splice_buffer(content: &mut text_editor::Content, start: (usize, usize), edit: core::Edit) {
-    let start = Position {
-        line: start.0,
-        column: start.1,
+/// The core's byte diff can end an edit between the two bytes of a `\r\n` or
+/// `\n\r` ending, where no cursor can stand. The span then widens to the whole
+/// ending, and the ending's bytes that the edit keeps join the inserted text
+/// on that side. They are read from `text`, the core's text after the edit:
+/// nothing before `edit.at` or after the inserted text changed.
+fn cr_edit_span(
+    content: &text_editor::Content,
+    text: &str,
+    edit: core::Edit,
+) -> (Position, Position, String) {
+    let (start, back) = content.position_of(edit.at);
+    let removed_to = edit.at + edit.removed.len();
+    let (removed_end, ahead) = match content.position_of(removed_to) {
+        (end, 0) => (end, 0),
+        (end, _) => {
+            let next = Position {
+                line: end.line + 1,
+                column: 0,
+            };
+            (next, content.offset_of(next) - removed_to)
+        }
     };
-    let removed_end = end_of(start, &edit.removed);
-    let inserted_end = end_of(start, &edit.inserted);
+    let inserted_to = edit.at + edit.inserted.len();
+    let inserted = [
+        &text[edit.at - back..edit.at],
+        edit.inserted.as_str(),
+        &text[inserted_to..inserted_to + ahead],
+    ]
+    .concat();
+    (start, removed_end, inserted)
+}
+
+/// Replace the text from `start` to `removed_end` in the buffer with
+/// `inserted`, then put the user's caret and selection back where they were
+/// relative to the text around them (#137). The core's
+/// [`Effect::RevealRange`] that follows undo, redo and replace-next then moves
+/// the caret on purpose; replace-all and whole-document text operations send
+/// none, so an edit elsewhere leaves the caret where the user had it. The
+/// editor scrolls only to keep a moved caret in view, so a caret that was on
+/// screen keeps the view still too.
+///
+/// Both positions are in the buffer's coordinates before the edit. `start`
+/// is the same after it, since nothing before it changes, and the end of the
+/// inserted text is where the editor leaves the caret.
+fn splice_buffer(
+    content: &mut text_editor::Content,
+    start: Position,
+    removed_end: Position,
+    inserted: String,
+) {
     let before = content.cursor();
     content.move_to(Cursor {
         position: removed_end,
         selection: (removed_end != start).then_some(start),
     });
-    content.perform(text_editor::Action::Edit(if edit.inserted.is_empty() {
+    content.perform(text_editor::Action::Edit(if inserted.is_empty() {
         text_editor::Edit::Delete
     } else {
-        text_editor::Edit::Paste(Arc::new(edit.inserted))
+        text_editor::Edit::Paste(Arc::new(inserted))
     }));
+    let inserted_end = content.cursor().position;
     let key = |p: Position| (p.line, p.column);
     let shift = |p: Position| {
         if key(p) <= key(start) {
@@ -1015,19 +1103,16 @@ struct Readouts {
 impl Readouts {
     /// Derive both readouts from `doc` and its editor buffer. Headless-testable:
     /// `text_editor::Content::cursor()` needs no renderer. The widget speaks in
-    /// `(line, byte-column)`; the document's indexed `offset_at` turns that into
-    /// the byte offsets the core's [`core::status`] and
-    /// [`core::brackets::match_at`] expect, and its `line_col_of` maps the matched
-    /// brackets back — O(1) and O(log n) conversions (#126), with the one caret
-    /// conversion shared by both readouts.
+    /// `(line, byte-column)`; [`doc_offset`] turns that into the byte offsets
+    /// the core's [`core::status`] and [`core::brackets::match_at`] expect, and
+    /// [`editor_position`] maps the matched brackets back. Both go through the
+    /// document's line index, O(1) and O(log n) (#126), unless the text holds a
+    /// `\r` (#153). The one caret conversion is shared by both readouts.
     fn of(doc: &core::Document, editor: &text_editor::Content) -> Self {
         let cursor = editor.cursor();
-        let caret = doc.offset_at(cursor.position.line, cursor.position.column);
-        let anchor = cursor.selection.map(|a| doc.offset_at(a.line, a.column));
-        let to_pos = |off: usize| {
-            let (line, column) = doc.line_col_of(off);
-            Position { line, column }
-        };
+        let caret = doc_offset(doc, editor, cursor.position);
+        let anchor = cursor.selection.map(|a| doc_offset(doc, editor, a));
+        let to_pos = |off: usize| editor_position(doc, editor, off, Round::Back);
         Readouts {
             status: core::status(doc, caret, anchor),
             bracket: core::brackets::match_at(doc.content(), caret).map(|m| BracketHighlight {
@@ -2174,13 +2259,13 @@ impl Shell {
     /// about 1.1 s per Ctrl+Z at 20k lines, and threw away the scroll position;
     /// an in-place edit reshapes only the lines it touches.
     ///
-    /// The one exception is text holding a `\r`. cosmic-text ends a buffer line
-    /// at a lone `\r` and takes `\r\n` and `\n\r` as one ending each, while the
-    /// core's line index breaks at `\n` alone and counts a `\r` as a column, so
-    /// the two disagree on positions after it and an in-place edit would land
-    /// in the wrong place. Such text (CR-only files, pasted CRs) is rebuilt as
-    /// before. The check is one memchr over the document plus the removed text,
-    /// which is what the buffer still holds where the edit was.
+    /// The buffer still holds the text from before the edit. If that text has
+    /// no `\r`, its lines are the core's `\n`-lines, so the line index finds
+    /// the edit's start in O(log n) and the removed text itself gives the end.
+    /// That holds exactly when neither the document now nor the removed text
+    /// holds a `\r`: the cached flag plus a scan of the removed text, O(edit).
+    /// Otherwise both ends come from the buffer's own lines ([`cr_edit_span`],
+    /// #153).
     fn apply_edit_to_buffer(&mut self, id: TabId, edit: core::Edit) {
         let Some(doc) = self.core.docs.iter().find(|d| d.id == id) else {
             return;
@@ -2188,11 +2273,14 @@ impl Shell {
         let Some(content) = self.editors.get_mut(&id) else {
             return;
         };
-        if doc.content().contains('\r') || edit.removed.contains('\r') {
-            *content = text_editor::Content::with_text(doc.content());
-            return;
-        }
-        splice_buffer(content, doc.line_col_of(edit.at), edit);
+        let (start, removed_end, inserted) = if doc.has_cr() || edit.removed.contains('\r') {
+            cr_edit_span(content, doc.content(), edit)
+        } else {
+            let (line, column) = doc.line_col_of(edit.at);
+            let start = Position { line, column };
+            (start, end_of(start, &edit.removed), edit.inserted)
+        };
+        splice_buffer(content, start, removed_end, inserted);
     }
 
     /// Open the find bar, seeding the query from a single-line selection (#97
@@ -2297,32 +2385,17 @@ impl Shell {
             }
             // Turn a byte range into an editor selection (or a bare caret when
             // empty, e.g. go-to-line). The core hands us offsets on the same
-            // canonical text the editor holds; the document's indexed
-            // `line_col_of` converts them to the (line, byte-column) the widget's
-            // cursor speaks without rescanning the text (#126).
+            // canonical text the editor holds; `editor_position` converts them
+            // to the (line, byte-column) the widget's cursor speaks, through
+            // the document's line index without rescanning the text (#126), or
+            // through the buffer's own lines when the text holds a `\r` (#153).
             Effect::RevealRange { start, end } => {
                 let doc = self.core.active_doc();
-                let (sl, sc) = doc.line_col_of(start);
-                let cursor = if start == end {
-                    Cursor {
-                        position: Position {
-                            line: sl,
-                            column: sc,
-                        },
-                        selection: None,
-                    }
-                } else {
-                    let (el, ec) = doc.line_col_of(end);
-                    Cursor {
-                        position: Position {
-                            line: el,
-                            column: ec,
-                        },
-                        selection: Some(Position {
-                            line: sl,
-                            column: sc,
-                        }),
-                    }
+                let editor = self.active_editor();
+                let cursor = Cursor {
+                    position: editor_position(doc, editor, end, Round::Forward),
+                    selection: (start != end)
+                        .then(|| editor_position(doc, editor, start, Round::Back)),
                 };
                 self.active_editor_mut().move_to(cursor);
                 Task::none()
@@ -2383,9 +2456,10 @@ impl Shell {
     /// text operation (#54) is scoped to — the core widens or clamps it.
     fn selection_range(&self) -> Option<(usize, usize)> {
         let doc = self.core.active_doc();
-        let cursor = self.active_editor().cursor();
-        let caret = doc.offset_at(cursor.position.line, cursor.position.column);
-        let anchor = cursor.selection.map(|a| doc.offset_at(a.line, a.column))?;
+        let editor = self.active_editor();
+        let cursor = editor.cursor();
+        let caret = doc_offset(doc, editor, cursor.position);
+        let anchor = cursor.selection.map(|a| doc_offset(doc, editor, a))?;
         Some((anchor, caret))
     }
 
@@ -5795,8 +5869,10 @@ mod tests {
             let mut expected = text.to_string();
             edit.apply(&mut expected);
             let mut content = text_editor::Content::with_text(text);
-            let start = core::find::line_col_of(&expected, edit.at);
-            splice_buffer(&mut content, start, edit.clone());
+            let (line, column) = core::find::line_col_of(&expected, edit.at);
+            let start = Position { line, column };
+            let removed_end = end_of(start, &edit.removed);
+            splice_buffer(&mut content, start, removed_end, edit.inserted.clone());
             assert_eq!(content.text(), expected, "{edit:?} on {text:?}");
         }
     }
@@ -5807,10 +5883,11 @@ mod tests {
         // through the text: replace-all and whole-document text operations
         // send no reveal, so this is where their caret (and view) ends up.
         let text = "abc\ndef\nghi";
-        let edit = || core_edit(1, "bc\nd", "XY"); // "aXYef\nghi"
+        // "bc\nd" at (0, 1) becomes "XY": "aXYef\nghi".
         let check = |caret, anchor, want: ((usize, usize), Option<(usize, usize)>)| {
             let mut content = buffer_at(text, caret, anchor);
-            splice_buffer(&mut content, (0, 1), edit());
+            let at = |line, column| Position { line, column };
+            splice_buffer(&mut content, at(0, 1), at(1, 1), "XY".to_string());
             assert_eq!(
                 caret_of(&content),
                 want,
@@ -5833,29 +5910,184 @@ mod tests {
     }
 
     #[test]
-    fn a_rewrite_of_text_with_a_cr_rebuilds_the_buffer_from_the_core() {
-        // cosmic-text ends buffer lines at a lone `\r` and takes `\r\n` as one
-        // ending; the core's line index breaks at `\n` alone and counts the `\r`
-        // as a column. An in-place edit would land on the wrong line (a lone
-        // CR, from a CR-only file) or past the end of one (`\r\n`, pasted in),
-        // so the shell rebuilds instead and the buffer still matches the core.
-        for (text, query, replacement, replaced) in [
-            ("one\rtwo\nthree", "three", "3", "one\rtwo\n3"),
-            ("one\r\ntwo", "\n", " ", "one\r two"),
-            // The document is CR-free after this one, but the buffer is not.
-            ("one\r\ntwo", "\r", "", "one\ntwo"),
+    fn splicing_an_edit_into_text_with_a_cr_follows_the_buffers_own_lines() {
+        // #153: the editor breaks lines at a lone `\r` and takes `\r\n` and
+        // `\n\r` as one ending each, so the edit's span comes from the buffer's
+        // own lines. The core's diff can end an edit inside a two-byte ending,
+        // where no cursor stands; the span widens to the whole ending.
+        let cases = [
+            // Lone CRs (a CR-only file): the edit is on the editor's line 2.
+            ("one\rtwo\rthree", core_edit(8, "three", "3")),
+            // Removes the `\n` of a `\r\n`: starts inside the ending.
+            ("one\r\ntwo", core_edit(4, "\n", " ")),
+            // Removes the `\r` of a `\r\n`: ends inside the ending.
+            ("one\r\ntwo", core_edit(3, "\r", "")),
+            // Inserts between the two bytes of a `\n\r`.
+            ("a\n\rb", core_edit(2, "", "X")),
+            // Starts inside one `\r\n` and ends inside the next.
+            ("a\r\n\r\nb", core_edit(2, "\n\r", "")),
+            (
+                "mixed\r\nendings\nhere\rand\n\rthere",
+                core_edit(15, "here\rand", "H"),
+            ),
+            ("x\ry\rz", core_edit(1, "\r", "\n\r\n")),
+        ];
+        for (text, edit) in cases {
+            let mut expected = text.to_string();
+            edit.apply(&mut expected);
+            let mut content = text_editor::Content::with_text(text);
+            let (start, removed_end, inserted) = cr_edit_span(&content, &expected, edit.clone());
+            splice_buffer(&mut content, start, removed_end, inserted);
+            assert_eq!(content.text(), expected, "{edit:?} on {text:?}");
+        }
+
+        // The buffer's lines depend on its history, not only on its text.
+        // Enter at the start of "b" leaves `\r` and `\n` as two endings, so
+        // offset 2 starts a line here, where a fresh parse of "a\r\nb" finds it
+        // inside one `\r\n` ending.
+        let mut content = buffer_at("a\rb", (1, 0), None);
+        content.perform(text_editor::Action::Edit(text_editor::Edit::Enter));
+        assert_eq!(content.text(), "a\r\nb");
+        assert_eq!(content.line_count(), 3);
+        let (start, removed_end, inserted) = cr_edit_span(&content, "a\rb", core_edit(2, "\n", ""));
+        assert_eq!(
+            (start, removed_end, inserted.as_str()),
+            (
+                Position { line: 1, column: 0 },
+                Position { line: 2, column: 0 },
+                ""
+            )
+        );
+        splice_buffer(&mut content, start, removed_end, inserted);
+        assert_eq!(content.text(), "a\rb");
+    }
+
+    #[test]
+    fn a_rewrite_of_text_with_a_cr_is_spliced_in_place() {
+        // #153 lets #137's in-place edit cover text with a `\r` too: replace-all
+        // sends no reveal, so the caret keeps its place in the text, where a
+        // rebuild of the buffer put it back at the top.
+        for (text, query, replacement, replaced, caret_after) in [
+            ("one\rtwo\nthree", "three", "3", "one\rtwo\n3", (2, 1)),
+            ("one\r\ntwo", "\n", " ", "one\r two", (1, 4)),
+            // The document is CR-free after this one; the buffer still splices.
+            ("one\r\ntwo", "\r", "", "one\ntwo", (1, 3)),
         ] {
             let (mut shell, _) = Shell::new();
             let _ = shell.update(Message::Edit(paste(text)));
             let _ = shell.update(Message::FindQueryChanged(query.into()));
+            let _ = shell.update(Message::Edit(text_editor::Action::Move(
+                text_editor::Motion::DocumentEnd,
+            )));
             let _ = shell.update(Message::ReplaceQueryChanged(replacement.into()));
             let _ = shell.update(Message::ReplaceAll);
             assert_eq!(shell.core.active_doc().content(), replaced);
             assert_eq!(shell.active_editor().text(), replaced);
+            assert_eq!(
+                caret_of(shell.active_editor()),
+                (caret_after, None),
+                "{query:?} in {text:?}"
+            );
             let _ = shell.update(Message::Undo);
             assert_eq!(shell.core.active_doc().content(), text);
             assert_eq!(shell.active_editor().text(), text);
         }
+    }
+
+    /// A shell holding a CR-only file, the shape a classic Mac OS file keeps on
+    /// load (#153): the core sees one line, the editor three.
+    fn shell_with_cr_file() -> Shell {
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::FileRead {
+            path: PathBuf::from("/tmp/classic-mac.txt"),
+            result: Ok(b"one\rtwo\rthree".to_vec()),
+        });
+        assert_eq!(shell.active_editor().line_count(), 3);
+        shell
+    }
+
+    #[test]
+    fn finding_in_text_with_a_cr_selects_the_match_and_typing_replaces_it() {
+        // #153: the reveal put the selection at (0, 8)..(0, 13) by the core's
+        // `\n`-only lines, past the end of the editor's line "one", and the next
+        // keystroke panicked inside cosmic-text.
+        let mut shell = shell_with_cr_file();
+        let _ = shell.update(Message::FindQueryChanged("three".into()));
+        let _ = shell.update(Message::FindNext);
+        assert_eq!(caret_of(shell.active_editor()), ((2, 5), Some((2, 0))));
+        assert_eq!(shell.active_editor().selection().as_deref(), Some("three"));
+        assert_eq!(shell.status().selection, 5);
+        let _ = shell.update(Message::Edit(paste("3")));
+        assert_eq!(shell.core.active_doc().content(), "one\rtwo\r3");
+        assert_eq!(shell.active_editor().text(), "one\rtwo\r3");
+    }
+
+    #[test]
+    fn a_text_operation_on_a_selection_in_text_with_a_cr_changes_the_selected_text() {
+        // #153: the selection's (1, 0)..(1, 3) went through the core's line
+        // index, which has no line 1 here, and UPPERCASE rewrote "one" instead.
+        let mut shell = shell_with_cr_file();
+        let at = |line, column| Position { line, column };
+        shell.active_editor_mut().move_to(Cursor {
+            position: at(1, 3),
+            selection: Some(at(1, 0)),
+        });
+        let _ = shell.update(Message::SelectTextOp("UPPERCASE".into()));
+        assert_eq!(shell.core.active_doc().content(), "one\rTWO\rthree");
+        assert_eq!(shell.active_editor().text(), "one\rTWO\rthree");
+    }
+
+    #[test]
+    fn bracket_highlights_in_text_with_a_cr_land_on_the_editors_lines() {
+        // #153: the matched brackets were mapped back through the core's line
+        // index, onto line 0 past the end of "one".
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::Edit(paste("one\r(a)")));
+        shell.active_editor_mut().move_to(Cursor {
+            position: Position { line: 1, column: 0 },
+            selection: None,
+        });
+        let _ = shell.update(Message::Edit(text_editor::Action::Move(
+            text_editor::Motion::Right,
+        )));
+        let _ = shell.update(Message::Edit(text_editor::Action::Move(
+            text_editor::Motion::Left,
+        )));
+        assert_eq!(
+            shell.active_bracket(),
+            Some(BracketHighlight {
+                here: Position { line: 1, column: 0 },
+                partner: Some(Position { line: 1, column: 2 }),
+            })
+        );
+    }
+
+    #[test]
+    fn a_caret_revealed_inside_a_two_byte_ending_lands_on_the_next_line() {
+        // Go to line 2 of "a\n\rb": the core's line 2 starts between the `\n`
+        // and the `\r` of one `\n\r` ending, where no cursor stands. A caret
+        // rounds forward, onto the line the offset begins (#153).
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::Edit(paste("a\n\rb")));
+        assert_eq!(shell.active_editor().line_count(), 2);
+        let _ = shell.update(Message::GoToInputChanged("2".into()));
+        let _ = shell.update(Message::GoToSubmit);
+        assert_eq!(caret_of(shell.active_editor()), ((1, 0), None));
+        let _ = shell.update(Message::Edit(paste("X")));
+        assert_eq!(shell.core.active_doc().content(), "a\n\rXb");
+        assert_eq!(shell.active_editor().text(), "a\n\rXb");
+    }
+
+    #[test]
+    fn a_selection_revealed_across_a_two_byte_ending_covers_the_whole_ending() {
+        // Finding the `\n` of a `\r\n` reveals offsets 4..5, which start inside
+        // the ending. The selection's start rounds back, so it covers the
+        // match: the whole ending (#153).
+        let (mut shell, _) = Shell::new();
+        let _ = shell.update(Message::Edit(paste("one\r\ntwo")));
+        let _ = shell.update(Message::FindQueryChanged("\n".into()));
+        let _ = shell.update(Message::FindNext);
+        assert_eq!(caret_of(shell.active_editor()), ((1, 0), Some((0, 3))));
     }
 
     #[test]
@@ -5942,10 +6174,14 @@ mod tests {
             Move(text_editor::Motion),
             Select(text_editor::Motion),
             Backspace,
+            Delete,
+            Enter,
             Undo,
             Redo,
             ReplaceAll(String, String),
             ReplaceOne(String, String),
+            FindNext(String),
+            GoTo(usize),
             Transform(&'static str),
         }
 
@@ -5966,24 +6202,26 @@ mod tests {
         }
 
         fn op() -> impl Strategy<Value = Op> {
-            // Mostly ASCII, newlines and tabs, and some multi-byte and
-            // right-to-left characters. No `\r`: the core counts lines at `\n`
-            // alone while the editor also breaks them at `\r`, so a reveal (find,
-            // undo, a text operation on a selection) past one puts the caret off
-            // the editor's line, and the next edit panics inside cosmic-text. That
-            // is an older bug in the reveal, not in these edits; the rebuild that
-            // text with a `\r` takes has its own test above.
-            let text = "[ab \n\t]{0,6}|[aé ש\n]{0,4}";
-            let query = "[ab]{1,2}|\n";
+            // Mostly ASCII, newlines, carriage returns and tabs, and some
+            // multi-byte and right-to-left characters. The `\r`s make every
+            // ending shape the editor knows (`\n`, `\r`, `\r\n`, `\n\r`), and
+            // Enter and pastes beside them build buffers whose lines a fresh
+            // parse of their text would not give (#153).
+            let text = "[ab \n\r\t]{0,6}|[aé ש\n\r]{0,4}";
+            let query = "[ab]{1,2}|\n|\r|\r\n";
             prop_oneof![
                 text.prop_map(Op::Type),
                 motion().prop_map(Op::Move),
                 motion().prop_map(Op::Select),
                 Just(Op::Backspace),
+                Just(Op::Delete),
+                Just(Op::Enter),
                 Just(Op::Undo),
                 Just(Op::Redo),
                 (query, text).prop_map(|(q, r)| Op::ReplaceAll(q, r)),
                 (query, text).prop_map(|(q, r)| Op::ReplaceOne(q, r)),
+                query.prop_map(Op::FindNext),
+                (1usize..8).prop_map(Op::GoTo),
                 prop_oneof![
                     Just("Sort Lines A→Z"),
                     Just("Reverse Lines"),
@@ -6004,6 +6242,12 @@ mod tests {
                 Op::Backspace => vec![Message::Edit(text_editor::Action::Edit(
                     text_editor::Edit::Backspace,
                 ))],
+                Op::Delete => vec![Message::Edit(text_editor::Action::Edit(
+                    text_editor::Edit::Delete,
+                ))],
+                Op::Enter => vec![Message::Edit(text_editor::Action::Edit(
+                    text_editor::Edit::Enter,
+                ))],
                 Op::Undo => vec![Message::Undo],
                 Op::Redo => vec![Message::Redo],
                 Op::ReplaceAll(q, r) => vec![
@@ -6015,6 +6259,11 @@ mod tests {
                     Message::FindQueryChanged(q),
                     Message::ReplaceQueryChanged(r),
                     Message::ReplaceOne,
+                ],
+                Op::FindNext(q) => vec![Message::FindQueryChanged(q), Message::FindNext],
+                Op::GoTo(line) => vec![
+                    Message::GoToInputChanged(line.to_string()),
+                    Message::GoToSubmit,
                 ],
                 Op::Transform(label) => vec![Message::SelectTextOp(label.to_string())],
             };
@@ -6031,9 +6280,22 @@ mod tests {
                 for op in ops {
                     let shown = format!("{op:?}");
                     run(&mut shell, op);
+                    let doc = shell.core.active_doc();
+                    let editor = shell.active_editor();
+                    let text = editor.text();
+                    prop_assert_eq!(&text, doc.content(), "after {}", shown);
+                    // The caret converts to an offset of the core's text that
+                    // splits the caret's line where the caret does, and back
+                    // to the same position (#153).
+                    let caret = editor.cursor().position;
+                    let offset = doc_offset(doc, editor, caret);
+                    let line = editor.line(caret.line).expect("the caret's line");
+                    prop_assert!(text.is_char_boundary(offset), "after {}", shown);
+                    prop_assert!(text[..offset].ends_with(&line.text[..caret.column]), "after {}", shown);
+                    prop_assert!(text[offset..].starts_with(&line.text[caret.column..]), "after {}", shown);
                     prop_assert_eq!(
-                        shell.active_editor().text(),
-                        shell.core.active_doc().content(),
+                        editor_position(doc, editor, offset, Round::Forward),
+                        caret,
                         "after {}", shown
                     );
                 }

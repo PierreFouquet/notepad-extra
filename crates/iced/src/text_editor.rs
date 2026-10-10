@@ -764,13 +764,6 @@ where
         let internal = self.0.borrow();
         let editor = &internal.editor;
         let count = editor.line_count();
-        let separator = |ending: LineEnding| -> &'static str {
-            if ending == LineEnding::None {
-                LineEnding::default().as_str()
-            } else {
-                ending.as_str()
-            }
-        };
 
         let capacity = (0..count)
             .map_while(|i| editor.line(i))
@@ -799,6 +792,84 @@ where
         contents
     }
 
+    // NOTEPAD-EXTRA(#153): byte offsets of `text()` and cursor positions,
+    // converted through the buffer's own lines.
+    /// The byte offset in [`Content::text`] of `position`. The column is
+    /// clamped to its line's end, and a line past the last one gives the end of
+    /// the text.
+    ///
+    /// The shell needs this for text holding a `\r`, where the core's
+    /// `\n`-only line index and the editor's lines disagree. cosmic-text ends a
+    /// line at a lone `\r` and takes `\r\n` and `\n\r` as one ending each.
+    /// Worse, its lines depend on the edit history, not only on the text: it
+    /// splits inserted text on its own, so Enter at the start of the line after
+    /// a lone-`\r` line leaves `\r` and `\n` as two endings, where a fresh parse
+    /// of the same text finds one `\r\n`. No function of the text alone can
+    /// say where the buffer's lines start; only the buffer can. O(lines): one
+    /// walk adding up each line's bytes and the separator [`Content::text`]
+    /// writes after it, with no copy.
+    pub fn offset_of(&self, position: Position) -> usize {
+        let internal = self.0.borrow();
+        let editor = &internal.editor;
+        let count = editor.line_count();
+        let mut start = 0;
+        for i in 0..count {
+            let Some(line) = editor.line(i) else {
+                break;
+            };
+            if i == position.line {
+                return start + position.column.min(line.text.len());
+            }
+            start += line.text.len();
+            if i + 1 < count {
+                start += separator(line.ending).len();
+            }
+        }
+        start
+    }
+
+    /// The cursor position of byte `offset` of [`Content::text`], as
+    /// `(position, into)`. `into` is 0 when a cursor can stand at `offset`.
+    /// Otherwise `offset` falls inside a two-byte line ending (`\r\n` or
+    /// `\n\r`), where no cursor can stand, and `into` counts the bytes it lies
+    /// past `position`, the end of that line's text. An offset past the end of
+    /// the text gives the end. O(lines), like [`Content::offset_of`].
+    pub fn position_of(&self, offset: usize) -> (Position, usize) {
+        let internal = self.0.borrow();
+        let editor = &internal.editor;
+        let count = editor.line_count();
+        let mut start = 0;
+        let mut end_of_text = Position { line: 0, column: 0 };
+        for i in 0..count {
+            let Some(line) = editor.line(i) else {
+                break;
+            };
+            let end = start + line.text.len();
+            if offset <= end {
+                return (
+                    Position {
+                        line: i,
+                        column: offset - start,
+                    },
+                    0,
+                );
+            }
+            end_of_text = Position {
+                line: i,
+                column: line.text.len(),
+            };
+            if i + 1 == count {
+                break;
+            }
+            let next = end + separator(line.ending).len();
+            if offset < next {
+                return (end_of_text, offset - end);
+            }
+            start = next;
+        }
+        (end_of_text, 0)
+    }
+
     /// Returns the selected text of the [`Content`].
     pub fn selection(&self) -> Option<String> {
         self.0.borrow().editor.copy()
@@ -812,6 +883,19 @@ where
     /// Returns whether or not the the [`Content`] is empty.
     pub fn is_empty(&self) -> bool {
         self.0.borrow().editor.is_empty()
+    }
+}
+
+// NOTEPAD-EXTRA(#153): one separator rule for `text()` and the offset
+// conversions, so the offsets always index the text the core holds.
+/// The bytes [`Content::text`] writes after a line that is not the last: the
+/// line's own ending, or the default `\n` for an interior line with none. The
+/// rule is upstream's.
+fn separator(ending: LineEnding) -> &'static str {
+    if ending == LineEnding::None {
+        LineEnding::default().as_str()
+    } else {
+        ending.as_str()
     }
 }
 
@@ -2454,6 +2538,15 @@ mod tests {
             ),
             (126, "    pub fn text(&self) -> String {"),
             (126, "pub struct VerticalExtent {"),
+            (
+                153,
+                "    pub fn offset_of(&self, position: Position) -> usize {",
+            ),
+            (
+                153,
+                "    pub fn position_of(&self, offset: usize) -> (Position, usize) {",
+            ),
+            (153, "fn separator(ending: LineEnding) -> &'static str {"),
         ];
         for &(issue, anchor) in anchors {
             let idx = lines
@@ -2480,9 +2573,9 @@ mod tests {
         // The divergences catalogued in VENDORED.md: the compiled-out upstream
         // methods (#25), find-match highlighting while unfocused (#33), scrollbar
         // (#34), editor niceties (#41), the geometry extraction (#79), the
-        // large-document performance work (#126) and the caret-only `move_to`
-        // (#137).
-        for expected in [25u32, 33, 34, 41, 79, 126, 137] {
+        // large-document performance work (#126), the caret-only `move_to`
+        // (#137) and the offset conversions through the buffer's lines (#153).
+        for expected in [25u32, 33, 34, 41, 79, 126, 137, 153] {
             assert!(
                 issues.contains(&expected),
                 "no NOTEPAD-EXTRA(#{expected}) marker remains — a documented divergence lost its tag",
@@ -2862,6 +2955,175 @@ mod tests {
             assert_eq!(content.text(), input, "round-trip of {input:?}");
             // `Clone` is implemented through `text()`, so it must round-trip too.
             assert_eq!(content.clone().text(), input, "clone of {input:?}");
+        }
+    }
+
+    /// Where a fresh parse of `text` puts byte `offset`, as
+    /// [`Content::position_of`] reports it: cosmic-text's line rule, read left
+    /// to right, takes `\r\n` and `\n\r` as one ending and a lone `\n` or `\r`
+    /// as another (#153). Written from the rule, not from the buffer.
+    fn fresh_position(text: &str, offset: usize) -> (Position, usize) {
+        let bytes = text.as_bytes();
+        let (mut line, mut start, mut i) = (0, 0, 0);
+        while i < bytes.len() {
+            let ending = match (bytes[i], bytes.get(i + 1)) {
+                (b'\r', Some(b'\n')) | (b'\n', Some(b'\r')) => 2,
+                (b'\r' | b'\n', _) => 1,
+                _ => {
+                    i += 1;
+                    continue;
+                }
+            };
+            if offset <= i {
+                break;
+            }
+            if offset < i + ending {
+                let column = i - start;
+                return (Position { line, column }, offset - i);
+            }
+            line += 1;
+            i += ending;
+            start = i;
+        }
+        let column = offset - start;
+        (Position { line, column }, 0)
+    }
+
+    #[test]
+    fn offsets_and_positions_follow_the_buffers_lines() {
+        let at = |line, column| Position { line, column };
+        for text in [
+            "",
+            "one line",
+            "two\nlines\n",
+            "crlf\r\nlines\r\n",
+            "mixed\r\nendings\nhere\rand\n\rthere",
+            "\r\n\r\n",
+            "\n\r\n\r",
+            "\r\r\n\n",
+            "unicode ✓ 🙂\r\nsecond ✓\rשלום",
+        ] {
+            let content = Content::<iced::Renderer>::with_text(text);
+            for offset in (0..=text.len()).filter(|&o| text.is_char_boundary(o)) {
+                let (position, into) = content.position_of(offset);
+                assert_eq!(
+                    (position, into),
+                    fresh_position(text, offset),
+                    "offset {offset} of {text:?}"
+                );
+                assert_eq!(
+                    content.offset_of(position) + into,
+                    offset,
+                    "offset {offset} of {text:?}"
+                );
+            }
+        }
+
+        // Out of range: the column clamps to its line, a line past the end and
+        // an offset past the end give the end of the text.
+        let content = Content::<iced::Renderer>::with_text("ab\rc");
+        assert_eq!(content.offset_of(at(0, 99)), 2);
+        assert_eq!(content.offset_of(at(9, 0)), 4);
+        assert_eq!(content.position_of(99), (at(1, 1), 0));
+
+        // The buffer's lines depend on its history. Enter at the start of "c"
+        // splits the inserted `\n` on its own, so the `\r` and the `\n` are two
+        // endings: offset 3 starts a line, where a fresh parse of the same
+        // text finds it inside one `\r\n` ending.
+        let mut content = Content::<iced::Renderer>::with_text("ab\rc");
+        content.move_to(Cursor {
+            position: at(1, 0),
+            selection: None,
+        });
+        content.perform(Action::Edit(Edit::Enter));
+        assert_eq!(content.text(), "ab\r\nc");
+        assert_eq!(fresh_position("ab\r\nc", 3), (at(0, 2), 1));
+        assert_eq!(content.position_of(3), (at(1, 0), 0));
+        assert_eq!(content.position_of(4), (at(2, 0), 0));
+        assert_eq!(content.offset_of(at(2, 1)), 5);
+    }
+
+    mod offsets {
+        //! Invalidation pin for [`Content::offset_of`] and
+        //! [`Content::position_of`] (#153): after any history of edits, the
+        //! conversions index the text [`Content::text`] returns, whatever line
+        //! structure the edits left in the buffer.
+        use super::*;
+        use proptest::prelude::*;
+
+        #[derive(Debug, Clone)]
+        enum Op {
+            Paste(String),
+            Enter,
+            Backspace,
+            Delete,
+            Move(Motion),
+        }
+
+        fn op() -> impl Strategy<Value = Op> {
+            prop_oneof![
+                "[ab\r\n]{0,4}".prop_map(Op::Paste),
+                Just(Op::Enter),
+                Just(Op::Backspace),
+                Just(Op::Delete),
+                prop_oneof![
+                    Just(Motion::Left),
+                    Just(Motion::Right),
+                    Just(Motion::Up),
+                    Just(Motion::Down),
+                    Just(Motion::Home),
+                    Just(Motion::End),
+                ]
+                .prop_map(Op::Move),
+            ]
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(64))]
+            #[test]
+            fn conversions_index_the_text_after_any_edits(
+                start in "[ab\r\n]{0,6}",
+                ops in prop::collection::vec(op(), 0..16),
+            ) {
+                let mut content = Content::<iced::Renderer>::with_text(&start);
+                for op in ops {
+                    content.perform(match op {
+                        Op::Paste(s) => Action::Edit(Edit::Paste(Arc::new(s))),
+                        Op::Enter => Action::Edit(Edit::Enter),
+                        Op::Backspace => Action::Edit(Edit::Backspace),
+                        Op::Delete => Action::Edit(Edit::Delete),
+                        Op::Move(m) => Action::Move(m),
+                    });
+                }
+                let text = content.text();
+                // Every cursor position maps to the offset that splits the text
+                // where the position splits its line, and back.
+                let mut previous = None;
+                for line in 0..content.line_count() {
+                    let line_text = content.line(line).unwrap().text.into_owned();
+                    for column in (0..=line_text.len()).filter(|&c| line_text.is_char_boundary(c)) {
+                        let position = Position { line, column };
+                        let offset = content.offset_of(position);
+                        prop_assert!(text[..offset].ends_with(&line_text[..column]));
+                        prop_assert!(text[offset..].starts_with(&line_text[column..]));
+                        prop_assert!(previous.is_none_or(|p| p < offset), "offsets increase");
+                        previous = Some(offset);
+                        prop_assert_eq!(content.position_of(offset), (position, 0));
+                    }
+                }
+                // The offsets no cursor stands at are the insides of two-byte
+                // endings, just past the end of their line's text.
+                for offset in (0..=text.len()).filter(|&o| text.is_char_boundary(o)) {
+                    let (position, into) = content.position_of(offset);
+                    prop_assert_eq!(content.offset_of(position) + into, offset);
+                    if into > 0 {
+                        let line = content.line(position.line).unwrap();
+                        prop_assert_eq!(position.column, line.text.len());
+                        prop_assert!(matches!(line.ending, LineEnding::CrLf | LineEnding::LfCr));
+                        prop_assert_eq!(into, 1);
+                    }
+                }
+            }
         }
     }
 

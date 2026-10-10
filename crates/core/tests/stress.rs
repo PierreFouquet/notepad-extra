@@ -571,6 +571,30 @@ fn status_and_dirty_on_a_200k_line_document_cost_nothing_per_frame() {
 }
 
 #[test]
+fn the_cr_flag_on_a_200k_line_document_costs_nothing_per_message() {
+    // The shell reads `has_cr` before every position conversion, several
+    // times per message, to choose between the line index and a walk of the
+    // editor's lines (#153). It is a cached count: a hundred thousand reads
+    // take microseconds, where a scan for a `\r` would cost about a
+    // millisecond each at this size, over a minute for the lot.
+    let mut s = two_hundred_thousand_lines();
+    let started = Instant::now();
+    let with_cr = (0..100_000)
+        .filter(|_| std::hint::black_box(s.active_doc()).has_cr())
+        .count();
+    let elapsed = started.elapsed();
+    assert_eq!(with_cr, 0);
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "100_000 has_cr() calls took {elapsed:?}: a scan of the document is back (#153)"
+    );
+    // A `\r` at the very end, past every line the edit path recounts, is seen.
+    let content = format!("{}\r", s.active_doc().content());
+    update(&mut s, Message::Edited(content));
+    assert!(s.active_doc().has_cr());
+}
+
+#[test]
 fn typing_into_a_200k_line_document_keeps_the_cached_totals_exact() {
     // Keystrokes arrive as the whole new text; the document must update its
     // totals from the diff'd span alone (#126) and stay exact while the edits

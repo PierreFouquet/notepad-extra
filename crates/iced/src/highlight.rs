@@ -31,12 +31,19 @@ use syntect::highlighting::{
 use syntect::parsing::{ParseState, ScopeStack, SyntaxSet};
 
 /// Identifies *what* to highlight: the effective syntax name (from the core's
-/// [`notepad_core::app::Document::language`]) and the light/dark [`ThemeMode`]
+/// [`notepad_core::Document::language`]) and the light/dark [`ThemeMode`]
 /// (#36). `PartialEq` lets the widget rebuild the highlighter only when one of
 /// these actually changes — so toggling the theme re-highlights the buffer.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// The syntax is a `&'static str`, not a `String` (#126): every name the core
+/// can hand us borrows the process-wide syntax set (`Document::language` is
+/// `&'static str`), and the shell builds one `Settings` per frame for the editor
+/// widget, which then compares and clones it on every layout. Borrowing makes
+/// that a pointer copy instead of a heap allocation per frame, and lets the
+/// type be `Copy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Settings {
-    pub syntax: String,
+    pub syntax: &'static str,
     pub theme: ThemeMode,
 }
 
@@ -114,7 +121,7 @@ impl SyntectHighlighter {
         // which emits only default-styled spans — i.e. visually unhighlighted —
         // so the view needs no separate "no highlighting" code path.
         let syntax = syntaxes
-            .find_syntax_by_name(&settings.syntax)
+            .find_syntax_by_name(settings.syntax)
             .unwrap_or_else(|| syntaxes.find_syntax_plain_text());
 
         // The paired theme is borrowed from the process-wide embedded set, so the
@@ -224,9 +231,9 @@ mod tests {
     use super::*;
     use iced_core::text::highlighter::Highlighter as _;
 
-    fn settings(syntax: &str) -> Settings {
+    fn settings(syntax: &'static str) -> Settings {
         Settings {
-            syntax: syntax.to_string(),
+            syntax,
             theme: ThemeMode::Light,
         }
     }
@@ -234,14 +241,11 @@ mod tests {
     /// The set of foreground colours a syntax produces for one line, under a given
     /// theme — used to prove the theme actually drives the palette (#36).
     fn line_colors(
-        syntax: &str,
+        syntax: &'static str,
         theme: ThemeMode,
         line: &str,
     ) -> std::collections::BTreeSet<[u8; 4]> {
-        let mut hl = SyntectHighlighter::new(&Settings {
-            syntax: syntax.to_string(),
-            theme,
-        });
+        let mut hl = SyntectHighlighter::new(&Settings { syntax, theme });
         hl.highlight_line(line)
             .map(|(_, h)| {
                 let c = h.0.foreground;
@@ -263,7 +267,7 @@ mod tests {
         assert_ne!(
             settings("Rust"),
             Settings {
-                syntax: "Rust".to_string(),
+                syntax: "Rust",
                 theme: ThemeMode::Dark,
             },
             "a theme change must make Settings compare unequal so the widget rebuilds"

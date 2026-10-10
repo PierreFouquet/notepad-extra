@@ -2488,7 +2488,7 @@ impl Shell {
             // highlighting" without changing the widget's type.
             .highlight_with::<SyntectHighlighter>(
                 highlight::Settings {
-                    syntax: self.core.active_doc().language().to_string(),
+                    syntax: self.core.active_doc().language(),
                     // Pair the editor's syntect theme with the UI theme (#36):
                     // light UI → GitHub-light, dark UI → Monokai.
                     theme: self.core.theme(),

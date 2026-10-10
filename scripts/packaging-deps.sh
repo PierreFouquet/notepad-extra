@@ -54,16 +54,24 @@ RPM_OUT="$DEPS_DIR/rpm-bundled-provides.txt"
 
 command -v jq >/dev/null || { echo "error: jq is required" >&2; exit 2; }
 
-# All external crates.io packages as sorted "name<TAB>version", offline.
+# External packages as sorted "name<TAB>version", offline: every crates.io
+# package and, with `--with-vendored`, the patched copies under vendor/ that the
+# root manifest's [patch.crates-io] puts in place of a crates.io release (#149).
+# Those ship in this source tree, so the Gentoo download list leaves them out.
+# They are still compiled into the binary, so the RPM `bundled(crate(...))`
+# provides and the Debian gap report keep them.
 crate_rows() {
-  local offline=(--offline)
+  local offline=(--offline) vendored=false
   [ -n "${PACKAGING_DEPS_ONLINE:-}" ] && offline=()
+  [ "${1:-}" = --with-vendored ] && vendored=true
   cargo metadata --format-version 1 "${offline[@]}" --filter-platform "$TARGET" \
-    | jq -r '
+    | jq -r --argjson vendored "$vendored" '
         (.workspace_members) as $ws
         | .packages[]
         | select(.id as $id | ($ws | index($id)) | not)
-        | select((.source // "") | test("registry.*crates.io"))
+        | select(((.source // "") | test("registry.*crates.io"))
+                 or ($vendored and .source == null
+                     and (.manifest_path | test("/vendor/[^/]+/Cargo\\.toml$"))))
         | "\(.name)\t\(.version)"' \
     | sort -u
 }
@@ -81,7 +89,7 @@ render_gentoo() {
 
 render_rpm() {
   gen_header "Fedora/openSUSE bundled-crate Provides (#8/#12) for the .spec %files-adjacent block."
-  crate_rows | awk -F'\t' '{printf "Provides: bundled(crate(%s)) = %s\n", $1, $2}'
+  crate_rows --with-vendored | awk -F'\t' '{printf "Provides: bundled(crate(%s)) = %s\n", $1, $2}'
 }
 
 do_vendor() {
@@ -111,7 +119,7 @@ do_debian_gap() {
     else
       printf 'MISSING  %s %s (%s)\n' "$name" "$version" "$deb"; missing=$((missing+1))
     fi
-  done < <(crate_rows)
+  done < <(crate_rows --with-vendored)
   echo "# Summary: $present present, $missing to package." >&2
 }
 

@@ -489,7 +489,7 @@ mod tests {
             reference::decode_with(&utf8_bom, fe("UTF-8")),
             decode_with(&utf8_bom, fe("UTF-8"))
         );
-        assert_eq!(reference::decode_with(&utf8_bom, fe("UTF-8")).1.bom, true);
+        assert!(reference::decode_with(&utf8_bom, fe("UTF-8")).1.bom);
         assert_eq!(
             reference::decode_strict(&utf8_bom, fe("UTF-8")),
             decode_strict(&utf8_bom, fe("UTF-8"))

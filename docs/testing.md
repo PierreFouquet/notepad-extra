@@ -104,6 +104,29 @@ COVERAGE_GATE=100 scripts/coverage.sh --html   # write an HTML report
 Requires `cargo install cargo-llvm-cov`. The gate rises toward the ~100% DoD
 target as the core grows; pure logic with no I/O has little excuse to miss it.
 
+The gate must not depend on what the property tests happen to draw (#142). Run
+it once more with a single proptest case:
+
+```sh
+PROPTEST_CASES=1 scripts/coverage.sh   # must pass too: no line may rely on a lucky draw
+```
+
+If that fails, or a file's margin shrinks, find the lines no deterministic test
+reaches by running with no proptest cases at all and reading the report. The
+gate itself fails at zero cases, because the proptest bodies and strategies in
+each `mod tests` count towards their file. Every *production* line should still
+be covered:
+
+```sh
+PROPTEST_CASES=0 scripts/coverage.sh --text --output-path cov.txt   # then look for 0 counts above `mod tests`
+```
+
+Give each such line a deterministic unit test, i.e. a synthetic `Message`
+asserted against `State` and the returned `Effect`s. This includes a test-module
+"reference" oracle that only a proptest calls. The script clears the previous
+run's profile data first, so a run never reports lines that only an earlier run
+reached.
+
 ## Render shell (`crates/iced`)
 
 The thin iced shell (#28) does no application logic of its own — it renders the

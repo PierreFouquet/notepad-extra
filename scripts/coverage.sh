@@ -35,6 +35,13 @@ trap 'rm -f "$COV_JSON"' EXIT
 # the one the rest of CI just tested.
 LOCKED=(--locked)
 
+# 0. Drop the raw profile data of any earlier run (#142). `--no-report` adds to
+#    what is already in the target directory rather than replacing it, so a
+#    second run in the same target directory would report the union of both: a
+#    `PROPTEST_CASES=1` check straight after a full run would pass on lines only
+#    the full run reached.
+cargo llvm-cov clean --profraw-only
+
 # 1. Run both suites once under instrumentation, keeping the raw profile data so
 #    the reports below don't re-run the tests.
 cargo llvm-cov --no-report "${LOCKED[@]}" "${PKGS[@]}"

@@ -282,7 +282,8 @@ impl ScrollOffset for iced_graphics::text::Editor {
 
 /// A bracket pair to highlight (#41), in the widget's `(line, byte-column)`
 /// space — the same coordinates iced's `Cursor` uses, so the shell builds it
-/// from the core's byte offsets with `find::line_col_of`. `partner == None`
+/// from the core's byte offsets with its `editor_position` conversion (#153).
+/// `partner == None`
 /// marks an unbalanced bracket, which the widget draws in a distinct colour.
 #[derive(Debug, Clone, Copy, PartialEq)]
 // NOTEPAD-EXTRA(#41): bracket-match pair the shell asks the widget to highlight.

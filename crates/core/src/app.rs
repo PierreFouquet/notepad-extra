@@ -2925,8 +2925,8 @@ mod tests {
         update(&mut s, Message::Edited("hello world".into()));
         update(&mut s, Message::Edited("hello BIG world".into())); // insert "BIG " at 6
 
-        // Undo removes "BIG "; the caret reveals the edit site (byte 6), not the
-        // top of the document — the shell would otherwise resync to (0,0) (#94).
+        // Undo removes "BIG "; the caret reveals the edit site (byte 6), so the
+        // user sees what changed (#94).
         let undo_fx = update(&mut s, Message::Undo);
         assert_eq!(s.active_doc().content(), "hello world");
         assert_eq!(reveal(&undo_fx), Some((6, 6)));
@@ -4480,7 +4480,8 @@ mod tests {
         let mut s = State::default();
         update(&mut s, Message::Edited("banana\napple".into()));
         let fx = text_op(&mut s, SORT_ASC);
-        // No user selection -> no RevealRange (the shell resyncs to the top).
+        // No user selection -> no RevealRange (the shell's in-place splice keeps
+        // the caret where it was, #137).
         assert!(reveal(&fx).is_none());
     }
 

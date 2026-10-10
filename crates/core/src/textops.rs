@@ -5,8 +5,9 @@
 //! Every operation is a **pure function of text** — no window, no I/O — so the
 //! whole feature is asserted headlessly (epic #25's testing standard). The
 //! render shell reads the live selection from its editor widget, hands the byte
-//! range to [`apply_to`], and resyncs the rewritten buffer; the *decision* logic
-//! (which region to touch, how to transform it) lives here.
+//! range to [`apply_to`], and splices the resulting edit into its buffer in
+//! place (#137); the *decision* logic (which region to touch, how to
+//! transform it) lives here.
 //!
 //! ## Region scoping
 //!

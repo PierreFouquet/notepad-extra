@@ -575,8 +575,8 @@ fn the_cr_flag_on_a_200k_line_document_costs_nothing_per_message() {
     // The shell reads `has_cr` before every position conversion, several
     // times per message, to choose between the line index and a walk of the
     // editor's lines (#153). It is a cached count: a hundred thousand reads
-    // take microseconds, where a scan for a `\r` would cost about a
-    // millisecond each at this size, over a minute for the lot.
+    // take microseconds, where a scan for a `\r` costs about 0.4 ms each at
+    // this size: 37 s for the lot, measured.
     let mut s = two_hundred_thousand_lines();
     let started = Instant::now();
     let with_cr = (0..100_000)

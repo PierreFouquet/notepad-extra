@@ -12,8 +12,10 @@
 //! buffers, one per document, keyed by [`TabId`] (#94). The active tab's buffer
 //! is the one on screen; switching tabs simply shows a different cached buffer,
 //! so each tab's caret and scroll position survive the switch. A buffer is
-//! rebuilt from `core` only when the core rewrites that document's text
-//! (undo/redo, replace, load) — see [`Shell::sync_editor_cache`].
+//! rebuilt from `core` only when the core replaces that document's text (a
+//! load, reload or reopen) — see [`Shell::sync_editor_cache`]. A rewrite (undo,
+//! redo, replace, a text operation) is spliced into the existing buffer
+//! instead — see [`Shell::apply_edit_to_buffer`] (#137).
 //! Because the shell never decides *what* happens (only *how* the effects run),
 //! it stays untestable-window-free: [`Shell::apply_core`] and friends are
 //! exercised headlessly (see the tests below), matching the epic's DoD.
@@ -1483,7 +1485,7 @@ impl Shell {
             // Ctrl+Shift+Z / Ctrl+Y accelerators (#39).
             Message::Undo => self.apply_core(core::Message::Undo, Resync::No),
             Message::Redo => self.apply_core(core::Message::Redo, Resync::No),
-            // resync=false: the per-tab cache already holds this tab's buffer, so
+            // `Resync::No`: the per-tab cache already holds this tab's buffer, so
             // selecting it shows that tab's own caret and scroll instead of
             // rebuilding at the top — the crux of #94. (A first-ever selection of
             // a tab that has no cached buffer is covered by `sync_editor_cache`'s
@@ -1494,10 +1496,11 @@ impl Shell {
                 self.tabs_menu_open = false;
                 self.apply_core(core::Message::TabSelected(i), Resync::No)
             }
-            // resync=false: closing a clean tab (or a save-then-close) changes the
-            // active document, which `apply_core` detects and resyncs on its own;
-            // a *dirty* tab only yields a `ConfirmClose`, so the editor must be
-            // left untouched (no caret jump) until the user answers.
+            // `Resync::No`: closing a clean tab (or a save-then-close) makes another
+            // tab active, which keeps its own cached buffer, caret and scroll (see
+            // `sync_editor_cache`); a *dirty* tab only yields a `ConfirmClose`, so
+            // the editor must be left untouched (no caret jump) until the user
+            // answers.
             Message::TabClosed(i) => self.apply_core(core::Message::TabClosed(i), Resync::No),
             Message::CloseChoiceMade { id, choice } => {
                 self.confirm_close = None;
@@ -1981,18 +1984,18 @@ impl Shell {
             },
 
             // Zoom changes only the app-wide font size the view reads; it never
-            // rewrites the buffer, so resync=false leaves the editor untouched.
+            // rewrites the buffer, so `Resync::No` leaves the editor untouched.
             Message::ZoomIn => self.apply_core(core::Message::ZoomIn, Resync::No),
             Message::ZoomOut => self.apply_core(core::Message::ZoomOut, Resync::No),
             Message::ZoomReset => self.apply_core(core::Message::ZoomReset, Resync::No),
             Message::ToggleWordWrap => self.apply_core(core::Message::ToggleWordWrap, Resync::No),
             // The gutter is a view-only preference the editor reads from
-            // `show_line_numbers()`; it never rewrites the buffer, so resync=false.
+            // `show_line_numbers()`; it never rewrites the buffer, so `Resync::No`.
             Message::ToggleLineNumbers => {
                 self.apply_core(core::Message::ToggleLineNumbers, Resync::No)
             }
             // Theme is a view-only preference read from `theme()`; it never
-            // rewrites the buffer, so resync=false. The editor re-highlights
+            // rewrites the buffer, so `Resync::No`. The editor re-highlights
             // because its highlighter `Settings.theme` changes (#36).
             Message::ToggleTheme => self.apply_core(core::Message::ToggleTheme, Resync::No),
             Message::SetEditorFont(family) => {
@@ -2208,10 +2211,12 @@ impl Shell {
     ///    file, the initial document — seeded from that document's text. A tab
     ///    that already owns a buffer keeps it, caret and scroll intact: that is
     ///    the whole point of the cache, and why a plain tab switch passes
-    ///    `resync = false`.
+    ///    [`Resync::No`].
     /// 3. **Rebuild** the one buffer `resync` names, the document whose text the
-    ///    core rewrote out from under the editor (undo/redo, replace, load,
-    ///    reload). That is the active tab's buffer for most messages, but a
+    ///    core replaced out from under the editor (a new tab, a load, a reload
+    ///    or a reopen). Undo, redo, replace and the text operations are not
+    ///    rebuilt: they reach the buffer as an exact edit
+    ///    ([`Shell::apply_edit_to_buffer`], #137). That is the active tab's buffer for most messages, but a
     ///    reload or reopen names its own document: its file read can finish
     ///    after the user has switched tabs, and rebuilding the active buffer
     ///    instead left the reloaded tab showing stale text (#143). `Edited`
@@ -4761,10 +4766,10 @@ mod tests {
 
     #[test]
     fn undo_then_redo_reveals_the_edit_site_not_the_top() {
-        // #94: undo/redo rewrite the buffer, so the shell rebuilds the active
-        // editor from the core's text (`resync = true`) — which on its own would
-        // drop the caret at (0, 0) and scroll to the top. Step 1's `RevealRange`
-        // lands the caret on the edit instead; verified here end-to-end.
+        // #94: undo/redo rewrite the text out from under the editor. The shell
+        // splices the edit into the buffer in place (#137), and the core's
+        // `RevealRange` then lands the caret on the edit, so the user sees what
+        // changed; verified here end-to-end.
         let (mut shell, _) = Shell::new();
         // Two separate steps: the first insert carries a newline, which closes the
         // typing run, so "edit" is its own undo step rather than coalesced in.
@@ -6965,7 +6970,7 @@ mod tests {
         assert_eq!(b.here, Position { line: 0, column: 0 });
         assert_eq!(b.partner, None, "an unbalanced opener has no partner");
 
-        // Undo rewrites the buffer from the core and resyncs the editor: the
+        // Undo rewrites the text and the shell splices it into the buffer: the
         // total goes back and the bracket readout clears.
         let _ = shell.update(Message::Undo);
         assert_eq!(

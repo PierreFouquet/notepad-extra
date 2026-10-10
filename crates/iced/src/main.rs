@@ -428,12 +428,14 @@ enum Message {
     },
     /// The user chose to open a large file anyway, past the confirm bar (#102):
     /// load the first buffer queued in [`Shell::confirm_large_open`] as usual.
-    /// The next queued file, if any, then takes the bar (#148).
-    LargeOpenConfirmed,
+    /// The next queued file, if any, then takes the bar (#148). Carries the
+    /// [`PendingLargeOpen::id`] of the file the bar showed, so a click queued
+    /// behind a long load cannot land on the next file's prompt.
+    LargeOpenConfirmed(u64),
     /// The user declined to open a large file (#102): drop the first queued
     /// buffer and leave the current tabs untouched. The next queued file, if
-    /// any, then takes the bar (#148).
-    LargeOpenCancelled,
+    /// any, then takes the bar (#148). Carries the shown file's id, as above.
+    LargeOpenCancelled(u64),
     /// Document `id` was re-read for a *reopen* under a user-chosen encoding
     /// ([`Message::ReopenAs`]). The raw bytes are *strictly* re-decoded here with
     /// [`core::encoding::decode_strict_owned`]: if they are not valid in that encoding
@@ -762,15 +764,17 @@ const LARGE_FILE_LINE_BYTES: usize = 500_000;
 /// dialog, for the same reasons as [`PendingClose`].
 #[derive(Debug, Clone)]
 struct PendingLargeOpen {
+    /// Unique per queued file, so an answer names the file it was given for
+    /// (#148). The bar comes back in the same place with the same buttons for
+    /// the next file, so without it a second click queued during the first
+    /// file's multi-second load would answer for a file the user never saw.
+    id: u64,
     path: PathBuf,
     content: String,
     encoding: core::FileEncoding,
-    /// The measured line count, shown in the prompt so the user knows the scale.
-    lines: usize,
-    /// Whether the long-line gate tripped only because lone `\r`s join short
-    /// lines into one long one (see [`LargeFileScan::cr_joined`]), so the prompt
-    /// can say why rather than call it "a very long line" (#148).
-    cr_joined: bool,
+    /// What the gate measured: the line count the prompt shows, and whether
+    /// lone `\r`s are what made the long line (#148).
+    scan: LargeFileScan,
     /// The file's fingerprint at read time (#51), threaded through so accepting the
     /// large open records the same external-change baseline a normal open would.
     disk: Option<DiskMeta>,
@@ -818,17 +822,27 @@ fn large_file_scan(content: &str) -> Option<LargeFileScan> {
     let mut lines = 0usize;
     let mut longest = 0usize;
     let mut longest_shown = 0usize;
-    for line in content.lines() {
-        longest = longest.max(line.len());
-        for shown in line.split('\r') {
-            lines += 1;
-            longest_shown = longest_shown.max(shown.len());
+    if content.contains('\r') {
+        for line in content.lines() {
+            longest = longest.max(line.len());
+            for shown in line.split('\r') {
+                lines += 1;
+                longest_shown = longest_shown.max(shown.len());
+            }
         }
-    }
-    // A final lone `\r` ends the last line, the way a final `\n` does, rather
-    // than starting an empty one: drop the empty piece `split` left after it.
-    if content.ends_with('\r') {
-        lines -= 1;
+        // A final lone `\r` ends the last line, the way a final `\n` does,
+        // rather than starting an empty one: drop the empty piece `split` left.
+        if content.ends_with('\r') {
+            lines -= 1;
+        }
+    } else {
+        // LF text, the common case: one split, so the second per-line search
+        // above is skipped (one memchr over the buffer decides).
+        for line in content.lines() {
+            lines += 1;
+            longest = longest.max(line.len());
+        }
+        longest_shown = longest;
     }
     let long_line = longest >= LARGE_FILE_LINE_BYTES;
     (lines >= LARGE_FILE_LINES || long_line || content.len() >= LARGE_FILE_BYTES).then_some(
@@ -843,11 +857,14 @@ fn large_file_scan(content: &str) -> Option<LargeFileScan> {
 /// crossed, in the user's terms, and what accepting costs. A many-line file
 /// reports its line count and size, a file that tripped on size alone its size,
 /// and a lone enormous line — which trips on byte length, not line count, so
-/// "1 lines" would mislead — is described as such, unless lone `\r` line
-/// endings are what made it one line (#148). The memory warning is the
-/// measured one (#126): the largest files cost gigabytes of resident memory
-/// to shape, not just a pause.
-fn large_open_prompt(pending: &PendingLargeOpen) -> String {
+/// "1 lines" would mislead — is described as such. When lone `\r` line endings
+/// are what make the core see one enormous line, the prompt says so whichever
+/// gate tripped: those files cost the most per keystroke (#148). The memory
+/// warning is the measured one (#126): the largest files cost gigabytes of
+/// resident memory to shape, not just a pause. `waiting` counts the gated
+/// files queued behind this one, so the bar coming back for the next file is
+/// expected rather than a surprise (#148).
+fn large_open_prompt(pending: &PendingLargeOpen, waiting: usize) -> String {
     let name = pending.path.file_name().map_or_else(
         || pending.path.display().to_string(),
         |n| n.to_string_lossy().into_owned(),
@@ -855,18 +872,31 @@ fn large_open_prompt(pending: &PendingLargeOpen) -> String {
     let bytes = pending.content.len();
     // Binary units, labelled as such: the size gate is `LARGE_FILE_BYTES` in MiB.
     let size = format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0));
-    let scale = if pending.lines >= LARGE_FILE_LINES {
-        format!("has {} lines ({size})", pending.lines)
+    let scan = pending.scan;
+    // On screen a CR-joined line is many short ones; the cost is the core's.
+    const CR: &str =
+        "uses classic Mac OS (CR) line endings, which are edited as one very long line";
+    let scale = if scan.lines >= LARGE_FILE_LINES {
+        format!("has {} lines ({size})", scan.lines)
     } else if bytes >= LARGE_FILE_BYTES {
         format!("is {size}")
-    } else if pending.cr_joined {
-        // On screen the lines are short; the cost is the core's (#148).
-        "uses classic Mac OS (CR) line endings, which are edited as one very long line".to_string()
+    } else if scan.cr_joined {
+        CR.to_string()
     } else {
         "has a very long line".to_string()
     };
+    let cr = if scan.cr_joined && !scale.starts_with("uses") {
+        format!(" and {CR}")
+    } else {
+        String::new()
+    };
+    let queue = match waiting {
+        0 => String::new(),
+        1 => " 1 more large file is waiting.".to_string(),
+        n => format!(" {n} more large files are waiting."),
+    };
     format!(
-        "\u{201c}{name}\u{201d} {scale}. Opening it may take a while and, for the largest files, use several GB of memory."
+        "\u{201c}{name}\u{201d} {scale}{cr}. Opening it may take a while and, for the largest files, use several GB of memory.{queue}"
     )
 }
 
@@ -974,6 +1004,8 @@ struct Shell {
     /// second must not silently replace the first (#148). Answering pops the
     /// front, and the next file takes the bar.
     confirm_large_open: VecDeque<PendingLargeOpen>,
+    /// The id the next gated file gets in [`Shell::confirm_large_open`] (#148).
+    next_large_open_id: u64,
     /// A Save awaiting the stale-save overwrite prompt (#51), if any; drives the
     /// in-app overwrite bar in [`Shell::view`]. `Some` means the file changed on
     /// disk and the core raised [`Effect::ConfirmOverwrite`] instead of writing.
@@ -1130,6 +1162,7 @@ impl Shell {
                 confirm_close: None,
                 confirm_quit: None,
                 confirm_large_open: VecDeque::new(),
+                next_large_open_id: 0,
                 confirm_overwrite: None,
                 drag_hover: false,
                 context_menu: None,
@@ -1376,12 +1409,14 @@ impl Shell {
                     // the UI unexpectedly; `LargeOpenConfirmed` finishes the load.
                     // Queued behind any file already waiting (#148).
                     if let Some(scan) = large_file_scan(&content) {
+                        let id = self.next_large_open_id;
+                        self.next_large_open_id += 1;
                         self.confirm_large_open.push_back(PendingLargeOpen {
+                            id,
                             path,
                             content,
                             encoding,
-                            lines: scan.lines,
-                            cr_joined: scan.cr_joined,
+                            scan,
                             disk,
                         });
                         return Task::none();
@@ -1404,8 +1439,9 @@ impl Shell {
 
             // The user accepted the large-file confirm bar (#102): load the
             // buffer stashed at read time, exactly as the non-large path would.
-            // Only the front of the queue; the next waiting file keeps its turn.
-            Message::LargeOpenConfirmed => match self.confirm_large_open.pop_front() {
+            // Only the front of the queue, and only if the answer was given for
+            // it; the next waiting file keeps its turn.
+            Message::LargeOpenConfirmed(id) => match self.take_large_open(id) {
                 Some(pending) => self.apply_core(
                     core::Message::FileLoaded {
                         path: pending.path,
@@ -1420,8 +1456,8 @@ impl Shell {
 
             // The user declined (#102): drop the front buffer, open nothing.
             // Any other waiting file is still offered (#148).
-            Message::LargeOpenCancelled => {
-                self.confirm_large_open.pop_front();
+            Message::LargeOpenCancelled(id) => {
+                self.take_large_open(id);
                 Task::none()
             }
 
@@ -1959,6 +1995,19 @@ impl Shell {
         self.refresh_watched();
         let tasks: Vec<Task<Message>> = effects.into_iter().map(|e| self.run_effect(e)).collect();
         Task::batch(tasks)
+    }
+
+    /// Pop the front of the large-file queue if `id` names it (#148). The bar
+    /// only ever shows the front, so an answer for any other id is stale: a
+    /// click made before the bar moved on to the next file, typically while
+    /// the previous file's load froze the UI. It is dropped rather than
+    /// applied to a file whose prompt the user has not seen.
+    fn take_large_open(&mut self, id: u64) -> Option<PendingLargeOpen> {
+        if self.confirm_large_open.front()?.id == id {
+            self.confirm_large_open.pop_front()
+        } else {
+            None
+        }
     }
 
     /// Reconcile the per-tab editor cache with the core's documents after an
@@ -3026,7 +3075,7 @@ impl Shell {
         };
         let ui = self.ui_font();
         let t = self.tokens();
-        let prompt = large_open_prompt(pending);
+        let prompt = large_open_prompt(pending, self.confirm_large_open.len() - 1);
         container(
             row![
                 // The sentence names the threshold and the cost, so it is longer
@@ -3035,10 +3084,10 @@ impl Shell {
                 text(prompt).font(ui).width(Fill),
                 button(text("Open anyway").font(ui))
                     .style(theme::accent(t))
-                    .on_press(Message::LargeOpenConfirmed),
+                    .on_press(Message::LargeOpenConfirmed(pending.id)),
                 button(text("Cancel").font(ui))
                     .style(theme::ghost(t))
-                    .on_press(Message::LargeOpenCancelled),
+                    .on_press(Message::LargeOpenCancelled(pending.id)),
             ]
             .spacing(8)
             .align_y(iced::Alignment::Center),
@@ -4701,9 +4750,9 @@ mod tests {
             .confirm_large_open
             .front()
             .expect("a many-line file arms the confirm bar");
-        assert_eq!(pending.lines, LARGE_FILE_LINES);
+        assert_eq!(pending.scan.lines, LARGE_FILE_LINES);
         assert_eq!(
-            large_open_prompt(pending),
+            large_open_prompt(pending, 0),
             "\u{201c}huge.log\u{201d} has 50000 lines (0.1 MiB). Opening it may take a while \
              and, for the largest files, use several GB of memory."
         );
@@ -4728,13 +4777,13 @@ mod tests {
             .confirm_large_open
             .front()
             .expect("a many-megabyte file arms the confirm bar");
-        assert_eq!(pending.lines, 40_000);
+        assert_eq!(pending.scan.lines, 40_000);
         assert!(
-            pending.lines < LARGE_FILE_LINES,
+            pending.scan.lines < LARGE_FILE_LINES,
             "the line gate did not trip"
         );
         assert_eq!(
-            large_open_prompt(pending),
+            large_open_prompt(pending, 0),
             "\u{201c}wide.csv\u{201d} is 9.8 MiB. Opening it may take a while and, for the \
              largest files, use several GB of memory."
         );
@@ -4759,9 +4808,9 @@ mod tests {
             .confirm_large_open
             .front()
             .expect("an enormous single line arms the confirm bar");
-        assert_eq!(pending.lines, 1);
+        assert_eq!(pending.scan.lines, 1);
         assert_eq!(
-            large_open_prompt(pending),
+            large_open_prompt(pending, 0),
             "\u{201c}oneline.txt\u{201d} has a very long line. Opening it may take a while \
              and, for the largest files, use several GB of memory."
         );
@@ -4835,14 +4884,14 @@ mod tests {
         // the load actually shapes it, standing in for the huge real one.
         let (mut shell, _) = Shell::new();
         shell.confirm_large_open.push_back(PendingLargeOpen {
+            id: 0,
             path: PathBuf::from("/tmp/huge.log"),
             content: "loaded at last".to_string(),
             encoding: core::FileEncoding::default(),
-            lines: LARGE_FILE_LINES,
-            cr_joined: false,
+            scan: scan(LARGE_FILE_LINES),
             disk: None,
         });
-        let _ = shell.update(Message::LargeOpenConfirmed);
+        let _ = shell.update(Message::LargeOpenConfirmed(front_id(&shell)));
         assert!(
             shell.confirm_large_open.is_empty(),
             "confirming clears the bar"
@@ -4855,14 +4904,14 @@ mod tests {
     fn cancelling_a_large_open_loads_nothing() {
         let (mut shell, _) = Shell::new();
         shell.confirm_large_open.push_back(PendingLargeOpen {
+            id: 0,
             path: PathBuf::from("/tmp/huge.log"),
             content: "never loaded".to_string(),
             encoding: core::FileEncoding::default(),
-            lines: LARGE_FILE_LINES,
-            cr_joined: false,
+            scan: scan(LARGE_FILE_LINES),
             disk: None,
         });
-        let _ = shell.update(Message::LargeOpenCancelled);
+        let _ = shell.update(Message::LargeOpenCancelled(front_id(&shell)));
         assert!(
             shell.confirm_large_open.is_empty(),
             "cancelling clears the bar"
@@ -4882,6 +4931,15 @@ mod tests {
             path: PathBuf::from(path),
             result: Ok(big.into_bytes()),
         });
+    }
+
+    /// The id of the file the large-file bar shows: what its buttons answer for.
+    fn front_id(shell: &Shell) -> u64 {
+        shell
+            .confirm_large_open
+            .front()
+            .expect("a file is waiting")
+            .id
     }
 
     /// The paths waiting behind the large-file bar, front first.
@@ -4911,13 +4969,13 @@ mod tests {
         );
 
         // Cancelling the first drops only the first; the second takes the bar.
-        let _ = shell.update(Message::LargeOpenCancelled);
+        let _ = shell.update(Message::LargeOpenCancelled(front_id(&shell)));
         assert_eq!(queued(&shell), [Path::new("/tmp/wide.txt")]);
         assert_eq!(shell.core.docs.len(), 1, "nothing was opened");
         let _ = shell.view(); // the bar now builds for the second file
 
         // Accepting it loads the second file. The first was never loaded.
-        let _ = shell.update(Message::LargeOpenConfirmed);
+        let _ = shell.update(Message::LargeOpenConfirmed(front_id(&shell)));
         assert!(shell.confirm_large_open.is_empty());
         assert_eq!(shell.core.active_doc().title(), "wide.txt");
         assert_eq!(shell.core.docs.len(), 1, "it reused the blank tab");
@@ -4932,14 +4990,14 @@ mod tests {
             "a".repeat(LARGE_FILE_LINE_BYTES),
         );
         read_gated(&mut shell, "/tmp/many.log", "x\n".repeat(LARGE_FILE_LINES));
-        let _ = shell.update(Message::LargeOpenConfirmed);
+        let _ = shell.update(Message::LargeOpenConfirmed(front_id(&shell)));
         assert_eq!(shell.core.active_doc().title(), "wide.txt");
         assert_eq!(
             queued(&shell),
             [Path::new("/tmp/many.log")],
             "the second file is still offered after the first opens"
         );
-        let _ = shell.update(Message::LargeOpenCancelled);
+        let _ = shell.update(Message::LargeOpenCancelled(front_id(&shell)));
         assert!(shell.confirm_large_open.is_empty());
         assert_eq!(shell.core.docs.len(), 1);
     }
@@ -4991,11 +5049,12 @@ mod tests {
         assert_eq!(mac.len(), 600_000);
         read_gated(&mut shell, "/tmp/mac.txt", mac);
         let pending = shell.confirm_large_open.front().expect("gated");
-        assert_eq!(pending.lines, LARGE_FILE_LINES);
+        assert_eq!(pending.scan.lines, LARGE_FILE_LINES);
         assert_eq!(
-            large_open_prompt(pending),
-            "\u{201c}mac.txt\u{201d} has 50000 lines (0.6 MiB). Opening it may take a while \
-             and, for the largest files, use several GB of memory."
+            large_open_prompt(pending, 0),
+            "\u{201c}mac.txt\u{201d} has 50000 lines (0.6 MiB) and uses classic Mac OS (CR) \
+             line endings, which are edited as one very long line. Opening it may take a \
+             while and, for the largest files, use several GB of memory."
         );
     }
 
@@ -5010,15 +5069,85 @@ mod tests {
         let mac = "abcdefghijk\r".repeat(45_000);
         read_gated(&mut shell, "/tmp/mac.txt", mac);
         let pending = shell.confirm_large_open.front().expect("gated");
-        assert_eq!(pending.lines, 45_000);
-        assert!(pending.cr_joined);
+        assert_eq!(pending.scan.lines, 45_000);
+        assert!(pending.scan.cr_joined);
         assert_eq!(
-            large_open_prompt(pending),
+            large_open_prompt(pending, 0),
             "\u{201c}mac.txt\u{201d} uses classic Mac OS (CR) line endings, which are edited \
              as one very long line. Opening it may take a while and, for the largest files, \
              use several GB of memory."
         );
         let _ = shell.view(); // the bar builds with the CR phrasing
+    }
+
+    #[test]
+    fn an_answer_for_a_file_the_bar_no_longer_shows_is_ignored() {
+        // Answers carry the id of the file the bar showed (#148). A click queued
+        // during the first file's load arrives after the bar has moved on to
+        // the second file, in the same place with the same buttons, and must
+        // not answer for it.
+        let (mut shell, _) = Shell::new();
+        let long = "a".repeat(LARGE_FILE_LINE_BYTES);
+        read_gated(&mut shell, "/tmp/first.txt", long.clone());
+        read_gated(&mut shell, "/tmp/second.txt", long);
+        let first = front_id(&shell);
+        let _ = shell.update(Message::LargeOpenConfirmed(first));
+        assert_eq!(shell.core.active_doc().title(), "first.txt");
+
+        // The same click again, and a stale Cancel: both name the first file.
+        let _ = shell.update(Message::LargeOpenConfirmed(first));
+        let _ = shell.update(Message::LargeOpenCancelled(first));
+        assert_eq!(queued(&shell), [Path::new("/tmp/second.txt")]);
+        assert_eq!(shell.core.docs.len(), 1, "the second file was not opened");
+
+        let _ = shell.update(Message::LargeOpenCancelled(front_id(&shell)));
+        assert!(shell.confirm_large_open.is_empty());
+    }
+
+    #[test]
+    fn the_prompt_says_how_many_more_large_files_are_waiting() {
+        // The bar comes back for each queued file; saying so up front makes that
+        // expected rather than a surprise (#148).
+        let pending = PendingLargeOpen {
+            id: 0,
+            path: PathBuf::from("/tmp/huge.log"),
+            content: String::new(),
+            encoding: core::FileEncoding::default(),
+            scan: scan(LARGE_FILE_LINES),
+            disk: None,
+        };
+        let base = "\u{201c}huge.log\u{201d} has 50000 lines (0.0 MiB). Opening it may take a \
+                    while and, for the largest files, use several GB of memory.";
+        assert_eq!(large_open_prompt(&pending, 0), base);
+        assert_eq!(
+            large_open_prompt(&pending, 1),
+            format!("{base} 1 more large file is waiting.")
+        );
+        assert_eq!(
+            large_open_prompt(&pending, 2),
+            format!("{base} 2 more large files are waiting.")
+        );
+    }
+
+    #[test]
+    fn a_cr_joined_file_over_the_size_gate_still_warns_about_the_long_line() {
+        // 42 000 lines of 200 bytes ended by lone `\r`s: under the line gate,
+        // over the size gate, and one 8 MB line to the core. The size phrasing
+        // leads, and the CR cause, the worst per-keystroke case, still shows.
+        let (mut shell, _) = Shell::new();
+        read_gated(
+            &mut shell,
+            "/tmp/mac.txt",
+            format!("{}\r", "a".repeat(199)).repeat(42_000),
+        );
+        let pending = shell.confirm_large_open.front().expect("gated");
+        assert_eq!(pending.scan.lines, 42_000);
+        assert_eq!(
+            large_open_prompt(pending, 0),
+            "\u{201c}mac.txt\u{201d} is 8.0 MiB and uses classic Mac OS (CR) line endings, \
+             which are edited as one very long line. Opening it may take a while and, for \
+             the largest files, use several GB of memory."
+        );
     }
 
     #[test]
@@ -7326,6 +7455,30 @@ mod ui_tests {
             LARGE_FILE_LINE_BYTES,
             "Open anyway loaded the whole line into the editor"
         );
+    }
+
+    #[test]
+    fn large_file_bar_shows_the_file_its_buttons_answer_for() {
+        // The buttons answer for the front of the queue, so the bar must name
+        // that file, with the count of the others behind it (#148).
+        let (mut shell, _) = Shell::new();
+        for (path, big) in [
+            ("/tmp/huge.log", "x\n".repeat(LARGE_FILE_LINES)),
+            ("/tmp/oneline.txt", "a".repeat(LARGE_FILE_LINE_BYTES)),
+        ] {
+            let _ = shell.update(Message::FileRead {
+                path: PathBuf::from(path),
+                result: Ok(big.into_bytes()),
+            });
+        }
+        let front = large_open_prompt(&shell.confirm_large_open[0], 1);
+        let back = large_open_prompt(&shell.confirm_large_open[1], 1);
+        let mut ui = simulator(shell.view());
+        assert!(
+            ui.find(front.as_str()).is_ok(),
+            "the bar names the front file"
+        );
+        assert!(ui.find(back.as_str()).is_err(), "not the one behind it");
     }
 
     #[test]

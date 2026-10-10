@@ -4078,4 +4078,190 @@ mod tests {
         // No user selection -> no RevealRange (the shell resyncs to the top).
         assert!(reveal(&fx).is_none());
     }
+
+    // ---- Cached document totals and line index (#126) ----
+
+    /// One step of the invalidation proptest below: every message path that
+    /// rewrites a buffer, plus the tab moves that spread them across documents
+    /// and the save / encoding changes that move the dirty baseline.
+    #[derive(Debug, Clone)]
+    enum Rewrite {
+        /// Replace `len` bytes at `pos` with `text`, reported as the editor
+        /// would: the whole new text through `Message::Edited`.
+        Edit {
+            pos: usize,
+            len: usize,
+            text: String,
+        },
+        Undo,
+        Redo,
+        ReplaceAll {
+            query: String,
+            replacement: String,
+        },
+        ReplaceNext {
+            query: String,
+            replacement: String,
+        },
+        TextOp {
+            op: crate::textops::TextOp,
+            selection: Option<(usize, usize)>,
+        },
+        Load(String),
+        Reload(String),
+        Save,
+        SetEncoding(&'static str),
+        NewTab,
+        SelectTab(usize),
+    }
+
+    fn arb_text_op() -> impl Strategy<Value = crate::textops::TextOp> {
+        use crate::textops::TextOp;
+        prop_oneof![
+            Just(TextOp::SortLines {
+                descending: false,
+                case_insensitive: true,
+            }),
+            Just(TextOp::ReverseLines),
+            Just(TextOp::RemoveDuplicateLines),
+            Just(TextOp::RemoveBlankLines),
+            Just(TextOp::Uppercase),
+            Just(TextOp::Lowercase),
+            Just(TextOp::TitleCase),
+            Just(TextOp::ToggleCase),
+            Just(TextOp::TrimTrailingWhitespace),
+            Just(TextOp::TabsToSpaces { width: 2 }),
+            Just(TextOp::SpacesToTabs { width: 2 }),
+        ]
+    }
+
+    fn arb_rewrite() -> impl Strategy<Value = Rewrite> {
+        use crate::document::strategies::seam_text;
+        // Literal (non-regex) patterns that occur often in seam text, including
+        // a newline so a replacement can join or split lines.
+        let query = prop_oneof![
+            Just("a"),
+            Just("ab"),
+            Just("你"),
+            Just("\n"),
+            Just("'"),
+            Just(" "),
+        ]
+        .prop_map(str::to_string);
+        prop_oneof![
+            8 => (0usize..80, 0usize..12, seam_text(10))
+                .prop_map(|(pos, len, text)| Rewrite::Edit { pos, len, text }),
+            3 => Just(Rewrite::Undo),
+            2 => Just(Rewrite::Redo),
+            1 => (query.clone(), seam_text(4))
+                .prop_map(|(query, replacement)| Rewrite::ReplaceAll { query, replacement }),
+            1 => (query, seam_text(4))
+                .prop_map(|(query, replacement)| Rewrite::ReplaceNext { query, replacement }),
+            1 => (arb_text_op(), prop::option::of((0usize..80, 0usize..80)))
+                .prop_map(|(op, selection)| Rewrite::TextOp { op, selection }),
+            1 => seam_text(40).prop_map(Rewrite::Load),
+            1 => seam_text(40).prop_map(Rewrite::Reload),
+            1 => Just(Rewrite::Save),
+            1 => prop_oneof![Just("UTF-8"), Just("Windows-1252")].prop_map(Rewrite::SetEncoding),
+            1 => Just(Rewrite::NewTab),
+            1 => (0usize..4).prop_map(Rewrite::SelectTab),
+        ]
+    }
+
+    proptest! {
+        /// The invalidation pin for #126: after **every** path that rewrites a
+        /// buffer — edits, undo/redo, replace-next/all, text operations, load,
+        /// reload, save, encoding changes, new/selected tabs — every document's
+        /// cached chars / words / lines / line index / dirty flag equals a
+        /// from-scratch recount, and `status()` reports those same numbers. The
+        /// seam alphabet (newlines, apostrophes, CJK, emoji, regional
+        /// indicators, joiners, combining marks, a lone CR) is chosen so the
+        /// per-line word recount is exercised at every awkward UAX #29 boundary.
+        #[test]
+        fn cached_totals_match_a_recount_after_every_rewrite_path(
+            steps in prop::collection::vec(arb_rewrite(), 0..40),
+        ) {
+            use unicode_segmentation::UnicodeSegmentation;
+            let mut s = State::default();
+            update(&mut s, Message::FindOpened); // so replace-next / replace-all act
+            for step in steps {
+                match step {
+                    Rewrite::Edit { pos, len, text } => {
+                        let cur = s.active_doc().content();
+                        let lo = find::floor_boundary(cur, pos);
+                        let hi = find::floor_boundary(cur, lo + len);
+                        let next = format!("{}{}{}", &cur[..lo], text, &cur[hi..]);
+                        update(&mut s, Message::Edited(next));
+                    }
+                    Rewrite::Undo => {
+                        update(&mut s, Message::Undo);
+                    }
+                    Rewrite::Redo => {
+                        update(&mut s, Message::Redo);
+                    }
+                    Rewrite::ReplaceAll { query, replacement } => {
+                        update(&mut s, Message::FindQueryChanged(query));
+                        update(&mut s, Message::ReplaceTextChanged(replacement));
+                        update(&mut s, Message::ReplaceAll);
+                    }
+                    Rewrite::ReplaceNext { query, replacement } => {
+                        update(&mut s, Message::FindQueryChanged(query));
+                        update(&mut s, Message::ReplaceTextChanged(replacement));
+                        update(&mut s, Message::ReplaceNext);
+                    }
+                    Rewrite::TextOp { op, selection } => {
+                        update(&mut s, Message::TextOperation { op, selection });
+                    }
+                    Rewrite::Load(text) => {
+                        load(&mut s, "/t/loaded.txt", &text);
+                    }
+                    Rewrite::Reload(content) => {
+                        let id = s.active_doc().id;
+                        update(&mut s, Message::FileReloaded {
+                            id,
+                            content,
+                            encoding: FileEncoding::default(),
+                            disk: None,
+                        });
+                    }
+                    Rewrite::Save => {
+                        let id = s.active_doc().id;
+                        update(&mut s, Message::FileSaved {
+                            id,
+                            path: PathBuf::from("/t/saved.txt"),
+                            disk: None,
+                        });
+                    }
+                    Rewrite::SetEncoding(label) => {
+                        update(&mut s, Message::SetEncoding(label.to_string()));
+                    }
+                    Rewrite::NewTab => {
+                        update(&mut s, Message::NewTab);
+                    }
+                    Rewrite::SelectTab(i) => {
+                        update(&mut s, Message::TabSelected(i));
+                    }
+                }
+                for doc in &s.docs {
+                    // The private-field oracle (dirty flag included)...
+                    doc.assert_derived_data_matches_recount();
+                    // ...and the public readers, spelled out against the
+                    // definitions the status bar used to compute per frame.
+                    let text = doc.content();
+                    prop_assert_eq!(doc.char_count(), text.chars().count());
+                    prop_assert_eq!(doc.word_count(), text.unicode_words().count());
+                    prop_assert_eq!(doc.line_count(), find::line_count(text));
+                    for line in 0..doc.line_count() {
+                        prop_assert_eq!(doc.line_start(line), find::goto_line_offset(text, line + 1));
+                    }
+                }
+                let doc = s.active_doc();
+                let st = crate::status::status(doc, doc.content().len(), None);
+                prop_assert_eq!(
+                    (st.chars, st.words, st.lines),
+                    (doc.char_count(), doc.word_count(), doc.line_count())
+                );
+            }
+        }
+    }
 }

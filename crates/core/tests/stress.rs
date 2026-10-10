@@ -9,6 +9,7 @@ use notepad_core::{
     Effect, FileEncoding, Matcher, Message, SearchOptions, State, brackets, status, update,
 };
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 /// A regex-mode [`SearchOptions`].
 fn regex_opts() -> SearchOptions {
@@ -496,6 +497,115 @@ fn monotonic_zoom_to_each_extreme_settles_exactly_on_the_bound() {
         update(&mut s, Message::ZoomOut);
     }
     assert_eq!(s.font_size(), State::MIN_FONT_SIZE);
+}
+
+// ---- Cached document totals and line index (#126) ----
+
+/// A 200k-line document loaded through the real `FileLoaded` path, then dirtied
+/// by one keystroke so neither readout can short-circuit on a pristine buffer.
+fn two_hundred_thousand_lines() -> State {
+    let mut s = State::default();
+    let content = "lorem ipsum dolor sit amet\n".repeat(200_000);
+    update(
+        &mut s,
+        Message::FileLoaded {
+            path: PathBuf::from("/tmp/big.txt"),
+            content: content.clone(),
+            encoding: FileEncoding::default(),
+            disk: None,
+        },
+    );
+    update(&mut s, Message::Edited(format!("{content}x")));
+    assert!(s.active_doc().dirty());
+    s
+}
+
+#[test]
+fn status_and_dirty_on_a_200k_line_document_cost_nothing_per_frame() {
+    // The shell asks for the status readout and every tab's dirty flag on every
+    // redraw. Before #126 each `status()` recounted the whole buffer (chars,
+    // UAX #29 words and newlines — ~50 ms per call at this size in release, far
+    // more in debug) and `dirty()` compared the whole buffer against its saved
+    // copy. Ten thousand frames' worth of those calls would have taken the old
+    // code many minutes; with the cached totals, the indexed caret maths and the
+    // dirty flag they finish in well under a second even unoptimised. The bound
+    // is deliberately loose for a slow CI runner — it only trips if an O(n)
+    // recount sneaks back onto the per-frame path.
+    let s = two_hundred_thousand_lines();
+    let doc = s.active_doc();
+    let lines = doc.line_count();
+    assert_eq!(lines, 200_001);
+
+    let started = Instant::now();
+    let mut checksum = 0usize;
+    for frame in 0..10_000usize {
+        // Walk the caret across the whole document so the line index is
+        // binary-searched at many depths, not just at one hot entry.
+        let caret = doc.offset_at((frame * 7919) % lines, frame % 30);
+        let st = status(doc, caret, None);
+        checksum += st.chars + st.words + st.lines + st.line + st.column;
+        checksum += usize::from(doc.dirty());
+    }
+    let elapsed = started.elapsed();
+    assert!(checksum > 0);
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "10_000 status()+dirty() calls took {elapsed:?}: a per-frame recount is back (#126)"
+    );
+
+    // The cached numbers are the real ones.
+    let text = doc.content();
+    let st = status(doc, text.len(), None);
+    assert_eq!(st.chars, text.chars().count());
+    assert_eq!(st.words, 200_000 * 5 + 1); // five per line, plus the appended "x"
+    assert_eq!(st.lines, 200_001);
+    assert_eq!((st.line, st.column), (200_001, 2)); // after the trailing "x"
+    // And the indexed conversions agree with the pure scanning helpers.
+    for line in [0, 1, 99_999, 200_000, 999_999] {
+        assert_eq!(doc.line_start(line), goto_line_offset(text, line + 1));
+        assert_eq!(doc.offset_at(line, 7), find::offset_at(text, line, 7));
+    }
+    for offset in [0, 27, text.len() / 2, text.len(), usize::MAX] {
+        assert_eq!(doc.line_col_of(offset), find::line_col_of(text, offset));
+    }
+}
+
+#[test]
+fn typing_into_a_200k_line_document_keeps_the_cached_totals_exact() {
+    // Keystrokes arrive as the whole new text; the document must update its
+    // totals from the diff'd span alone (#126) and stay exact while the edits
+    // land mid-document, where every later line start has to shift. Chars and
+    // lines are re-derived cheaply after each keystroke; the (expensive) word
+    // oracle runs at the end over the final text.
+    let mut s = two_hundred_thousand_lines();
+    let mut caret = s.active_doc().line_start(100_000); // a byte offset
+    let mut text = s.active_doc().content().to_string();
+    for ch in "don't 你好 😀\n".chars().cycle().take(120) {
+        text.insert(caret, ch);
+        caret += ch.len_utf8();
+        update(&mut s, Message::Edited(text.clone()));
+        let doc = s.active_doc();
+        assert_eq!(doc.content(), text);
+        assert_eq!(doc.char_count(), text.chars().count());
+        assert_eq!(doc.line_count(), find::line_count(&text));
+        assert_eq!(
+            doc.line_start(100_001),
+            find::goto_line_offset(&text, 100_002)
+        );
+    }
+    let doc = s.active_doc();
+    assert_eq!(
+        doc.word_count(),
+        unicode_segmentation::UnicodeSegmentation::unicode_words(text.as_str()).count()
+    );
+    // Undo the whole typing run: the counts walk back to the loaded baseline.
+    for _ in 0..200 {
+        update(&mut s, Message::Undo);
+    }
+    let doc = s.active_doc();
+    assert!(!doc.dirty());
+    assert_eq!(doc.line_count(), 200_001);
+    assert_eq!(doc.word_count(), 200_000 * 5);
 }
 
 // ---- Bracket matching (#41) ----

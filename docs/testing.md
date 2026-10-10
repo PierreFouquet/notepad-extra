@@ -12,7 +12,7 @@ display**.
 | Layer | Where | Run it |
 | --- | --- | --- |
 | Unit tests | `#[cfg(test)]` in each `crates/core/src/*.rs` | `cargo test -p notepad-core` |
-| Property tests (`proptest`) | `app.rs` `mod tests` | `cargo test -p notepad-core` |
+| Property tests (`proptest`) | `app.rs` / `document.rs` `mod tests` | `cargo test -p notepad-core` |
 | Adversarial / stress | `crates/core/tests/stress.rs` | `cargo test -p notepad-core --test stress` |
 | Fuzzing (`cargo-fuzz`) | `crates/core/fuzz/` | see below (nightly) |
 | Coverage gate | `scripts/coverage.sh` | `scripts/coverage.sh` |
@@ -25,12 +25,25 @@ CI wires all of these together in [`.github/workflows/native-ci.yml`](../.github
 
 - No message stream can empty the document list or push `active` out of bounds.
 - Loading content then saving reproduces the original bytes exactly (either EOL).
+- The `Document`'s cached character / word / line totals, line-start index and
+  dirty flag (#126) equal a from-scratch recount after **every** message path
+  that rewrites a buffer — edit, undo/redo, replace-next/all, text operations,
+  load, reload, save, encoding change — over a "seam" alphabet (newlines,
+  apostrophes, CJK, emoji, regional indicators, joiners, combining marks); and
+  the indexed `(line, column)` conversions agree with the pure `find::*`
+  helpers for any text and any (even out-of-range or mid-glyph) arguments
+  (`document.rs` `mod tests`).
 
 ## Adversarial / stress
 
 Hundreds of open operations, million-line pastes, and rapid tab churn — asserting
 the core stays panic-free and structurally sound. Catastrophic-regex cases join
 this file once find/replace (#33) exists.
+
+It also pins the per-frame cost the status bar depends on (#126): ten thousand
+`status()` + `dirty()` calls on a 200k-line document must finish inside a loose
+wall-clock bound that the old recount-per-call code would miss by orders of
+magnitude, so a full recount cannot silently return to the redraw path.
 
 ## Fuzzing
 
@@ -106,7 +119,7 @@ make.
 | DoD requirement | Covered by |
 | --- | --- |
 | Unit tests on pure logic | per-module `mod tests` |
-| Property-based tests (`proptest`) | `app.rs` proptests |
+| Property-based tests (`proptest`) | `app.rs` and `document.rs` proptests |
 | Adversarial / stress | `tests/stress.rs` |
 | Edge & error paths | `io.rs` (bad UTF-8, missing file), `text.rs` |
 | Fuzz targets (`cargo-fuzz`) | `fuzz/fuzz_targets/*` |

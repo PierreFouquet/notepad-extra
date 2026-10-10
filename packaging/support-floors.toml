@@ -6,7 +6,10 @@
 # Paid or opt-in extension programmes do not count: Windows Extended Security
 # Updates, Debian LTS (volunteers / Freexian), Ubuntu Expanded Security
 # Maintenance. A Windows *version* counts as supported while any edition of it
-# (Home/Pro or Enterprise/Education) is still in standard support. Floors move on
+# (Home/Pro or Enterprise/Education) is still in standard support; the Long-Term
+# Servicing Channel does not count as such an edition (Microsoft reserves LTSC
+# for fixed-purpose devices, not general-purpose PCs), so an LTSC release in
+# support never holds the floor at an otherwise end-of-life version. Floors move on
 # the vendors' dates, so each one below records the date its vendor drops it and
 # the date to re-check it. Re-check every floor at each release and on each review
 # date; raising a floor is its own issue. The toolchain's own floors (winit:
@@ -47,7 +50,11 @@ macos_source_min_version_key = "https://developer.apple.com/documentation/bundle
 
 # ---- Windows -----------------------------------------------------------------
 # Windows 10 left standard support on 2025-10-14 (its consumer ESU, to
-# 2027-10-12, is excluded by policy). Windows 11 23H2 (build 10.0.22631): Home/Pro
+# 2027-10-12, is excluded by policy, and so are Windows 10 Enterprise LTSC 2021,
+# mainstream support to 2027-01-12, and IoT Enterprise LTSC 2021, to 2032-01-13:
+# LTSC is a fixed-purpose-device channel and does not hold the floor at 10).
+# Windows 11 Enterprise LTSC 2024 is build 26100 and passes the floor like any
+# 24H2. Windows 11 23H2 (build 10.0.22631): Home/Pro
 # ended 2025-11-11, Enterprise/Education run to 2026-11-10, so it is supported
 # under the any-edition rule. 24H2 (build 26100): Home/Pro to 2026-10-13,
 # Enterprise/Education to 2027-10-12. 25H2 (build 26200): Home/Pro to 2027-10-12,

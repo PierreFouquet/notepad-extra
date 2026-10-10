@@ -131,8 +131,10 @@ Artifacts produced:
 
 An OS release is supported for exactly as long as its vendor's standard support lasts: the
 day a release goes end-of-life it is no longer supported here, and paid or opt-in extensions
-(Windows ESU, Debian LTS, Ubuntu ESM) do not count. The floors therefore move on the vendors'
-dates:
+(Windows ESU, Debian LTS, Ubuntu ESM) do not count. Nor does the Windows Long-Term Servicing
+Channel, which Microsoft reserves for fixed-purpose devices: an LTSC release still in support
+does not keep an end-of-life Windows version on the list. The floors therefore move on the
+vendors' dates:
 
 | Platform | Minimum | Vendor support ends | Next review |
 | --- | --- | --- | --- |

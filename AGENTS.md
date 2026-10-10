@@ -182,6 +182,32 @@ whole document into words on every `view` (~50 ms at 200 000 lines).
 | Undo-depth eviction is O(1) (`VecDeque`). | `history.rs` | `coalescing_appends_in_place_and_keeps_the_step_id` + the existing cap tests |
 | Language detection is a hash lookup, not a scan of the syntax set. | `syntax/lib.rs` | `indexed_detection_matches_syntects_scans_for_every_known_token` |
 
+### Known costs, accepted
+
+Measured on the 200k-line / 12 MB fixture in a release build (#126's audit).
+Each is understood and either bounded or inherent; none is a bug to fix in
+passing, and a change that moves one is its own issue with its own numbers.
+
+- The find bar re-runs its regex pass over the whole document on every keystroke
+  while it is open: 19.6 ms at 12 MB for a case-insensitive literal with 200 000
+  hits. Closed, it costs nothing.
+- Bracket matching runs once per message (`Shell::readouts`) and walks from the
+  caret to its partner — the rest of the document for an unmatched opener: 11 ms
+  for a stray `(` at the top of 12 MB.
+- `vertical_extent` is O(lines) per frame with wrapping **on** (one fused pass,
+  0.78 ms at 200k lines); O(1) with wrapping off.
+- `Document::splice` recounts words over the whole touched line: 72 ms per
+  keystroke on a single 12 MB line, bounded by the single-line open guard
+  (`LARGE_FILE_LINE_BYTES`, 500 KB).
+- `refresh_dirty` falls through to a `memcmp` when an edit leaves the length and
+  the totals equal to the saved baseline's: +1.8 ms at 12 MB, kept for exactness
+  (§8).
+- cosmic-text shapes the whole buffer at open (6.5 s + 4.6 s and +7.5 GB of RSS
+  at 200k lines, ≈56 µs and ≈37 KB per line) and, with wrapping off, relayouts
+  every shaped line on any viewport size change (≈550 ms per resize event at
+  200k lines). Inherent to the widget; the large-file guard (`LARGE_FILE_LINES`
+  50 000, `LARGE_FILE_BYTES` 8 MiB, `LARGE_FILE_LINE_BYTES` 500 KB) is the lever.
+
 ### Adding a cache or a fast path
 
 Do both of these, every time:

@@ -57,6 +57,10 @@ Everything stays offline and pure-Rust (fancy-regex, no oniguruma C dependency).
 
 ## Development
 
+Contributing — the process (issues, branches, PRs, CI), the architecture to preserve, the
+performance budgets every change is measured against, and the exact checks to run — is in
+[`AGENTS.md`](AGENTS.md). It applies to coding agents and humans alike; read it first.
+
 ### Prerequisites
 
 - Rust (latest stable) via [rustup](https://rustup.rs/)
@@ -155,6 +159,7 @@ build runner and this README in step with it. Raising a floor is its own issue.
 ## Project layout
 
 ```text
+AGENTS.md                # Contributor & coding-agent guide: process, architecture, performance model, checks
 Cargo.toml               # Cargo workspace root (virtual manifest — shared version & profiles)
 crates/syntax/           # Shared syntect-backed language catalogue
 crates/core/             # Pure update core (State / Message / Effect) — no window, no GPU

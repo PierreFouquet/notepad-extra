@@ -111,6 +111,15 @@ jobs:
           tool: cargo-llvm-cov
       - name: coverage gate
         run: bash scripts/coverage.sh --summary-only
+      # The same gate with a single proptest case (#142): coverage must not
+      # depend on what the property tests happen to draw. The seed is pinned so
+      # a result reproduces locally and the job cannot flake; local runs leave
+      # it random to try other draws.
+      - name: coverage gate, one proptest case
+        run: bash scripts/coverage.sh --summary-only
+        env:
+          PROPTEST_CASES: "1"
+          PROPTEST_RNG_SEED: "1"
 
   fuzz:
     name: "core — fuzz targets"

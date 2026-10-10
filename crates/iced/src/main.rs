@@ -1113,18 +1113,36 @@ impl Shell {
     /// itself already repaints. The first arrives on *every* pointer motion over
     /// the editor, so nudging it would force a full-window software repaint on
     /// each one — the very churn the nudge exists to avoid. Neither can move the
-    /// caret or touch a document, so neither can stale the readouts. Skipping
-    /// both lets those frames take iced's cheap no-damage path; every message
-    /// that can change a pixel still nudges, and every one that can move the
-    /// caret or change the document still refreshes.
+    /// caret or touch a document, so neither can stale the readouts, and both
+    /// skip the nudge and the refresh. The scroll messages ([`Message::ScrollNudge`],
+    /// [`Message::ScrollSettle`] and the widget's `Scroll` action) are the other
+    /// way round: they exist to repaint, so they keep the nudge, but they cannot
+    /// move the caret either, so they skip the refresh — otherwise one wheel tick
+    /// would run the bracket scan up to five times, three of them per frame.
+    /// Every other message is a potential state change and does both.
     fn update(&mut self, message: Message) -> Task<Message> {
         let changes_state = !matches!(
             message,
             Message::EditorCursorMoved(_) | Message::WindowResized(_)
         );
+        // Scrolling needs the nudge (that is what `ScrollNudge` and the
+        // `ScrollSettle` frames exist for) but moves no caret and touches no
+        // document, so the readouts stay valid. One wheel tick is a `Scroll`
+        // action, a nudge and three settle frames; refreshing on each would run
+        // the bracket scan — O(document) for an unmatched opener — up to five
+        // times per tick, three of them once per frame (#126).
+        let moves_caret_or_text = changes_state
+            && !matches!(
+                message,
+                Message::ScrollNudge
+                    | Message::ScrollSettle
+                    | Message::Edit(text_editor::Action::Scroll { .. })
+            );
         let task = self.dispatch(message);
         if changes_state {
             self.repaint_nudge = !self.repaint_nudge;
+        }
+        if moves_caret_or_text {
             self.refresh_readouts();
         }
         task
@@ -5688,6 +5706,26 @@ mod tests {
             "a resize must not recompute the readouts either"
         );
         assert!(shell.active_bracket().is_none());
+        // Scrolling repaints but moves no caret: a wheel tick's `Scroll` action,
+        // the nudge it sends and the settle frames that follow all leave the
+        // cache alone (#126) — they would otherwise run the bracket scan up to
+        // five times per tick.
+        for message in [
+            Message::Edit(text_editor::Action::Scroll { lines: 1 }),
+            Message::ScrollNudge,
+            Message::ScrollSettle,
+        ] {
+            let _ = shell.update(message);
+            assert_eq!(
+                (shell.status().line, shell.status().column),
+                (2, 5),
+                "scrolling must not recompute the status readout"
+            );
+            assert!(
+                shell.active_bracket().is_none(),
+                "scrolling must not recompute the bracket readout"
+            );
+        }
 
         // Any other message is a potential state change and refreshes the cache
         // from the live caret.

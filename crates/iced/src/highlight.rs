@@ -83,6 +83,15 @@ fn convert_color(c: syntect::highlighting::Color) -> Color {
 /// that worst case; the memory is already small at 32, so the cheaper edit wins.
 const CHECKPOINT_INTERVAL: usize = 32;
 
+/// Capacity (in spans) above which the reusable span buffer is handed back after
+/// an ordinary line, and the capacity it is trimmed to (#126). A span is a byte
+/// range plus a style, ~32 bytes; 4096 of them is 128 KB — the worst an ordinary
+/// source line could plausibly need, and nothing beside a pathological line ever
+/// reaches it. Trimming to 1024 rather than to the line's own length keeps the
+/// next few lines from growing the buffer again one doubling at a time.
+const SPANS_SHRINK_ABOVE: usize = 4096;
+const SPANS_KEEP: usize = 1024;
+
 /// A snapshot of the parser and highlighter state *at the start* of a line.
 /// Both syntect types are `Clone`, which is what makes a checkpoint possible.
 #[derive(Debug, Clone)]
@@ -203,6 +212,15 @@ impl highlighter::Highlighter for SyntectHighlighter {
             RangedHighlightIterator::new(&mut self.state.highlight, &ops, line, &self.inner)
                 .map(|(style, _text, range)| (range, Highlight(style))),
         );
+        // A reused buffer keeps the capacity of the *longest* line it ever saw:
+        // one multi-megabyte line yields tens of thousands of spans (~32 B
+        // each), and without this the tens of MB stayed pinned for the life of
+        // the highlighter while every later line used a few hundred bytes of it
+        // (#126). Give it back once an ordinary line follows; the hysteresis
+        // between the two sizes keeps a typical buffer from ever reallocating.
+        if self.spans.capacity() > SPANS_SHRINK_ABOVE && self.spans.len() <= SPANS_KEEP {
+            self.spans.shrink_to(SPANS_KEEP);
+        }
 
         self.current_line += 1;
         if self.current_line.is_multiple_of(CHECKPOINT_INTERVAL) {
@@ -295,6 +313,39 @@ mod tests {
             .iter()
             .any(|(_, h)| to_format(h, &iced::Theme::Light).color.unwrap() != kw_color);
         assert!(differs, "highlighting should use more than one colour");
+    }
+
+    /// The reusable span buffer gives back the capacity of an enormous line once
+    /// an ordinary line follows (#126): one multi-megabyte line would otherwise
+    /// pin tens of MB of span storage for the life of the highlighter.
+    #[test]
+    fn the_span_buffer_gives_back_the_capacity_of_an_enormous_line() {
+        let mut hl = SyntectHighlighter::new(&settings("Rust"));
+        let enormous = "1 + ".repeat(4_000);
+        let spans = hl.highlight_line(&enormous).count();
+        assert!(
+            spans > SPANS_SHRINK_ABOVE,
+            "the fixture must overflow the shrink threshold, got {spans} spans"
+        );
+        let pinned = hl.spans.capacity();
+        assert!(
+            pinned >= spans,
+            "the buffer holds the enormous line's spans"
+        );
+
+        let short: Vec<_> = hl.highlight_line("fn main() {}").collect();
+        assert!(!short.is_empty() && short.len() <= SPANS_KEEP);
+        assert!(
+            hl.spans.capacity() <= SPANS_SHRINK_ABOVE,
+            "capacity {} is still the enormous line's ({pinned}) after a short line",
+            hl.spans.capacity()
+        );
+        assert!(
+            hl.spans.capacity() >= SPANS_KEEP,
+            "the trim keeps room for ordinary lines, not just this one"
+        );
+        // The short line's spans are the usual ones, untouched by the trim.
+        assert_eq!(short.last().map(|(r, _)| r.end), Some("fn main() {}".len()));
     }
 
     /// The reported regression: a TOML buffer must actually highlight (the

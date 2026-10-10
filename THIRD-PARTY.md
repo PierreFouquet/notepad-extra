@@ -32,6 +32,25 @@ metadata` by [`scripts/license-audit.sh`](scripts/license-audit.sh) — see
   in the `GPL-3.0-or-later` combined work; the MIT notice governs the vendored
   portions themselves.
 
+### `vendor/cosmic-text/` — cosmic-text 0.15.0, patched
+
+- **Upstream:** [cosmic-text](https://github.com/pop-os/cosmic-text) **0.15.0**
+  as published on crates.io (upstream git `c82ee1c`). The workspace substitutes
+  it for the crates.io release through `[patch.crates-io]` in the root
+  `Cargo.toml`.
+- **License:** **MIT OR Apache-2.0**, as upstream. Both licence files,
+  `LICENSE-MIT` and `LICENSE-APACHE`, are kept unchanged in `vendor/cosmic-text/`.
+- **Local changes:** one upstream commit,
+  [`1e0074c`](https://github.com/pop-os/cosmic-text/commit/1e0074c83926041c16f9ee76afafe91819927013),
+  applied verbatim to `src/shape.rs`. It stops a line that mixes bidi paragraph
+  directions from panicking the text widgets (#149). The published manifest's
+  test, bench and dev-dependency sections are dropped, and the tests, benches,
+  fonts and screenshots are not copied. Provenance, the exact diff and when to
+  drop the copy are in
+  [vendor/cosmic-text/VENDORED.md](vendor/cosmic-text/VENDORED.md).
+- **Combined-work licensing:** both licences are GPL-compatible; the crate's
+  own notice governs the vendored code.
+
 ## Vendored assets
 
 ### `crates/iced/fonts/dejavu-sans-mono/` — DejaVu Sans Mono

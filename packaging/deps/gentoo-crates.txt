@@ -31,7 +31,6 @@ clipboard_wayland@0.2.2
 clipboard_x11@0.4.3
 core_detect@1.0.0
 core_maths@0.1.1
-cosmic-text@0.15.0
 cpufeatures@0.2.17
 crc32fast@1.5.2
 crypto-common@0.1.7

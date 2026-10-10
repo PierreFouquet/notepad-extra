@@ -16,7 +16,8 @@ Companion documents, each authoritative for its area: [`README.md`](README.md)
 (build, run, release), [`docs/testing.md`](docs/testing.md) (test standard),
 [`docs/native-rendering.md`](docs/native-rendering.md) (drawing traps in the
 render shell), [`crates/iced/VENDORED.md`](crates/iced/VENDORED.md) (the forked
-`text_editor` widget), [`.github/pull_request_template.md`](.github/pull_request_template.md)
+`text_editor` widget), [`vendor/cosmic-text/VENDORED.md`](vendor/cosmic-text/VENDORED.md)
+(the patched cosmic-text crate), [`.github/pull_request_template.md`](.github/pull_request_template.md)
 (what a PR must declare).
 
 ## 1. Non-negotiables
@@ -328,6 +329,18 @@ cargo audit                                   # RustSec advisories (needs cargo-
   xkbcommon libraries) must have that library named in the deb `depends` and rpm
   `requires` in `crates/iced/Cargo.toml` and in the README's Linux prerequisites;
   the packaging clean-install smokes are the check (#131 did this for `libdbus-1`).
+- **Patched crates.** Stay on the newest release of each crate that the rest of
+  the graph allows. When that release still has a bug that hits us and upstream
+  has a fix, apply
+  upstream's commit to a copy under `vendor/<crate>/`, substituted with
+  `[patch.crates-io]` in the root `Cargo.toml`. Each copy carries a `VENDORED.md`
+  naming the upstream commit, the exact diff and the condition for deleting it,
+  plus a `// NOTEPAD-EXTRA(#NN)` marker at each change. `vendor/` is excluded from
+  the workspace, so our fmt / clippy / test gates do not run over upstream code.
+  Today: `vendor/cosmic-text` (#149). A patched crate drops out of the Gentoo
+  download list but stays in the RPM bundled provides (`scripts/packaging-deps.sh`),
+  and `cargo audit` no longer checks it against RustSec, so watch its upstream
+  advisories by hand.
 - **Vendored widget.** Every divergence from upstream iced is marked
   `// NOTEPAD-EXTRA(#NN): reason` and listed in `crates/iced/VENDORED.md`. Tests
   in `text_editor.rs` enforce that the markers are well-formed, that one sits

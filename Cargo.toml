@@ -8,7 +8,22 @@
 # workspace is now native-only.
 [workspace]
 members = ["crates/syntax", "crates/core", "crates/iced"]
+# `vendor/` holds patched third-party crates (see [patch.crates-io] below). They
+# are dependencies, not workspace members: our fmt / clippy / test gates do not
+# apply to upstream code.
+exclude = ["vendor"]
 resolver = "2"
+
+# cosmic-text 0.15.0 asserts that every bidi paragraph on one buffer line has
+# the same direction, so a line such as "abc\u{2029}שלום" panics the text
+# widgets on open or paste (#149). iced 0.14, the newest iced release, needs
+# cosmic-text 0.15, and every cosmic-text release through 0.19.0 still has the
+# assert. Upstream fixed it on `main` in 1e0074c, so `vendor/cosmic-text` is
+# 0.15.0 with exactly that commit applied (vendor/cosmic-text/VENDORED.md).
+# Drop this patch once the iced release used here depends on a cosmic-text
+# release that contains 1e0074c.
+[patch.crates-io]
+cosmic-text = { path = "vendor/cosmic-text" }
 
 # One product version for the whole workspace: every native crate inherits it via
 # `version.workspace = true`, so a release bump has a single source of truth and

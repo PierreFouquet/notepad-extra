@@ -1866,11 +1866,12 @@ impl Shell {
             }
             // Turn a byte range into an editor selection (or a bare caret when
             // empty, e.g. go-to-line). The core hands us offsets on the same
-            // canonical text the editor holds; `line_col_of` converts them to the
-            // (line, byte-column) the widget's cursor speaks.
+            // canonical text the editor holds; the document's indexed
+            // `line_col_of` converts them to the (line, byte-column) the widget's
+            // cursor speaks without rescanning the text (#126).
             Effect::RevealRange { start, end } => {
-                let content = self.core.active_doc().content();
-                let (sl, sc) = core::find::line_col_of(content, start);
+                let doc = self.core.active_doc();
+                let (sl, sc) = doc.line_col_of(start);
                 let cursor = if start == end {
                     Cursor {
                         position: Position {
@@ -1880,7 +1881,7 @@ impl Shell {
                         selection: None,
                     }
                 } else {
-                    let (el, ec) = core::find::line_col_of(content, end);
+                    let (el, ec) = doc.line_col_of(end);
                     Cursor {
                         position: Position {
                             line: el,
@@ -1940,16 +1941,14 @@ impl Shell {
     /// The status-bar readout for the active document, derived from the pure
     /// core plus the editor widget's live caret/selection. Headless-testable:
     /// `text_editor::Content::cursor()` needs no renderer. The widget speaks in
-    /// `(line, byte-column)`, which `offset_at` turns into the byte offsets the
-    /// core's [`core::status`] expects.
+    /// `(line, byte-column)`, which the document's indexed `offset_at` turns
+    /// into the byte offsets the core's [`core::status`] expects — O(1) per
+    /// conversion, since this runs on every redraw (#126).
     fn status(&self) -> core::StatusBar {
         let doc = self.core.active_doc();
         let cursor = self.active_editor().cursor();
-        let caret =
-            core::find::offset_at(doc.content(), cursor.position.line, cursor.position.column);
-        let anchor = cursor
-            .selection
-            .map(|a| core::find::offset_at(doc.content(), a.line, a.column));
+        let caret = doc.offset_at(cursor.position.line, cursor.position.column);
+        let anchor = cursor.selection.map(|a| doc.offset_at(a.line, a.column));
         core::status(doc, caret, anchor)
     }
 
@@ -1958,28 +1957,28 @@ impl Shell {
     /// (no renderer needed, so it stays headless-testable) and is what a line/
     /// text operation (#54) is scoped to — the core widens or clamps it.
     fn selection_range(&self) -> Option<(usize, usize)> {
-        let content = self.core.active_doc().content();
+        let doc = self.core.active_doc();
         let cursor = self.active_editor().cursor();
-        let caret = core::find::offset_at(content, cursor.position.line, cursor.position.column);
-        let anchor = cursor
-            .selection
-            .map(|a| core::find::offset_at(content, a.line, a.column))?;
+        let caret = doc.offset_at(cursor.position.line, cursor.position.column);
+        let anchor = cursor.selection.map(|a| doc.offset_at(a.line, a.column))?;
         Some((anchor, caret))
     }
 
     /// The bracket pair to highlight for the active document (#41), derived from
     /// the pure core plus the editor widget's live caret. Mirrors [`Shell::status`]:
     /// it reads the caret (no renderer needed, so this is headless-testable),
-    /// turns it into a byte offset with `find::offset_at`, asks the core which
-    /// brackets match, and maps the result back to the widget's `(line, column)`
-    /// positions with `find::line_col_of` — the same conversion `RevealRange` uses.
+    /// turns it into a byte offset with the document's indexed `offset_at`, asks
+    /// the core which brackets match, and maps the result back to the widget's
+    /// `(line, column)` positions with its `line_col_of` — the same conversion
+    /// `RevealRange` uses, and O(1)/O(log n) per call because this too runs on
+    /// every redraw (#126).
     fn active_bracket(&self) -> Option<BracketHighlight> {
-        let content = self.core.active_doc().content();
+        let doc = self.core.active_doc();
         let cursor = self.active_editor().cursor();
-        let caret = core::find::offset_at(content, cursor.position.line, cursor.position.column);
-        let m = core::brackets::match_at(content, caret)?;
+        let caret = doc.offset_at(cursor.position.line, cursor.position.column);
+        let m = core::brackets::match_at(doc.content(), caret)?;
         let to_pos = |off: usize| {
-            let (line, column) = core::find::line_col_of(content, off);
+            let (line, column) = doc.line_col_of(off);
             Position { line, column }
         };
         Some(BracketHighlight {

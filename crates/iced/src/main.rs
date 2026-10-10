@@ -29,6 +29,7 @@ use notepad_core as core;
 use notepad_core::{DiskMeta, DiskStatus, Effect, FindOption, TabId};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 // Vendored copy of iced 0.14's `text_editor`, extended with a visible vertical
 // scrollbar (#34) — the stock widget renders none and exposes no scroll offset.
@@ -1057,10 +1058,7 @@ impl Shell {
     /// widget in [`Shell::view`]; [`Shell::theme`] derives the coarse `iced::Theme`
     /// from the same choice for the widgets we don't hand-style.
     fn tokens(&self) -> theme::Tokens {
-        match self.core.theme() {
-            core::ThemeMode::Light => theme::LIGHT,
-            core::ThemeMode::Dark => theme::DARK,
-        }
+        tokens_for(self.core.theme())
     }
 
     /// The application background style. Painted from the token `app_bg` (#70) so
@@ -1083,21 +1081,13 @@ impl Shell {
     /// selection) still land in the right colours. iced reads this every frame, so a
     /// theme toggle repaints the chrome; the editor's syntect highlight theme is
     /// paired separately in [`Shell::view`] via the same `ThemeMode`.
+    ///
+    /// A clone of a theme built once per mode ([`app_theme`]): `iced::Theme`'s
+    /// custom variant is an `Arc`, so the per-frame cost is one reference-count
+    /// bump instead of a `String`, an `Arc` and a full extended-palette
+    /// generation (#126).
     fn theme(&self) -> iced::Theme {
-        let t = self.tokens();
-        iced::Theme::custom(
-            "Notepad Extra".to_owned(),
-            iced::theme::Palette {
-                background: t.app_bg,
-                text: t.text,
-                primary: t.accent,
-                success: t.accent,
-                // `Tokens` carries no distinct warning colour; the danger red
-                // doubles for it (nothing in the chrome uses `warning`).
-                warning: t.danger,
-                danger: t.danger,
-            },
-        )
+        app_theme(self.core.theme())
     }
 
     /// The active tab's editor buffer. Its key is present by invariant:
@@ -3250,7 +3240,7 @@ fn is_group_header(label: &str) -> bool {
 /// `pick_list` has no native option groups, so headers are rendered as (inert)
 /// entries — good-enough parity with the old grouped `<optgroup>` dropdown.
 fn language_options() -> &'static [String] {
-    static OPTS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    static OPTS: OnceLock<Vec<String>> = OnceLock::new();
     OPTS.get_or_init(|| {
         let mut opts = vec![
             AUTO_DETECT_LABEL.to_string(),
@@ -3268,7 +3258,7 @@ fn language_options() -> &'static [String] {
 /// so the shell and core never drift. `pick_list` wants owned `String`s, and the
 /// status bar's selection is the active document's label, also a `String`.
 fn encoding_options() -> &'static [String] {
-    static OPTS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    static OPTS: OnceLock<Vec<String>> = OnceLock::new();
     OPTS.get_or_init(|| {
         core::encoding::options()
             .iter()
@@ -3330,7 +3320,7 @@ const TEXT_OPS_PLACEHOLDER: &str = "Text ops…";
 /// [`textop_from_label`] recognises. Built once; `pick_list` wants owned
 /// `String`s.
 fn textop_options() -> &'static [String] {
-    static OPTS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    static OPTS: OnceLock<Vec<String>> = OnceLock::new();
     OPTS.get_or_init(|| {
         [
             &group_header("Sort") as &str,
@@ -3393,6 +3383,52 @@ fn textop_from_label(label: &str) -> Option<core::TextOp> {
         "Spaces → Tabs" => SpacesToTabs { width },
         _ => return None,
     })
+}
+
+/// The chrome colour tokens for `mode` (#70): the one mapping from the core's
+/// light/dark [`core::ThemeMode`] to a [`theme::Tokens`] set, shared by
+/// [`Shell::tokens`] and [`app_theme`] so the hand-styled chrome and the coarse
+/// `iced::Theme` can never disagree about which palette is active.
+fn tokens_for(mode: core::ThemeMode) -> theme::Tokens {
+    match mode {
+        core::ThemeMode::Light => theme::LIGHT,
+        core::ThemeMode::Dark => theme::DARK,
+    }
+}
+
+/// The app's custom `iced::Theme` for `mode` (#36/#70), built **once** per mode
+/// and shared from then on (#126).
+///
+/// `iced::Theme::custom` allocates the name and an `Arc<Custom>` and runs
+/// `palette::Extended::generate` — dozens of colour mixes covering every widget
+/// state — and iced asks the application for its theme on every frame, so
+/// building it per call paid all of that several times a second while idle.
+/// Only two themes can ever exist (one per mode, from `const` tokens), so each
+/// lives in a `OnceLock` and callers receive an `Arc` clone.
+fn app_theme(mode: core::ThemeMode) -> iced::Theme {
+    static LIGHT: OnceLock<iced::Theme> = OnceLock::new();
+    static DARK: OnceLock<iced::Theme> = OnceLock::new();
+    let cell = match mode {
+        core::ThemeMode::Light => &LIGHT,
+        core::ThemeMode::Dark => &DARK,
+    };
+    cell.get_or_init(|| {
+        let t = tokens_for(mode);
+        iced::Theme::custom(
+            APP_NAME.to_owned(),
+            iced::theme::Palette {
+                background: t.app_bg,
+                text: t.text,
+                primary: t.accent,
+                success: t.accent,
+                // `Tokens` carries no distinct warning colour; the danger red
+                // doubles for it (nothing in the chrome uses `warning`).
+                warning: t.danger,
+                danger: t.danger,
+            },
+        )
+    })
+    .clone()
 }
 
 /// The display name shown in the window title and the About panel (#40).
@@ -5232,6 +5268,37 @@ mod tests {
         // The toggle left the live buffer and its dirty flag untouched.
         assert_eq!(shell.active_editor().text().trim_end(), "keep me");
         assert!(shell.core.active_doc().dirty());
+    }
+
+    #[test]
+    fn the_iced_theme_is_built_once_per_mode_and_shared_across_frames() {
+        // iced asks for the theme on every frame (#126): each mode must come back
+        // as a clone of one shared `Arc`, not a freshly generated palette per call.
+        let same = |a: &iced::Theme, b: &iced::Theme| match (a, b) {
+            (iced::Theme::Custom(a), iced::Theme::Custom(b)) => Arc::ptr_eq(a, b),
+            _ => panic!("the app theme is always the custom variant"),
+        };
+        let (mut shell, _) = Shell::new();
+        let light = shell.theme();
+        assert!(
+            same(&light, &shell.theme()),
+            "two frames in light mode share one theme"
+        );
+
+        let _ = shell.update(Message::ToggleTheme);
+        let dark = shell.theme();
+        assert!(!same(&light, &dark), "dark mode is a different theme");
+        assert_eq!(dark.palette().background, theme::DARK.app_bg);
+        assert!(
+            same(&dark, &shell.theme()),
+            "two frames in dark mode share one theme"
+        );
+
+        let _ = shell.update(Message::ToggleTheme);
+        assert!(
+            same(&light, &shell.theme()),
+            "toggling back reuses the light theme rather than rebuilding it"
+        );
     }
 
     #[test]

@@ -414,7 +414,8 @@ enum Message {
     /// The drag left the window without dropping (#42): lower the overlay.
     FilesHoveredLeft,
     /// A chosen file finished loading from disk. The result is the raw bytes so
-    /// the encoding is auto-detected here ([`core::encoding::decode`], #50); a
+    /// the encoding is auto-detected here ([`core::encoding::decode_owned`], #50,
+    /// which takes the buffer by value so a UTF-8 file is never copied, #126); a
     /// read error still carries only the I/O failure (missing / directory /
     /// permission) — a binary or non-UTF-8 file reads back fine and opens lossily.
     FileRead {
@@ -429,7 +430,7 @@ enum Message {
     LargeOpenCancelled,
     /// Document `id` was re-read for a *reopen* under a user-chosen encoding
     /// ([`Message::ReopenAs`]). The raw bytes are *strictly* re-decoded here with
-    /// [`core::encoding::decode_strict`]: if they are not valid in that encoding
+    /// [`core::encoding::decode_strict_owned`]: if they are not valid in that encoding
     /// the reopen is refused (banner set, buffer untouched), mirroring how a lossy
     /// save is blocked. A read error is likewise surfaced in the banner.
     FileReloaded {
@@ -467,7 +468,7 @@ enum Message {
     /// Document `id` was re-read for a *reload from disk* after an external change
     /// ([`Effect::ReloadFile`]). Unlike the strict [`Message::FileReloaded`] reopen,
     /// the bytes are decoded *tolerantly* under the tab's encoding
-    /// ([`core::encoding::decode_with`]) — a reload reopens the file as-is, it must
+    /// ([`core::encoding::decode_with_owned`]) — a reload reopens the file as-is, it must
     /// not fail on bytes that don't fit. A read error is surfaced in the banner.
     DiskReloaded {
         id: TabId,
@@ -1150,13 +1151,16 @@ impl Shell {
             Message::FileRead { path, result } => match result {
                 Ok(bytes) => {
                     self.error = None;
-                    // Auto-detect the encoding from the raw bytes (#50); a binary
-                    // or non-UTF-8 file decodes lossily rather than erroring (#59).
-                    let (content, encoding) = core::encoding::decode(&bytes);
                     // Fingerprint the file now, while we hold its bytes, so the
                     // external-change watch has a baseline from the moment the tab
-                    // opens (#51) — no second read.
+                    // opens (#51) — no second read. This goes first: the decode
+                    // below consumes the buffer.
                     let disk = Some(watch::fingerprint(&path, &bytes));
+                    // Auto-detect the encoding from the raw bytes (#50); a binary
+                    // or non-UTF-8 file decodes lossily rather than erroring (#59).
+                    // By value, so the common case — valid UTF-8 — becomes the
+                    // buffer `String` with no copy at all (#126).
+                    let (content, encoding) = core::encoding::decode_owned(bytes);
                     // Large-file guard (#102): the vendored editor shapes every
                     // line up front, so a huge file is slow to open. Stash the
                     // decoded buffer and ask before loading rather than freezing
@@ -1217,27 +1221,30 @@ impl Shell {
                 encoding,
                 result,
             } => match result {
-                // Keep the raw bytes so we can both strictly re-decode them *and*
-                // fingerprint the file for the external-change baseline (#51).
-                Ok(bytes) => match core::encoding::decode_strict(&bytes, encoding) {
-                    Ok((content, encoding)) => {
-                        self.error = None;
-                        let disk = self.disk_fingerprint(id, &bytes);
-                        self.apply_core(
-                            core::Message::FileReloaded {
-                                id,
-                                content,
-                                encoding,
-                                disk,
-                            },
-                            true,
-                        )
+                // Fingerprint the file for the external-change baseline (#51)
+                // *before* the strict re-decode, which takes the bytes by value so
+                // a valid UTF-8 reopen is the buffer itself, uncopied (#126).
+                Ok(bytes) => {
+                    let disk = self.disk_fingerprint(id, &bytes);
+                    match core::encoding::decode_strict_owned(bytes, encoding) {
+                        Ok((content, encoding)) => {
+                            self.error = None;
+                            self.apply_core(
+                                core::Message::FileReloaded {
+                                    id,
+                                    content,
+                                    encoding,
+                                    disk,
+                                },
+                                true,
+                            )
+                        }
+                        Err(e) => {
+                            self.error = Some(e);
+                            Task::none()
+                        }
                     }
-                    Err(e) => {
-                        self.error = Some(e);
-                        Task::none()
-                    }
-                },
+                }
                 Err(e) => {
                     self.error = Some(e);
                     Task::none()
@@ -1255,8 +1262,10 @@ impl Shell {
             } => match result {
                 Ok(bytes) => {
                     self.error = None;
-                    let (content, encoding) = core::encoding::decode_with(&bytes, encoding);
+                    // Fingerprint first (#51): the decode consumes the buffer so a
+                    // UTF-8 reload is never copied (#126).
                     let disk = self.disk_fingerprint(id, &bytes);
+                    let (content, encoding) = core::encoding::decode_with_owned(bytes, encoding);
                     self.apply_core(
                         core::Message::FileReloaded {
                             id,

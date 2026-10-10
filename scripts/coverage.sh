@@ -35,22 +35,23 @@ trap 'rm -f "$COV_JSON"' EXIT
 # the one the rest of CI just tested.
 LOCKED=(--locked)
 
-# 0. Drop the raw profile data of any earlier run (#142). `--no-report` adds to
-#    what is already in the target directory rather than replacing it, so a
-#    second run in the same target directory would report the union of both: a
-#    `PROPTEST_CASES=1` check straight after a full run would pass on lines only
-#    the full run reached. `--profraw-only` removes just that data. The older
-#    cargo-llvm-cov that CI's install-action resolves (0.5.x) lacks the flag,
-#    so fall back to `--workspace` there: it removes the same data but also the
-#    instrumented core and syntax builds, which then rebuild. The help text is
-#    captured first and not piped to `grep -q`: an early exit would raise
-#    SIGPIPE, and with `pipefail` that reads as "flag missing".
-clean_help="$(cargo llvm-cov clean --help)"
-if [[ "$clean_help" == *--profraw-only* ]]; then
-    cargo llvm-cov clean --profraw-only "${LOCKED[@]}"
-else
-    cargo llvm-cov clean --workspace "${LOCKED[@]}"
-fi
+# 0. Start from a clean instrumented target: drop both the raw profile data and
+#    the instrumented builds of the workspace crates that earlier runs left.
+#    - The profile data (#142): `--no-report` adds to what is already in the
+#      target directory rather than replacing it, so a second run would report
+#      the union of both. A `PROPTEST_CASES=1` check straight after a full run
+#      would pass on lines only the full run reached.
+#    - The builds (#154): `report` maps coverage over every instrumented test
+#      binary in the target directory, not just the ones this run executed. A
+#      build under another hash (a new toolchain, another cargo-llvm-cov
+#      version) writes its binaries under new names beside the old ones. Every
+#      function in an old binary counts as never run, and once the source has
+#      moved on since that build, its regions land on other lines: a fully
+#      tested file read 50 %. `--profraw-only` kept those binaries, so it is
+#      not used.
+#    `--workspace` removes both and keeps the dependencies' builds, so a run
+#    recompiles only the workspace crates.
+cargo llvm-cov clean --workspace "${LOCKED[@]}"
 
 # 1. Run both suites once under instrumentation, keeping the raw profile data so
 #    the reports below don't re-run the tests.

@@ -832,6 +832,18 @@ mod tests {
         assert_eq!(d.saved.text, None);
         assert!(!d.dirty());
         d.assert_derived_data_matches_recount();
+        // ...and a reload from disk while dirty: the new text is the baseline.
+        assert!(d.commit("edited again".into()));
+        assert!(d.saved.text.is_some());
+        d.load(
+            "on disk".into(),
+            EndOfLine::Lf,
+            FileEncoding::default(),
+            None,
+        );
+        assert_eq!(d.saved.text, None);
+        assert!(!d.dirty());
+        d.assert_derived_data_matches_recount();
     }
 
     #[test]

@@ -428,7 +428,7 @@ fn to_match(m: regex::Match) -> Match {
 
 /// Round `i` down to the nearest char boundary (clamped to `text.len()`), so an
 /// arbitrary offset is always safe to hand to the regex engine or to slice.
-/// Shared with [`crate::status`], which floors widget-supplied offsets too.
+/// Shared with [`crate::status()`], which floors widget-supplied offsets too.
 pub(crate) fn floor_boundary(text: &str, i: usize) -> usize {
     if i >= text.len() {
         return text.len();

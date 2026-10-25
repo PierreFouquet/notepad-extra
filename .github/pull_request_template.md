@@ -2,10 +2,9 @@
 Thanks for contributing to Notepad Extra!
 
 This one template covers both regular changes and plugin submissions.
-👉 Fill in "All PRs" below, then KEEP the ONE section that matches your PR and
-   DELETE the other:
-     • Code / docs / packaging change  → keep "Regular change", delete "Plugin submission"
-     • Submitting a plugin             → keep "Plugin submission", delete "Regular change"
+👉 Fill in "All PRs" below, then:
+     • Code / docs / packaging change  → delete the "Plugin submission" section
+     • Submitting a plugin             → fill in "Plugin submission" as well
 -->
 
 # All PRs

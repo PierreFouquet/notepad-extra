@@ -52,6 +52,14 @@ The full list, with the exact commands, is `AGENTS.md` §6; run it on the newest
 - [ ] Shell touched: windowed smoke `xvfb-run -a timeout 10 ./target/debug/notepad-extra` exits 124 — or N/A.
 - [ ] Packaging metadata still validates if touched (`appstreamcli validate --no-net …`, `desktop-file-validate …`); the `packaging.yml` jobs are green on the PR.
 
+## Reviews
+
+`AGENTS.md` §2 "Reviews": two full reviews, then one review per part of the change (up to four), fixing between rounds.
+
+- [ ] Two full reviews ran, the second after the first one's fixes.
+- [ ] Chunked reviews ran, one per part: …
+- [ ] Findings outside the change were fixed here under their issue, or filed as their own issue: …
+
 ## Project constraints
 
 - [ ] **Fully offline** — no new runtime network of any kind (no CDN fonts, telemetry, or update pings; fonts bundled as bytes) and it still builds offline from vendored crates.

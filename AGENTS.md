@@ -4,7 +4,7 @@ Instructions for every contributor to this repository, coding agents first. Read
 this file before changing anything. `CLAUDE.md` imports it; keep all rules here.
 
 - §1 Non-negotiables (read even if you read nothing else)
-- §2 Development process: issues, branches, PRs, CI
+- §2 Development process: issues, branches, reviews, PRs, CI
 - §3 Architecture you must preserve
 - §4 Performance model: budgets per code path and the invariants tests pin
 - §5 Where code and tests go
@@ -68,6 +68,36 @@ render shell), [`crates/iced/VENDORED.md`](crates/iced/VENDORED.md) (the forked
    the same branch. Never skip, disable or quarantine a test to get green; never
    push an empty commit or close/reopen to re-run CI. If a failure is also red on
    `main`, say so in the PR instead of retrying.
+7. **Review the change before its PR.** Two full reviews, then a review of each
+   part of the change on its own, fixing what each round finds before the next
+   (see "Reviews" below).
+
+### Reviews
+
+A change is reviewed in rounds before its PR is opened. Each round is done by a
+reviewer with no part in writing the change: a person, or a separate agent that
+starts from the diff, the issues and this file rather than from the author's
+account of the change, so its read is not anchored on the author's. Check every
+finding against the code before acting on it, then fix it or answer it with the
+reason it stands. Re-run the §6 checks the fixes touch before the next round
+starts, so each round reviews the change as fixed.
+
+1. **Two full reviews, one after the other.** Each reads the whole change against
+   `main`: the code, the tests, the docs, the commit messages and the issues it
+   closes, held against this file. The second starts only once the first one's
+   findings are fixed, so it also catches what those fixes broke.
+2. **Then chunked reviews: one per part of the change, up to four.** Split the
+   change along its parts, for example the implementation; its tests and
+   coverage; the docs, commit messages and issue texts; lockfiles and packaging
+   inventories. Each chunk is reviewed on its own, closely enough to check every
+   line, which a review of the whole change cannot afford. A small change has
+   fewer parts and gets fewer chunked reviews.
+3. **Findings outside the change.** A small fix goes in the same PR, as its own
+   commit under the issue it belongs to (open one if none fits, rule 1). Anything
+   larger gets its own issue with the evidence. When unsure which it is, ask the
+   person you work for.
+
+The PR says which rounds ran and what they changed.
 
 ### If you can create branches on `origin`
 
@@ -75,11 +105,12 @@ render shell), [`crates/iced/VENDORED.md`](crates/iced/VENDORED.md) (the forked
    Branch from it: `git checkout -b <type>/<short-topic>` (types in §7).
 2. Do the work on that branch: small conventional commits with the tests §5 and §6
    require.
-3. Push the branch: `git push -u origin <branch>`.
-4. **Once prompted, and only once prompted** (rule 2), open the PR. Fill in the PR
+3. Review it in rounds ("Reviews" above) and commit the fixes.
+4. Push the branch: `git push -u origin <branch>`.
+5. **Once prompted, and only once prompted** (rule 2), open the PR. Fill in the PR
    template: what & why, `Closes #N`, the test-driven Definition of Done, the local
-   checks you ran, the project constraints. Request review.
-5. Wait for the workflow runs. Fix anything red and push until they are green
+   checks you ran, the reviews that ran, the project constraints. Request review.
+6. Wait for the workflow runs. Fix anything red and push until they are green
    (rule 6). The PR then waits for review and the merge decision (rule 3).
 
 ### If you work from a fork
@@ -91,22 +122,23 @@ here constrains what you do inside your own fork.
 1. Fork the repository, or sync your fork's `main` with upstream `main`.
 2. Do the work **on a branch in your fork**, not on its `main`, so the fork stays
    syncable.
-3. Push the branch to your fork (your clone's `origin`; the main repository is
+3. Review it in rounds ("Reviews" above) and commit the fixes.
+4. Push the branch to your fork (your clone's `origin`; the main repository is
    `upstream`).
-4. **Once prompted** (rule 2), open a **cross-fork PR on the upstream repository**
+5. **Once prompted** (rule 2), open a **cross-fork PR on the upstream repository**
    — base `PierreFouquet/notepad-extra:main`, head `<your-fork>:<branch>` — as a
    **draft**, so it is reviewed upstream like any other PR.
-5. Watch the workflow runs and fix what comes up, pushing to the same branch.
+6. Watch the workflow runs and fix what comes up, pushing to the same branch.
    GitHub does not run workflows for a first-time contributor's fork until a
    maintainer approves the run, so the draft may wait on that.
-6. Once the run is green, mark the PR ready for review.
+7. Once the run is green, mark the PR ready for review.
 
 ### Coding agents
 
 - Work only on the branch you were given. Never push to another branch.
 - Never open or merge a PR on your own initiative (rules 2 and 3). End with pushed
   commits and a report that lists: what changed, the commands you ran and their
-  results, and anything left undone.
+  results, the review rounds and what they found, and anything left undone.
 - When asked to drive an existing PR: address review comments with new commits
   (never rewrite history on a shared branch), keep CI green per rule 6, stop when
   asked.

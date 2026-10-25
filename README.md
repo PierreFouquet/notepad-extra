@@ -82,8 +82,9 @@ Windows and macOS need no extra system packages; they use their native window an
 ### Run & build
 
 ```bash
-cargo run --package notepad-iced              # run the app
-cargo build --release --package notepad-iced  # optimised binary → target/release/notepad-extra
+cargo run                # run the app
+cargo run -- notes.txt   # run the app and open files
+cargo build --release    # optimised binary → target/release/notepad-extra
 ```
 
 The built binary is named `notepad-extra`. Native installers are produced by the

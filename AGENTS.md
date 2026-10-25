@@ -114,7 +114,7 @@ here constrains what you do inside your own fork.
 
 ## 3. Architecture you must preserve
 
-```
+```text
 crates/syntax   notepad-syntax  syntect-backed language catalogue; exposes &'static str names only
 crates/core     notepad-core    pure MVU core: update(&mut State, Message) -> Vec<Effect>; no I/O, no window
 crates/iced     notepad-iced    thin iced shell: renders State, executes Effects, owns the editor buffers

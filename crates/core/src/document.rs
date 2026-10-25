@@ -102,9 +102,10 @@ pub struct Document {
     /// trailing `\n` yields a final empty line). Binary-searched by the
     /// `(line, column)` conversions and spliced by incremental edits (#126).
     line_starts: Vec<usize>,
-    /// The last content that was saved to disk, with its own totals and the
-    /// encoding it was written with. Deciding whether the buffer still matches
-    /// it is what the "•" marker means.
+    /// The text as last loaded from or saved to disk (held only while it
+    /// differs from `content`), its totals and the encoding it was written
+    /// with. Deciding whether the buffer still matches it is what the "•"
+    /// marker means.
     saved: Baseline,
 }
 
@@ -143,10 +144,11 @@ struct Baseline {
     /// content differs from disk", the cached half of [`Document::dirty`]
     /// (#126), re-derived on every mutation and never a hash.
     text: Option<String>,
-    /// `text`'s totals, kept so a dirty refresh can rule out equality without
-    /// reading the bytes (a different count means different text).
+    /// The saved text's totals (the content's while `text` is `None`), kept so
+    /// a dirty refresh can rule out equality without reading the bytes (a
+    /// different count means different text).
     totals: Totals,
-    /// `text`'s line count, for the same cheap pre-check.
+    /// The saved text's line count, for the same cheap pre-check.
     lines: usize,
     /// The encoding the baseline was written with. Choosing a different save
     /// encoding on an otherwise unchanged buffer still marks it dirty (a
@@ -498,6 +500,13 @@ impl Document {
     /// Recount everything from scratch and assert the cached values match: the
     /// oracle the invalidation proptests run after every message (#126), kept
     /// here so the private fields need no accessors.
+    ///
+    /// The dirty flag is not checked here: a clean document holds no copy of
+    /// its saved text (#140), so nothing inside it can tell "byte-equal to the
+    /// saved bytes" from "a refresh missed an edit". The proptests keep the
+    /// saved text themselves and compare [`Document::dirty`] to it
+    /// (`incremental_splices_match_a_full_recount`, and the app's
+    /// `cached_totals_match_a_recount_after_every_rewrite_path`).
     #[cfg(test)]
     pub(crate) fn assert_derived_data_matches_recount(&self) {
         assert_eq!(
@@ -518,11 +527,6 @@ impl Document {
             self.saved.text.as_deref(),
             Some(self.content.as_str()),
             "a clean document holds a second copy of its text (#140)"
-        );
-        assert_eq!(
-            self.dirty(),
-            self.content != saved || self.encoding != self.saved.encoding,
-            "dirty flag drifted"
         );
     }
 }

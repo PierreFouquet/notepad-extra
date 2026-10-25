@@ -4578,8 +4578,10 @@ mod tests {
         /// The invalidation pin for #126: after **every** path that rewrites a
         /// buffer — edits, undo/redo, replace-next/all, text operations, load,
         /// reload, save, encoding changes, new/selected tabs — every document's
-        /// cached chars / words / lines / line index / dirty flag equals a
-        /// from-scratch recount, and `status()` reports those same numbers. The
+        /// cached chars / words / lines / line index equals a from-scratch
+        /// recount, its dirty flag matches the test's own record of what each
+        /// tab last loaded or saved (#140), and `status()` reports those same
+        /// numbers. The
         /// seam alphabet (newlines, apostrophes, CJK, emoji, regional
         /// indicators, joiners, combining marks, a lone CR) is chosen so the
         /// per-line word recount is exercised at every awkward UAX #29 boundary.
@@ -4587,8 +4589,18 @@ mod tests {
         fn cached_totals_match_a_recount_after_every_rewrite_path(
             steps in prop::collection::vec(arb_rewrite(), 0..40),
         ) {
+            use std::collections::HashMap;
             use unicode_segmentation::UnicodeSegmentation;
+            // Each tab's saved text and encoding, as of its last load, reload or
+            // save: the dirty flag's reference, kept out here because a clean
+            // document holds no copy of it (#140).
+            fn rebaseline(s: &State, saved: &mut HashMap<TabId, (String, FileEncoding)>) {
+                let doc = s.active_doc();
+                saved.insert(doc.id, (doc.content().to_string(), doc.encoding));
+            }
             let mut s = State::default();
+            let mut saved = HashMap::new();
+            rebaseline(&s, &mut saved);
             update(&mut s, Message::FindOpened); // so replace-next / replace-all act
             for step in steps {
                 match step {
@@ -4620,6 +4632,7 @@ mod tests {
                     }
                     Rewrite::Load(text) => {
                         load(&mut s, "/t/loaded.txt", &text);
+                        rebaseline(&s, &mut saved);
                     }
                     Rewrite::Reload(content) => {
                         let id = s.active_doc().id;
@@ -4629,6 +4642,7 @@ mod tests {
                             encoding: FileEncoding::default(),
                             disk: None,
                         });
+                        rebaseline(&s, &mut saved);
                     }
                     Rewrite::Save => {
                         let id = s.active_doc().id;
@@ -4637,20 +4651,29 @@ mod tests {
                             path: PathBuf::from("/t/saved.txt"),
                             disk: None,
                         });
+                        rebaseline(&s, &mut saved);
                     }
                     Rewrite::SetEncoding(label) => {
                         update(&mut s, Message::SetEncoding(label.to_string()));
                     }
                     Rewrite::NewTab => {
                         update(&mut s, Message::NewTab);
+                        rebaseline(&s, &mut saved);
                     }
                     Rewrite::SelectTab(i) => {
                         update(&mut s, Message::TabSelected(i));
                     }
                 }
                 for doc in &s.docs {
-                    // The private-field oracle (dirty flag included)...
+                    // The private-field oracle...
                     doc.assert_derived_data_matches_recount();
+                    // ...the dirty flag against the model's saved text...
+                    let (text, encoding) = &saved[&doc.id];
+                    prop_assert_eq!(
+                        doc.dirty(),
+                        doc.content() != text || doc.encoding != *encoding,
+                        "dirty flag drifted"
+                    );
                     // ...and the public readers, spelled out against the
                     // definitions the status bar used to compute per frame.
                     let text = doc.content();

@@ -8,7 +8,7 @@ Gentoo #13) and the umbrella dependency strategy (#17). Regenerate with
 
 - **Resolved for target:** `x86_64-unknown-linux-gnu` (the Linux source distros' build target;
   Windows/macOS-only crates are excluded).
-- **External crates:** 230 (the three workspace crates are ours, GPL-3.0-or-later).
+- **External crates:** 239 (the three workspace crates are ours, GPL-3.0-or-later).
 - **Vendored code + font** (iced `text_editor` fork, DejaVu Sans Mono) are not
   crates — see [THIRD-PARTY.md](../THIRD-PARTY.md) (#77).
 - **Per-distro dependency lists** (Gentoo `CRATES=`, RPM bundled `Provides:`)
@@ -22,11 +22,11 @@ shipped under their permissive branch.
 
 | SPDX expression | Crates |
 | --- | ---: |
-| MIT OR Apache-2.0 | 97 |
-| MIT | 63 |
-| Apache-2.0 OR MIT | 17 |
+| MIT OR Apache-2.0 | 102 |
+| MIT | 64 |
+| Apache-2.0 OR MIT | 19 |
 | MIT/Apache-2.0 | 10 |
-| Apache-2.0 | 7 |
+| Apache-2.0 | 8 |
 | MIT OR Apache-2.0 OR Zlib | 4 |
 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | 4 |
 | Zlib OR Apache-2.0 OR MIT | 3 |
@@ -62,10 +62,14 @@ shipped under their permissive branch.
 | autocfg | 1.5.1 | Apache-2.0 OR MIT |
 | base64 | 0.23.1 | MIT OR Apache-2.0 |
 | bincode | 1.3.3 | MIT |
+| bit-set | 0.11.1 | Apache-2.0 OR MIT |
 | bit-set | 0.8.0 | Apache-2.0 OR MIT |
+| bit-vec | 0.10.1 | Apache-2.0 OR MIT |
 | bit-vec | 0.8.0 | Apache-2.0 OR MIT |
 | bitflags | 2.13.2 | MIT OR Apache-2.0 |
 | block-buffer | 0.10.4 | MIT OR Apache-2.0 |
+| borsh | 1.8.1 | MIT OR Apache-2.0 |
+| borsh-derive | 1.8.1 | Apache-2.0 |
 | bytemuck | 1.25.2 | Zlib OR Apache-2.0 OR MIT |
 | bytemuck_derive | 1.12.1 | Zlib OR Apache-2.0 OR MIT |
 | bytes | 1.12.1 | MIT |
@@ -73,9 +77,10 @@ shipped under their permissive branch.
 | calloop | 0.14.5 | MIT |
 | calloop-wayland-source | 0.3.0 | MIT |
 | calloop-wayland-source | 0.4.1 | MIT |
-| cc | 1.7.0 | MIT OR Apache-2.0 |
+| cc | 1.10.0 | MIT OR Apache-2.0 |
 | cfg-if | 1.0.5 | MIT OR Apache-2.0 |
 | cfg_aliases | 0.2.2 | MIT |
+| chacha20 | 0.10.2 | MIT OR Apache-2.0 |
 | chardetng | 1.0.0 | Apache-2.0 OR MIT |
 | clipboard_wayland | 0.2.2 | Apache-2.0 |
 | clipboard_x11 | 0.4.3 | MIT |
@@ -83,27 +88,28 @@ shipped under their permissive branch.
 | core_maths | 0.1.1 | MIT |
 | cosmic-text | 0.15.0 | MIT OR Apache-2.0 |
 | cpufeatures | 0.2.17 | MIT OR Apache-2.0 |
-| crc32fast | 1.5.2 | MIT OR Apache-2.0 |
+| cpufeatures | 0.3.1 | MIT OR Apache-2.0 |
+| crc32fast | 1.5.3 | MIT OR Apache-2.0 |
 | crypto-common | 0.1.7 | MIT OR Apache-2.0 |
 | ctor | 0.10.1 | Apache-2.0 OR MIT |
 | cursor-icon | 1.2.0 | MIT OR Apache-2.0 OR Zlib |
-| deranged | 0.5.8 | MIT OR Apache-2.0 |
+| deranged | 0.5.9 | MIT OR Apache-2.0 |
 | digest | 0.10.7 | MIT OR Apache-2.0 |
 | dlib | 0.5.3 | MIT |
 | downcast-rs | 1.2.1 | MIT/Apache-2.0 |
 | dpi | 0.1.2 | Apache-2.0 AND MIT |
 | dtor | 0.8.1 | Apache-2.0 OR MIT |
 | encoding_rs | 0.8.42 | (Apache-2.0 OR MIT) AND BSD-3-Clause |
-| equivalent | 1.0.2 | Apache-2.0 OR MIT |
+| equivalent | 1.0.3 | Apache-2.0 OR MIT |
 | errno | 0.3.14 | MIT OR Apache-2.0 |
 | fancy-regex | 0.16.2 | MIT |
 | fastrand | 2.5.0 | Apache-2.0 OR MIT |
 | fdeflate | 0.3.7 | MIT OR Apache-2.0 |
-| find-msvc-tools | 0.1.14 | MIT OR Apache-2.0 |
+| find-msvc-tools | 0.1.15 | MIT OR Apache-2.0 |
 | flate2 | 1.1.10 | MIT OR Apache-2.0 |
 | fnv | 1.0.7 | Apache-2.0 / MIT |
 | font-types | 0.10.1 | MIT OR Apache-2.0 |
-| font-types | 0.12.6 | MIT OR Apache-2.0 |
+| font-types | 0.12.7 | MIT OR Apache-2.0 |
 | fontconfig-parser | 0.5.8 | MIT |
 | fontdb | 0.23.0 | MIT |
 | futures | 0.3.34 | MIT OR Apache-2.0 |
@@ -142,7 +148,7 @@ shipped under their permissive branch.
 | itoa | 1.0.18 | MIT OR Apache-2.0 |
 | jobserver | 0.1.35 | MIT OR Apache-2.0 |
 | kurbo | 0.10.4 | MIT OR Apache-2.0 |
-| libc | 0.2.190 | MIT OR Apache-2.0 |
+| libc | 0.2.191 | MIT OR Apache-2.0 |
 | libloading | 0.8.9 | ISC |
 | libm | 0.2.16 | MIT |
 | lilt | 0.8.2 | MIT |
@@ -152,13 +158,13 @@ shipped under their permissive branch.
 | linux-raw-sys | 0.4.15 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT |
 | log | 0.4.34 | MIT OR Apache-2.0 |
 | memchr | 2.8.3 | Unlicense OR MIT |
-| memmap2 | 0.9.11 | MIT OR Apache-2.0 |
+| memmap2 | 0.9.12 | MIT OR Apache-2.0 |
 | miniz_oxide | 0.8.9 | MIT OR Zlib OR Apache-2.0 |
 | miniz_oxide | 0.9.1 | MIT OR Zlib OR Apache-2.0 |
 | mio | 1.2.4 | MIT |
 | multiversion_no_op | 1.0.0 | Apache-2.0 OR MIT |
 | nom | 8.0.0 | MIT |
-| notify | 8.2.0 | CC0-1.0 |
+| notify | 8.2.1 | CC0-1.0 |
 | notify-types | 2.1.0 | MIT OR Apache-2.0 |
 | num-conv | 0.2.2 | MIT OR Apache-2.0 |
 | num-traits | 0.2.19 | MIT OR Apache-2.0 |
@@ -167,22 +173,21 @@ shipped under their permissive branch.
 | percent-encoding | 2.3.2 | MIT OR Apache-2.0 |
 | pin-project-lite | 0.2.17 | Apache-2.0 OR MIT |
 | pkg-config | 0.3.34 | MIT OR Apache-2.0 |
-| plist | 1.10.1 | MIT |
+| plist | 1.10.3 | MIT |
 | png | 0.18.1 | MIT OR Apache-2.0 |
 | polling | 3.11.0 | Apache-2.0 OR MIT |
 | pollster | 0.4.0 | Apache-2.0/MIT |
 | powerfmt | 0.2.1 | MIT OR Apache-2.0 |
-| ppv-lite86 | 0.2.21 | MIT OR Apache-2.0 |
+| proc-macro-crate | 3.5.0 | MIT OR Apache-2.0 |
 | proc-macro2 | 1.0.107 | MIT OR Apache-2.0 |
-| proptest | 1.11.0 | MIT OR Apache-2.0 |
+| proptest | 1.12.0 | MIT OR Apache-2.0 |
 | quick-error | 1.2.3 | MIT/Apache-2.0 |
 | quick-xml | 0.41.0 | MIT |
 | quick-xml | 0.42.0 | MIT |
 | quote | 1.0.47 | MIT OR Apache-2.0 |
-| rand | 0.9.5 | MIT OR Apache-2.0 |
-| rand_chacha | 0.9.0 | MIT OR Apache-2.0 |
-| rand_core | 0.9.5 | MIT OR Apache-2.0 |
-| rand_xorshift | 0.4.0 | MIT OR Apache-2.0 |
+| rand | 0.10.3 | MIT OR Apache-2.0 |
+| rand_core | 0.10.1 | MIT OR Apache-2.0 |
+| rand_xorshift | 0.5.0 | MIT OR Apache-2.0 |
 | rangemap | 1.8.0 | MIT/Apache-2.0 |
 | raw-window-handle | 0.6.2 | MIT OR Apache-2.0 OR Zlib |
 | read-fonts | 0.35.0 | MIT OR Apache-2.0 |
@@ -206,7 +211,7 @@ shipped under their permissive branch.
 | serde | 1.0.229 | MIT OR Apache-2.0 |
 | serde_core | 1.0.229 | MIT OR Apache-2.0 |
 | serde_derive | 1.0.229 | MIT OR Apache-2.0 |
-| serde_json | 1.0.151 | MIT OR Apache-2.0 |
+| serde_json | 1.0.154 | MIT OR Apache-2.0 |
 | sha2 | 0.10.9 | MIT OR Apache-2.0 |
 | shlex | 2.0.1 | MIT OR Apache-2.0 |
 | simd-adler32 | 0.3.10 | MIT |
@@ -215,7 +220,7 @@ shipped under their permissive branch.
 | skrifa | 0.44.0 | MIT OR Apache-2.0 |
 | slab | 0.4.12 | MIT |
 | slotmap | 1.1.1 | Zlib |
-| smallvec | 1.16.3 | MIT OR Apache-2.0 |
+| smallvec | 1.16.4 | MIT OR Apache-2.0 |
 | smithay-client-toolkit | 0.19.2 | MIT |
 | smithay-client-toolkit | 0.20.0 | MIT |
 | smithay-clipboard | 0.7.3 | MIT |
@@ -224,7 +229,7 @@ shipped under their permissive branch.
 | strict-num | 0.1.1 | MIT |
 | swash | 0.2.10 | Apache-2.0 OR MIT |
 | syn | 2.0.119 | MIT OR Apache-2.0 |
-| syn | 3.0.7 | MIT OR Apache-2.0 |
+| syn | 3.0.9 | MIT OR Apache-2.0 |
 | syntect | 5.3.0 | MIT |
 | sys-locale | 0.3.2 | MIT OR Apache-2.0 |
 | tempfile | 3.27.0 | MIT OR Apache-2.0 |
@@ -239,6 +244,9 @@ shipped under their permissive branch.
 | tiny-skia-path | 0.11.4 | BSD-3-Clause |
 | tiny-xlib | 0.2.5 | MIT OR Apache-2.0 OR Zlib |
 | tinyvec | 1.13.3 | Zlib OR Apache-2.0 OR MIT |
+| toml_datetime | 1.1.2+spec-1.1.0 | MIT OR Apache-2.0 |
+| toml_edit | 0.25.17+spec-1.1.0 | MIT OR Apache-2.0 |
+| toml_parser | 1.1.5+spec-1.1.0 | MIT OR Apache-2.0 |
 | tracing | 0.1.44 | MIT |
 | tracing-attributes | 0.1.31 | MIT |
 | tracing-core | 0.1.36 | MIT |
@@ -247,7 +255,7 @@ shipped under their permissive branch.
 | typenum | 1.20.1 | MIT OR Apache-2.0 |
 | unarray | 0.1.4 | MIT OR Apache-2.0 |
 | unicode-bidi | 0.3.18 | MIT OR Apache-2.0 |
-| unicode-ident | 1.0.26 | (MIT OR Apache-2.0) AND Unicode-3.0 |
+| unicode-ident | 1.0.27 | (MIT OR Apache-2.0) AND Unicode-3.0 |
 | unicode-linebreak | 0.1.5 | Apache-2.0 |
 | unicode-script | 0.5.8 | MIT OR Apache-2.0 |
 | unicode-segmentation | 1.13.3 | MIT OR Apache-2.0 |
@@ -268,6 +276,7 @@ shipped under their permissive branch.
 | web-time | 1.1.0 | MIT OR Apache-2.0 |
 | window_clipboard | 0.5.1 | MIT |
 | winit | 0.30.13 | Apache-2.0 |
+| winnow | 1.0.4 | MIT |
 | x11-dl | 2.21.0 | MIT |
 | x11rb | 0.13.2 | MIT OR Apache-2.0 |
 | x11rb-protocol | 0.13.2 | MIT OR Apache-2.0 |
@@ -277,7 +286,7 @@ shipped under their permissive branch.
 | yaml-rust | 0.4.5 | MIT/Apache-2.0 |
 | yazi | 0.2.1 | Apache-2.0 OR MIT |
 | zeno | 0.3.3 | Apache-2.0 OR MIT |
-| zerocopy | 0.8.62 | BSD-2-Clause OR Apache-2.0 OR MIT |
-| zerocopy-derive | 0.8.62 | BSD-2-Clause OR Apache-2.0 OR MIT |
+| zerocopy | 0.8.63 | BSD-2-Clause OR Apache-2.0 OR MIT |
+| zerocopy-derive | 0.8.63 | BSD-2-Clause OR Apache-2.0 OR MIT |
 | zlib-rs | 0.6.8 | Zlib |
 | zmij | 1.0.23 | MIT |

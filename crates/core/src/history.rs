@@ -150,8 +150,10 @@ enum Clean {
     Gone,
 }
 
-/// The undo/redo history for one [`crate::Document`]. Also the single source of
-/// truth for the unsaved-changes ("•") flag via [`History::dirty`].
+/// The undo/redo history for one [`crate::Document`]. It tracks where the
+/// saved state sits in the stack ([`History::dirty`]), but the unsaved-changes
+/// ("•") flag is [`crate::Document::dirty`], which compares content, not stack
+/// position, so typing a change and deleting it again reads as clean.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct History {
     /// Oldest at the front, newest at the back. A deque, not a `Vec`, because

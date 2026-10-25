@@ -57,9 +57,10 @@ Everything stays offline and pure-Rust (fancy-regex, no oniguruma C dependency).
 
 ## Development
 
-Contributing — the process (issues, branches, PRs, CI), the architecture to preserve, the
-performance budgets every change is measured against, and the exact checks to run — is in
-[`AGENTS.md`](AGENTS.md). It applies to coding agents and humans alike; read it first.
+Contributing — the process (issues, branches, reviews, PRs, CI), the architecture to
+preserve, the performance budgets every change is measured against, and the exact checks to
+run — is in [`AGENTS.md`](AGENTS.md). It applies to coding agents and humans alike; read it
+first.
 
 ### Prerequisites
 

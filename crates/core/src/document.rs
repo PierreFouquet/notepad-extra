@@ -141,8 +141,10 @@ struct Baseline {
     /// the old text over (by move when the edit adopts a whole new text, by
     /// one clone when undo/redo rewrites in place), and an edit back onto the
     /// saved bytes drops the copy again. So `text.is_some()` is exactly "the
-    /// content differs from disk", the cached half of [`Document::dirty`]
-    /// (#126), re-derived on every mutation and never a hash.
+    /// content differs from what was last loaded or saved" (not from the file
+    /// as it is now, which may have changed since), the cached half of
+    /// [`Document::dirty`] (#126), re-derived on every mutation and never a
+    /// hash.
     text: Option<String>,
     /// The saved text's totals (the content's while `text` is `None`), kept so
     /// a dirty refresh can rule out equality without reading the bytes (a
@@ -953,11 +955,11 @@ mod tests {
         }
 
         /// Random single-span edits applied directly through `commit`, with the
-        /// cached totals, index and dirty flag checked against a from-scratch
-        /// recount after every one, then undone and redone all the way. The
-        /// dirty flag is also checked against the loaded text the test keeps
-        /// itself, since the document holds its own copy only while dirty
-        /// (#140) and the recount can only see that copy.
+        /// cached totals and index checked against a from-scratch recount after
+        /// every one, then undone and redone all the way. The dirty flag is
+        /// checked against the loaded text the test keeps itself: a clean
+        /// document holds no copy of its saved text (#140), so the recount
+        /// cannot check it.
         #[test]
         fn incremental_splices_match_a_full_recount(
             base in seam_text(40),

@@ -508,10 +508,12 @@ impl Document {
     /// oracle the invalidation proptests run after every message (#126), kept
     /// here so the private fields need no accessors.
     ///
-    /// The dirty flag is not checked here: a clean document holds no copy of
-    /// its saved text (#140), so nothing inside it can tell "byte-equal to the
-    /// saved bytes" from "a refresh missed an edit". The proptests keep the
-    /// saved text themselves and compare [`Document::dirty`] to it
+    /// Only half of the dirty flag can be checked here: a copy held as the
+    /// baseline must differ from the content (the last assert). The other half
+    /// needs the saved text, which a clean document no longer holds (#140), so
+    /// nothing inside it can tell "byte-equal to the saved bytes" from "a
+    /// refresh missed an edit". The proptests keep the saved text themselves
+    /// and compare [`Document::dirty`] to it
     /// (`incremental_splices_match_a_full_recount`, and the app's
     /// `cached_totals_match_a_recount_after_every_rewrite_path`).
     #[cfg(test)]

@@ -161,7 +161,7 @@ whole document into words on every `view` (~50 ms at 200 000 lines).
 | `Shell::update` / `Shell::dispatch` | every message | O(log n) lookups + O(viewport), plus the per-update readout refresh: O(selection) for the status bar and O(distance to the bracket partner) for bracket matching — O(document) for an unmatched opener, once per message, never per frame. On text holding a `\r`, each conversion between a core offset and an editor position walks the editor's lines instead, O(lines) (#153). |
 | edit path: `Message::Edit` → `Content::text()` → `core::Message::Edited` → `Document::commit` | every keystroke | O(n) is inherent (the widget hands over the whole text) but only with memcpy-class constants: one `text()` pass, one byte prefix/suffix `diff`, then **incremental** updates in O(edit + affected lines + the line starts after the edit — a memcpy-class shift of the index tail, 1.6 MB per keystroke at the top of 200k lines). No Unicode-aware full pass. |
 | rewrite path: undo / redo / replace / text operation → `Effect::ApplyEdit` → `Shell::apply_edit_to_buffer` | per command | O(n) memcpy-class in the core (the rewrite itself, its `diff`, the incremental `Document` update), then the exact edit spliced into the existing editor buffer: cosmic-text reshapes only the lines the edit touches, and the caret and view stay put unless the command reveals its result (#137). The splice finds its place through the line index, O(log n), or, when the document or the removed text holds a `\r` (the cached flag plus a scan of the removed text), through the editor's own lines, O(lines) (#153). |
-| load / reload / save | once per file | O(n), single pass, minimal copies: `encoding::decode_owned` (zero-copy UTF-8), `EndOfLine::normalize` (LF text untouched, CRLF compacted in place), fingerprint hashed before decode. |
+| load / reload / save | once per file | O(n), single pass, minimal copies: `encoding::decode_owned` (zero-copy UTF-8), `EndOfLine::normalize` (LF text untouched, CRLF compacted in place), fingerprint hashed before decode, and no copy of the text kept as the saved baseline (#140). |
 | highlighter | per visible line after an edit / scroll | parse from the nearest checkpoint; memory O(lines / 32). Exceptions tracked below: a forward jump past unparsed lines re-parses every skipped line (#138), and the state is per widget, not per tab (#144). |
 
 ### Invariants and the tests that pin them
@@ -171,7 +171,7 @@ whole document into words on every `view` (~50 ms at 200 000 lines).
 | `char_count`/`word_count`/`line_count`/`dirty`/`has_cr` are O(1), maintained incrementally on edit/undo/redo, recomputed once on full replacement. Word counts use `words(text) == Σ words(line)`: no UAX #29 word-like segment contains a `\n` (only `\n` and `\r\n` do — WB3 keeps CR LF together — and neither holds a word character), and segmentation restarts after a `\n` as at the start of text. | `document.rs` | `incremental_splices_match_a_full_recount`, `app::tests::cached_totals_match_a_recount_after_every_rewrite_path` (random `update()` paths vs a from-scratch recount), `stress::typing_into_a_200k_line_document_keeps_the_cached_totals_exact`, `the_cr_flag_follows_loads_edits_undo_and_redo`; cost pin `stress::the_cr_flag_on_a_200k_line_document_costs_nothing_per_message` (100 000 reads under 2 s; a scan per read took 37 s) |
 | `status()` is O(caret line + selection): totals from the cache, line/column from the line index. | `status.rs` | `stress::status_and_dirty_on_a_200k_line_document_cost_nothing_per_frame` (10 000 calls under a bound the old code missed by two orders of magnitude) |
 | `offset_at`/`line_col_of`/`line_start` are O(1)/O(log n) and agree with the pure `find::*` helpers, never panic on bad input. | `document.rs` | `indexed_position_maths_agree_with_the_pure_helpers` |
-| `dirty()` is exact ("content byte-equal to the saved baseline"), cached, refreshed only on mutation; compares length, then cached totals, then bytes. | `document.rs` | `dirty_refresh_short_circuits_on_length_totals_then_bytes`, `app::tests::reverting_to_the_saved_baseline_clears_the_dirty_marker` |
+| `dirty()` is exact ("content byte-equal to the saved baseline"), cached, refreshed only on mutation; compares length, then cached totals, then bytes. The baseline text is held as a copy exactly while it differs from the content: a load or save keeps none, the first edit away takes the old text by move (one clone for an undo/redo, which rewrites in place), and an edit back onto the saved bytes drops it (#140). | `document.rs` | `dirty_refresh_short_circuits_on_length_totals_then_bytes`, `app::tests::reverting_to_the_saved_baseline_clears_the_dirty_marker`, `a_clean_document_holds_no_baseline_copy_and_the_first_edit_moves_one_in` (the copy is the content's own allocation), `undo_or_redo_from_a_clean_document_copies_the_text_it_leaves`, `incremental_splices_match_a_full_recount` (dirty vs the loaded text the test keeps) |
 | The status-bar and bracket-match readouts (`Shell::readouts`) are computed once per `Shell::update` — every message except pointer tracking (`EditorCursorMoved`) and `WindowResized`, which skip the repaint nudge too, and the scroll messages (`ScrollNudge`, `ScrollSettle`, the widget's `Scroll` action), which repaint but cannot move the caret — and only *read* by `view`. | `main.rs` | `pointer_tracking_and_resizes_do_not_recompute_the_readouts`, `readouts_follow_caret_moves_edits_and_undo`, `readouts_follow_a_tab_switch`, `readouts_follow_a_find_reveal`, `readouts_follow_language_and_encoding_changes` |
 | The two `iced::Theme`s are built once per `ThemeMode` (`app_theme`) and handed out as `Arc` clones. | `main.rs` | `the_iced_theme_is_built_once_per_mode_and_shared_across_frames` |
 | `view` splits the tab strip once; clean tab titles are borrowed, only a dirty tab's "•" name allocates. | `main.rs` | `tab_names_borrow_clean_titles_and_allocate_only_the_dirty_marker` |
@@ -208,6 +208,10 @@ passing, and a change that moves one is its own issue with its own numbers.
 - `refresh_dirty` falls through to a `memcmp` when an edit leaves the length and
   the totals equal to the saved baseline's: +1.8 ms at 12 MB, kept for exactness
   (§8).
+- An undo or redo that leaves a clean document clones its text once to keep as
+  the saved baseline, because both rewrite the text in place (#140): 1.3 ms at
+  12 MB, once per departure from the saved state. It is the copy every load and
+  save used to make.
 - cosmic-text shapes the whole buffer at open (6.5 s + 4.6 s and +7.5 GB of RSS
   at 200k lines, ≈56 µs and ≈37 KB per line) and, with wrapping off, relayouts
   every shaped line on any viewport size change (≈550 ms per resize event at
@@ -239,8 +243,6 @@ do not add another without filing one.
   checkpoints only rewind.
 - #139 — with wrapping off, every resize event relayouts every shaped line
   (≈550 ms at 200k lines).
-- #140 — a clean document holds a second full copy of its text as the saved
-  baseline (12 MB per 12 MB document).
 - #144 — the highlighter state lives in the one editor widget and survives the
   tab switch, so same-language tabs share parser state (a bug, not a cost: an
   open block comment in one tab colours code in another).

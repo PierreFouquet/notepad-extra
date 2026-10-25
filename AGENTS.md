@@ -4,7 +4,7 @@ Instructions for every contributor to this repository, coding agents first. Read
 this file before changing anything. `CLAUDE.md` imports it; keep all rules here.
 
 - §1 Non-negotiables (read even if you read nothing else)
-- §2 Development process: issues, branches, PRs, CI
+- §2 Development process: issues, branches, reviews, PRs, CI
 - §3 Architecture you must preserve
 - §4 Performance model: budgets per code path and the invariants tests pin
 - §5 Where code and tests go
@@ -68,6 +68,40 @@ render shell), [`crates/iced/VENDORED.md`](crates/iced/VENDORED.md) (the forked
    the same branch. Never skip, disable or quarantine a test to get green; never
    push an empty commit or close/reopen to re-run CI. If a failure is also red on
    `main`, say so in the PR instead of retrying.
+7. **Review the change before its PR.** Two full reviews, then a review of each
+   part of the change on its own, fixing what each round finds before the next
+   (see "Reviews" below).
+
+### Reviews
+
+A change is reviewed in rounds before its PR is opened. Each round is done by a
+reviewer with no part in writing the change: a person, or a separate agent that
+starts from the diff, the issues and this file rather than from the author's
+account of the change, so its read is not anchored on the author's. Check every
+finding against the code before acting on it, then fix it or answer it with the
+reason it stands. Re-run the §6 checks the fixes touch before the next round
+starts, so each round reviews the change as fixed.
+
+1. **Two full reviews, one after the other.** Each reads the whole change against
+   its base (`main`, or the branch a stacked PR builds on): the code, the tests, the docs, the commit messages and the issues it
+   closes, held against this file. The second starts only once the first one's
+   findings are fixed, so it also catches what those fixes broke.
+2. **Then chunked reviews: one per part of the change, up to four.** Split the
+   change along its parts, for example the implementation; its tests and
+   coverage; the docs, commit messages and issue texts; lockfiles and packaging
+   inventories. Each chunk is reviewed on its own, closely enough to check every
+   line, which a review of the whole change cannot afford. A small change has
+   fewer parts and gets fewer chunked reviews. The chunks may be reviewed side
+   by side, since each reads a different part: together they are one round,
+   whose findings are fixed and re-checked before the PR.
+3. **Findings outside the change.** A small fix goes in the same PR, as its own
+   commit under the issue it belongs to (open one if none fits, rule 1). This
+   is an exception to rule 1, which lets only linked issues share a PR and
+   prefers stacked PRs even then: a PR of its own costs more than a few lines
+   are worth. Anything larger gets its own issue
+   with the evidence. When unsure which it is, ask the person you work for.
+
+The PR says which rounds ran and what they changed.
 
 ### If you can create branches on `origin`
 
@@ -76,10 +110,13 @@ render shell), [`crates/iced/VENDORED.md`](crates/iced/VENDORED.md) (the forked
 2. Do the work on that branch: small conventional commits with the tests §5 and §6
    require.
 3. Push the branch: `git push -u origin <branch>`.
-4. **Once prompted, and only once prompted** (rule 2), open the PR. Fill in the PR
+4. Review it in rounds ("Reviews" above) and push the fixes. A reviewer reading
+   the branch on GitHub needs step 3 first; one working in your checkout can
+   start before it.
+5. **Once prompted, and only once prompted** (rule 2), open the PR. Fill in the PR
    template: what & why, `Closes #N`, the test-driven Definition of Done, the local
-   checks you ran, the project constraints. Request review.
-5. Wait for the workflow runs. Fix anything red and push until they are green
+   checks you ran, the reviews that ran, the project constraints. Request review.
+6. Wait for the workflow runs. Fix anything red and push until they are green
    (rule 6). The PR then waits for review and the merge decision (rule 3).
 
 ### If you work from a fork
@@ -93,20 +130,23 @@ here constrains what you do inside your own fork.
    syncable.
 3. Push the branch to your fork (your clone's `origin`; the main repository is
    `upstream`).
-4. **Once prompted** (rule 2), open a **cross-fork PR on the upstream repository**
+4. Review it in rounds ("Reviews" above) and push the fixes. A reviewer reading
+   the branch on GitHub needs step 3 first; one working in your checkout can
+   start before it.
+5. **Once prompted** (rule 2), open a **cross-fork PR on the upstream repository**
    — base `PierreFouquet/notepad-extra:main`, head `<your-fork>:<branch>` — as a
    **draft**, so it is reviewed upstream like any other PR.
-5. Watch the workflow runs and fix what comes up, pushing to the same branch.
+6. Watch the workflow runs and fix what comes up, pushing to the same branch.
    GitHub does not run workflows for a first-time contributor's fork until a
    maintainer approves the run, so the draft may wait on that.
-6. Once the run is green, mark the PR ready for review.
+7. Once the run is green, mark the PR ready for review.
 
 ### Coding agents
 
 - Work only on the branch you were given. Never push to another branch.
 - Never open or merge a PR on your own initiative (rules 2 and 3). End with pushed
   commits and a report that lists: what changed, the commands you ran and their
-  results, and anything left undone.
+  results, the review rounds and what they found, and anything left undone.
 - When asked to drive an existing PR: address review comments with new commits
   (never rewrite history on a shared branch), keep CI green per rule 6, stop when
   asked.
@@ -114,7 +154,7 @@ here constrains what you do inside your own fork.
 
 ## 3. Architecture you must preserve
 
-```
+```text
 crates/syntax   notepad-syntax  syntect-backed language catalogue; exposes &'static str names only
 crates/core     notepad-core    pure MVU core: update(&mut State, Message) -> Vec<Effect>; no I/O, no window
 crates/iced     notepad-iced    thin iced shell: renders State, executes Effects, owns the editor buffers
@@ -161,17 +201,17 @@ whole document into words on every `view` (~50 ms at 200 000 lines).
 | `Shell::update` / `Shell::dispatch` | every message | O(log n) lookups + O(viewport), plus the per-update readout refresh: O(selection) for the status bar and O(distance to the bracket partner) for bracket matching — O(document) for an unmatched opener, once per message, never per frame. On text holding a `\r`, each conversion between a core offset and an editor position walks the editor's lines instead, O(lines) (#153). |
 | edit path: `Message::Edit` → `Content::text()` → `core::Message::Edited` → `Document::commit` | every keystroke | O(n) is inherent (the widget hands over the whole text) but only with memcpy-class constants: one `text()` pass, one byte prefix/suffix `diff`, then **incremental** updates in O(edit + affected lines + the line starts after the edit — a memcpy-class shift of the index tail, 1.6 MB per keystroke at the top of 200k lines). No Unicode-aware full pass. |
 | rewrite path: undo / redo / replace / text operation → `Effect::ApplyEdit` → `Shell::apply_edit_to_buffer` | per command | O(n) memcpy-class in the core (the rewrite itself, its `diff`, the incremental `Document` update), then the exact edit spliced into the existing editor buffer: cosmic-text reshapes only the lines the edit touches, and the caret and view stay put unless the command reveals its result (#137). The splice finds its place through the line index, O(log n), or, when the document or the removed text holds a `\r` (the cached flag plus a scan of the removed text), through the editor's own lines, O(lines) (#153). |
-| load / reload / save | once per file | O(n), single pass, minimal copies: `encoding::decode_owned` (zero-copy UTF-8), `EndOfLine::normalize` (LF text untouched, CRLF compacted in place), fingerprint hashed before decode. |
+| load / reload / save | once per file | O(n), single pass, minimal copies: `encoding::decode_owned` (zero-copy UTF-8), `EndOfLine::normalize` (LF text untouched, CRLF compacted in place), fingerprint hashed before decode, and no copy of the text kept as the saved baseline (#140); the loaded buffer is trimmed to its length (a transcoder's worst-case slack, ≈0.2 ms in place at 12 MB) so the first edit does not keep that slack as the baseline. |
 | highlighter | per visible line after an edit / scroll | parse from the nearest checkpoint; memory O(lines / 32). Exceptions tracked below: a forward jump past unparsed lines re-parses every skipped line (#138), and the state is per widget, not per tab (#144). |
 
 ### Invariants and the tests that pin them
 
 | Invariant | Where | Pinned by |
 | --- | --- | --- |
-| `char_count`/`word_count`/`line_count`/`dirty`/`has_cr` are O(1), maintained incrementally on edit/undo/redo, recomputed once on full replacement. Word counts use `words(text) == Σ words(line)`: no UAX #29 word-like segment contains a `\n` (only `\n` and `\r\n` do — WB3 keeps CR LF together — and neither holds a word character), and segmentation restarts after a `\n` as at the start of text. | `document.rs` | `incremental_splices_match_a_full_recount`, `app::tests::cached_totals_match_a_recount_after_every_rewrite_path` (random `update()` paths vs a from-scratch recount), `stress::typing_into_a_200k_line_document_keeps_the_cached_totals_exact`, `the_cr_flag_follows_loads_edits_undo_and_redo`; cost pin `stress::the_cr_flag_on_a_200k_line_document_costs_nothing_per_message` (100 000 reads under 2 s; a scan per read took 37 s) |
+| `char_count`/`word_count`/`line_count`/`dirty`/`has_cr` are O(1), maintained incrementally on edit/undo/redo, recomputed once on full replacement. Word counts use `words(text) == Σ words(line)`: no UAX #29 word-like segment contains a `\n` (only `\n` and `\r\n` do — WB3 keeps CR LF together — and neither holds a word character), and segmentation restarts after a `\n` as at the start of text. | `document.rs` | `incremental_splices_match_a_full_recount`, `app::tests::cached_totals_match_a_recount_after_every_rewrite_path` (random `update()` paths vs a from-scratch recount, and `dirty` vs the test's record of each tab's text at its creation or last load, reload or save), `stress::typing_into_a_200k_line_document_keeps_the_cached_totals_exact`, `the_cr_flag_follows_loads_edits_undo_and_redo`; cost pin `stress::the_cr_flag_on_a_200k_line_document_costs_nothing_per_message` (100 000 reads under 2 s; a scan per read took 37 s) |
 | `status()` is O(caret line + selection): totals from the cache, line/column from the line index. | `status.rs` | `stress::status_and_dirty_on_a_200k_line_document_cost_nothing_per_frame` (10 000 calls under a bound the old code missed by two orders of magnitude) |
 | `offset_at`/`line_col_of`/`line_start` are O(1)/O(log n) and agree with the pure `find::*` helpers, never panic on bad input. | `document.rs` | `indexed_position_maths_agree_with_the_pure_helpers` |
-| `dirty()` is exact ("content byte-equal to the saved baseline"), cached, refreshed only on mutation; compares length, then cached totals, then bytes. | `document.rs` | `dirty_refresh_short_circuits_on_length_totals_then_bytes`, `app::tests::reverting_to_the_saved_baseline_clears_the_dirty_marker` |
+| `dirty()` is exact ("content byte-equal to the saved baseline"), cached, refreshed only on mutation; compares length, then the cached totals and line count, then bytes. The baseline text is held as a copy exactly while it differs from the content: a load or save keeps none, the first edit away takes the old text by move (one clone for an undo/redo, which rewrites in place), and an edit back onto the saved bytes drops it (#140). | `document.rs` | `dirty_refresh_short_circuits_on_length_totals_then_bytes`, `app::tests::reverting_to_the_saved_baseline_clears_the_dirty_marker`, `a_clean_document_holds_no_baseline_copy_and_the_first_edit_moves_one_in` (the copy is the content's own allocation), `undo_or_redo_from_a_clean_document_copies_the_text_it_leaves`, `incremental_splices_match_a_full_recount` (dirty vs the loaded text the test keeps), `app::tests::cached_totals_match_a_recount_after_every_rewrite_path` (the same over random `update()` paths, saves and reloads included); cost pin `stress::undo_and_redo_between_unsaved_states_copy_nothing` (10 000 undo/redo steps between unsaved states under a quarter of a text clone each, timed on the same machine: ≈3 µs a step, ≈120 µs with a clone per step, at 5.4 MB in a debug build) |
 | The status-bar and bracket-match readouts (`Shell::readouts`) are computed once per `Shell::update` — every message except pointer tracking (`EditorCursorMoved`) and `WindowResized`, which skip the repaint nudge too, and the scroll messages (`ScrollNudge`, `ScrollSettle`, the widget's `Scroll` action), which repaint but cannot move the caret — and only *read* by `view`. | `main.rs` | `pointer_tracking_and_resizes_do_not_recompute_the_readouts`, `readouts_follow_caret_moves_edits_and_undo`, `readouts_follow_a_tab_switch`, `readouts_follow_a_find_reveal`, `readouts_follow_language_and_encoding_changes` |
 | The two `iced::Theme`s are built once per `ThemeMode` (`app_theme`) and handed out as `Arc` clones. | `main.rs` | `the_iced_theme_is_built_once_per_mode_and_shared_across_frames` |
 | `view` splits the tab strip once; clean tab titles are borrowed, only a dirty tab's "•" name allocates. | `main.rs` | `tab_names_borrow_clean_titles_and_allocate_only_the_dirty_marker` |
@@ -183,7 +223,7 @@ whole document into words on every `view` (~50 ms at 200 000 lines).
 | Scrollbar inputs (`vertical_extent`) are O(1) with wrapping off (one row per line) and one fused pass with wrapping on; thumb geometry unchanged. | `text_editor.rs` | `vertical_extent_matches_the_per_line_walk_in_both_wrap_modes` |
 | With wrapping off, `layout()` never hands the editor a narrower width than it already has (cosmic-text relayouts every shaped line on any size change) — except while a right-to-left run is on screen, when the width falls back to the visible extent because cosmic-text right-aligns RTL paragraphs to the buffer width. | `text_editor.rs` | `no_wrap_layout_width_ratchets_and_wrapping_restores_the_viewport`, `no_wrap_width_yields_to_the_visible_extent_while_rtl_text_is_on_screen` |
 | The highlighter checkpoints parser state every `CHECKPOINT_INTERVAL` (32) lines; `change_line(k)` resumes from the nearest checkpoint and is equivalent to a fresh run. | `highlight.rs` | `resuming_from_a_checkpoint_reproduces_a_fresh_run_for_every_line`, `resuming_after_an_edit_matches_a_fresh_run_of_the_edited_buffer`, `checkpoints_are_one_per_interval` |
-| Load path copies: `EndOfLine::normalize` returns LF text in the same allocation; `decode_owned` reuses the byte buffer for UTF-8. | `text.rs`, `encoding.rs` | `normalize_returns_an_lf_buffer_untouched_without_copying`, `owned_decode_of_valid_utf8_reuses_the_buffer`, `owned_and_borrowed_decoders_agree` |
+| Load path copies: `EndOfLine::normalize` returns LF text in the same allocation; `decode_owned` reuses the byte buffer for UTF-8; `Document::load` trims the buffer to its length, so the baseline the first edit takes over carries no decode slack (#140). | `text.rs`, `encoding.rs`, `document.rs` | `normalize_returns_an_lf_buffer_untouched_without_copying`, `owned_decode_of_valid_utf8_reuses_the_buffer`, `owned_and_borrowed_decoders_agree`, `a_load_trims_the_decode_slack_the_first_edit_would_keep` |
 | Find readouts are one regex pass (`count_and_ordinal`); replace-all expands into the output buffer. | `find.rs` | `count_and_ordinal_matches_the_two_pass_form`, `replace_all_matches_a_per_match_splice` |
 | Undo-depth eviction is O(1) (`VecDeque::pop_front`) — structural, not timed. | `history.rs` | the cap tests pin *which* entries are evicted and the `Clean` transitions; `coalescing_appends_in_place_and_keeps_the_step_id` pins the in-place append |
 | Language detection is a hash lookup, not a scan of the syntax set. | `syntax/lib.rs` | `indexed_detection_matches_syntects_scans_for_every_known_token` |
@@ -208,6 +248,10 @@ passing, and a change that moves one is its own issue with its own numbers.
 - `refresh_dirty` falls through to a `memcmp` when an edit leaves the length and
   the totals equal to the saved baseline's: +1.8 ms at 12 MB, kept for exactness
   (§8).
+- An undo or redo that leaves a clean document clones its text once to keep as
+  the saved baseline, because both rewrite the text in place (#140): ≈1.2 ms at
+  12 MB, once per departure from the saved state. It is the copy every load and
+  save used to make.
 - cosmic-text shapes the whole buffer at open (6.5 s + 4.6 s and +7.5 GB of RSS
   at 200k lines, ≈56 µs and ≈37 KB per line) and, with wrapping off, relayouts
   every shaped line on any viewport size change (≈550 ms per resize event at
@@ -239,8 +283,6 @@ do not add another without filing one.
   checkpoints only rewind.
 - #139 — with wrapping off, every resize event relayouts every shaped line
   (≈550 ms at 200k lines).
-- #140 — a clean document holds a second full copy of its text as the saved
-  baseline (12 MB per 12 MB document).
 - #144 — the highlighter state lives in the one editor widget and survives the
   tab switch, so same-language tabs share parser state (a bug, not a cost: an
   open block comment in one tab colours code in another).
@@ -275,7 +317,7 @@ Then record the invariant in the table above.
 | Change | Put it in | Test it with |
 | --- | --- | --- |
 | behaviour, state, a new `Message`/`Effect` | `crates/core/src/app.rs`; the pure algorithm in its own `crates/core/src/<topic>.rs` | unit tests + proptest in the module; `tests/stress.rs` for extremes |
-| anything that reads or writes document text | a `Document` method in `crates/core/src/document.rs` | `assert_derived_data_matches_recount` in a proptest |
+| anything that reads or writes document text | a `Document` method in `crates/core/src/document.rs` | `assert_derived_data_matches_recount` in a proptest, plus `dirty()` against the test's own record of the saved text (the oracle cannot check it, #140) |
 | text algorithm (search, text ops, EOL, encoding) | its `crates/core/src/*.rs` module, pure functions over `&str` / owned buffers | proptest new == reference (keep the reference body in the test module); a fuzz target if it parses bytes |
 | anything drawn or measured in the editor | `crates/iced/src/text_editor.rs`; mark each hunk `// NOTEPAD-EXTRA(#NN): reason`, add a row to `crates/iced/VENDORED.md` | widget tests in that file; never O(document) in `draw`/`layout` |
 | chrome, layout, wiring, effects | `crates/iced/src/main.rs` (`view`, `dispatch`, `run_effect`) | `mod tests` drives `Shell::update`; `mod ui_tests` uses the `iced_test` Simulator (headless, no GPU) |

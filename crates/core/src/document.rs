@@ -24,7 +24,8 @@
 //!   conversion a binary search ([`Document::line_start`],
 //!   [`Document::offset_at`], [`Document::line_col_of`]),
 //! * whether the text is byte-equal to the saved baseline, so
-//!   [`Document::dirty`] is a flag read, not a compare.
+//!   [`Document::dirty`] is a flag read, not a compare. The baseline is held as
+//!   a second copy of the text only while the two differ (#140).
 //!
 //! Every mutation goes through a `Document` method, so there is no path that
 //! rewrites the buffer and forgets the derived data: a load/reload recounts in
@@ -101,15 +102,11 @@ pub struct Document {
     /// trailing `\n` yields a final empty line). Binary-searched by the
     /// `(line, column)` conversions and spliced by incremental edits (#126).
     line_starts: Vec<usize>,
-    /// The last content that was saved to disk, with its own totals and the
-    /// encoding it was written with. Deciding whether the buffer still matches
-    /// it is what the "•" marker means.
+    /// The text as last loaded from or saved to disk (held only while it
+    /// differs from `content`), its totals and the encoding it was written
+    /// with. Deciding whether the buffer still matches it is what the "•"
+    /// marker means.
     saved: Baseline,
-    /// Whether `content` is byte-equal to `saved.text`, re-derived whenever
-    /// either side changes so [`Document::dirty`] is O(1) (#126). Exact — never
-    /// a hash: the compare that refreshes it short-circuits on the lengths and
-    /// the cached totals and only reads the bytes when those all agree.
-    matches_saved: bool,
 }
 
 /// Document-wide totals the status bar shows, cached so a frame reads two
@@ -137,12 +134,23 @@ impl Totals {
 /// The on-disk baseline a document is compared against for its dirty marker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Baseline {
-    /// The text as last loaded from or saved to disk.
-    text: String,
-    /// `text`'s totals, kept so a dirty refresh can rule out equality without
-    /// reading the bytes (a different count means different text).
+    /// The text as last loaded from or saved to disk, or `None` while the
+    /// content is byte-equal to it (#140). A clean document's baseline *is* its
+    /// content, so a copy would only double its memory (12 MB per 12 MB file)
+    /// and cost a clone per load and save. The first edit away from it takes
+    /// the old text over (by move when the edit adopts a whole new text, by
+    /// one clone when undo/redo rewrites in place), and an edit back onto the
+    /// saved bytes drops the copy again. So `text.is_some()` is exactly "the
+    /// content differs from what was last loaded or saved" (not from the file
+    /// as it is now, which may have changed since), the cached half of
+    /// [`Document::dirty`] (#126), re-derived on every mutation and never a
+    /// hash.
+    text: Option<String>,
+    /// The saved text's totals (the content's while `text` is `None`), kept so
+    /// a dirty refresh can rule out equality without reading the bytes (a
+    /// different count means different text).
     totals: Totals,
-    /// `text`'s line count, for the same cheap pre-check.
+    /// The saved text's line count, for the same cheap pre-check.
     lines: usize,
     /// The encoding the baseline was written with. Choosing a different save
     /// encoding on an otherwise unchanged buffer still marks it dirty (a
@@ -167,12 +175,11 @@ impl Document {
             totals: Totals::default(),
             line_starts: vec![0],
             saved: Baseline {
-                text: String::new(),
+                text: None,
                 totals: Totals::default(),
                 lines: 1,
                 encoding: FileEncoding::default(),
             },
-            matches_saved: true,
         }
     }
 
@@ -252,11 +259,12 @@ impl Document {
 
     /// Whether the buffer has unsaved changes (the tab's "•" marker): the text
     /// differs from the last saved baseline, or the save encoding was changed
-    /// (a pending *convert*). O(1): the text compare is a cached flag refreshed
-    /// on every mutation, the encoding compare is two enum fields (#126).
-    /// Exact — reverting the text to the saved bytes clears it.
+    /// (a pending *convert*). O(1): the text compare is whether a baseline copy
+    /// is held, re-derived on every mutation (#126, #140); the encoding compare
+    /// is two enum fields. Exact — reverting the text to the saved bytes clears
+    /// it.
     pub fn dirty(&self) -> bool {
-        !self.matches_saved || self.encoding != self.saved.encoding
+        self.saved.text.is_some() || self.encoding != self.saved.encoding
     }
 
     /// The effective language: the manual override if the user set one, otherwise
@@ -307,20 +315,26 @@ impl Document {
     /// Adopt `text` as both the buffer and the clean on-disk baseline: a fresh
     /// load, a reload after an external change, or a reopen under another
     /// encoding. Re-counts everything in a single pass (the one O(n) a load
-    /// pays), resets the history, and takes `text` by move so the only copy made
-    /// is the baseline's (#126). Path and language are the caller's business:
-    /// a reload keeps them, a load sets them.
+    /// pays), resets the history, and takes `text` by move. The clean document
+    /// keeps no baseline copy (#140), so a load copies nothing (#126). Path and
+    /// language are the caller's business: a reload keeps them, a load sets
+    /// them.
     pub(crate) fn load(
         &mut self,
-        text: String,
+        mut text: String,
         eol: EndOfLine,
         encoding: FileEncoding,
         disk: Option<DiskMeta>,
     ) {
+        // Transcoding sizes its output for the worst case, about three times
+        // the text for a single-byte encoding, and the first edit moves this
+        // buffer into the baseline (#140), spare capacity and all. Trimming it
+        // here is a shrink in place under the usual allocators, not a copy.
+        text.shrink_to_fit();
         self.totals = Totals::of(&text);
         self.line_starts = line_starts(&text);
         self.saved = Baseline {
-            text: text.clone(),
+            text: None, // the content is the baseline (#140)
             totals: self.totals,
             lines: self.line_starts.len(),
             encoding,
@@ -331,19 +345,18 @@ impl Document {
         self.history = History::new(); // loaded content is the clean baseline
         self.disk_status = DiskStatus::InSync;
         self.disk = disk;
-        self.matches_saved = true;
     }
 
     /// The current text and encoding were just written to disk: they become the
     /// clean baseline, so the "•" clears and undoing back to this point later
-    /// clears it again. The totals come from the live cache, so no recount.
+    /// clears it again. The totals come from the live cache, so no recount, and
+    /// the copy of the old baseline is dropped rather than overwritten (#140).
     pub(crate) fn mark_saved(&mut self) {
-        self.saved.text.clone_from(&self.content);
+        self.saved.text = None;
         self.saved.totals = self.totals;
         self.saved.lines = self.line_starts.len();
         self.saved.encoding = self.encoding;
         self.history.mark_saved();
-        self.matches_saved = true;
     }
 
     /// Replace the buffer with `new_content` as one undo-able step — the path
@@ -381,7 +394,7 @@ impl Document {
     /// Adopt `new_content`, which `edit` turns the current text into, and
     /// record the step in the history.
     fn record(&mut self, edit: Edit, new_content: String) {
-        self.splice(&edit, |content| *content = new_content);
+        self.splice(&edit, Rewrite::Adopt(new_content));
         self.history.record(edit);
     }
 
@@ -390,7 +403,7 @@ impl Document {
     /// there is nothing to undo.
     pub(crate) fn undo(&mut self) -> Option<Edit> {
         let edit = self.history.undo()?;
-        self.splice(&edit, |content| edit.apply(content));
+        self.splice(&edit, Rewrite::InPlace);
         Some(edit)
     }
 
@@ -398,15 +411,18 @@ impl Document {
     /// returning the applied [`Edit`]. `None` when there is nothing to redo.
     pub(crate) fn redo(&mut self) -> Option<Edit> {
         let edit = self.history.redo()?;
-        self.splice(&edit, |content| edit.apply(content));
+        self.splice(&edit, Rewrite::InPlace);
         Some(edit)
     }
 
-    /// Apply `edit` to the text via `rewrite` and bring every derived value up
-    /// to date **incrementally** (#126). `rewrite` performs the actual text
-    /// change — a move of the editor's whole new string, or [`Edit::apply`] in
-    /// place for undo/redo — and must realise exactly `edit`.
+    /// Apply `edit` to the text as `rewrite` says and bring every derived value
+    /// up to date **incrementally** (#126). `rewrite` must realise exactly
+    /// `edit`.
     ///
+    /// * baseline: a clean document holds no copy of its saved text (#140), so
+    ///   the text this edit leaves becomes that copy first — by move when the
+    ///   whole new text is adopted, by one clone when the edit is applied in
+    ///   place;
     /// * chars and `\r`s: `+ count(inserted) − count(removed)`;
     /// * line index: the starts inside the removed range go, the starts from
     ///   the inserted text come in, and everything after shifts by the length
@@ -416,10 +432,13 @@ impl Document {
     ///   contains a `\n` (the only segments that do are `\n` and `\r\n`, see the
     ///   module docs), so no word straddles a line and the rest of the
     ///   document's words are untouched;
-    /// * dirty: re-derived (cheaply, see [`Document::refresh_dirty`]).
+    /// * dirty: re-derived, dropping the baseline copy again when the edit
+    ///   lands back on the saved bytes (cheaply, see
+    ///   [`Document::refresh_dirty`]).
     ///
-    /// Cost: O(edit size + the touched lines + the index splice), not O(text).
-    fn splice(&mut self, edit: &Edit, rewrite: impl FnOnce(&mut String)) {
+    /// Cost: O(edit size + the touched lines + the index splice), not O(text),
+    /// plus the one clone when an undo or redo leaves a clean state.
+    fn splice(&mut self, edit: &Edit, rewrite: Rewrite) {
         let at = edit.at;
         let removed_end = at + edit.removed.len();
         // Index positions: `lo` is the first line start strictly after `at`
@@ -435,7 +454,16 @@ impl Document {
         let removed_crs = crs(&edit.removed);
         let inserted_crs = crs(&edit.inserted);
 
-        rewrite(&mut self.content);
+        match rewrite {
+            Rewrite::Adopt(new_content) => {
+                let old = std::mem::replace(&mut self.content, new_content);
+                self.saved.text.get_or_insert(old);
+            }
+            Rewrite::InPlace => {
+                self.saved.text.get_or_insert_with(|| self.content.clone());
+                edit.apply(&mut self.content);
+            }
+        }
 
         let inserted_end = at + edit.inserted.len();
         let new_words = words(&self.content[span_start..line_end(&self.content, inserted_end)]);
@@ -457,21 +485,37 @@ impl Document {
         self.refresh_dirty();
     }
 
-    /// Re-derive [`Document::matches_saved`] after the text changed: compare the
-    /// lengths first, then the cached totals, and read the bytes only when all
-    /// of those agree — so the O(n) compare runs only when the buffer could
-    /// genuinely have returned to its saved state, and never per frame (#126).
-    /// Exact by construction: the final arm is the byte equality itself.
+    /// Re-derive whether the text is back on the saved bytes after it changed,
+    /// and if so drop the baseline copy, which would now duplicate the content
+    /// (#140). Compares the lengths first, then the cached totals, and reads the
+    /// bytes only when all of those agree — so the O(n) compare runs only when
+    /// the buffer could genuinely have returned to its saved state, and never
+    /// per frame (#126). Exact by construction: the final arm is the byte
+    /// equality itself.
     fn refresh_dirty(&mut self) {
-        self.matches_saved = self.content.len() == self.saved.text.len()
-            && self.totals == self.saved.totals
-            && self.line_starts.len() == self.saved.lines
-            && self.content == self.saved.text;
+        let back_on_saved = self.saved.text.as_ref().is_some_and(|saved| {
+            self.content.len() == saved.len()
+                && self.totals == self.saved.totals
+                && self.line_starts.len() == self.saved.lines
+                && self.content == *saved
+        });
+        if back_on_saved {
+            self.saved.text = None;
+        }
     }
 
     /// Recount everything from scratch and assert the cached values match: the
     /// oracle the invalidation proptests run after every message (#126), kept
     /// here so the private fields need no accessors.
+    ///
+    /// Only half of the dirty flag can be checked here: a copy held as the
+    /// baseline must differ from the content (the last assert). The other half
+    /// needs the saved text, which a clean document no longer holds (#140), so
+    /// nothing inside it can tell "byte-equal to the saved bytes" from "a
+    /// refresh missed an edit". The proptests keep the saved text themselves
+    /// and compare [`Document::dirty`] to it
+    /// (`incremental_splices_match_a_full_recount`, and the app's
+    /// `cached_totals_match_a_recount_after_every_rewrite_path`).
     #[cfg(test)]
     pub(crate) fn assert_derived_data_matches_recount(&self) {
         assert_eq!(
@@ -485,14 +529,24 @@ impl Document {
             "line index drifted"
         );
         assert_eq!(self.line_count(), find::line_count(&self.content));
-        assert_eq!(self.saved.totals, Totals::of(&self.saved.text));
-        assert_eq!(self.saved.lines, find::line_count(&self.saved.text));
-        assert_eq!(
-            self.dirty(),
-            self.content != self.saved.text || self.encoding != self.saved.encoding,
-            "dirty flag drifted"
+        let saved = self.saved.text.as_deref().unwrap_or(&self.content);
+        assert_eq!(self.saved.totals, Totals::of(saved));
+        assert_eq!(self.saved.lines, find::line_count(saved));
+        assert_ne!(
+            self.saved.text.as_deref(),
+            Some(self.content.as_str()),
+            "a clean document holds a second copy of its text (#140)"
         );
     }
+}
+
+/// How [`Document::splice`] realises an edit on the text.
+enum Rewrite {
+    /// Move in the whole new text: a keystroke reported by the editor, or a
+    /// rewrite the core built. The old text is free to become the baseline.
+    Adopt(String),
+    /// Apply the edit to the text where it is ([`Edit::apply`], undo/redo).
+    InPlace,
 }
 
 /// Number of words in `text`, per Unicode word segmentation (UAX #29). This
@@ -753,6 +807,99 @@ mod tests {
     }
 
     #[test]
+    fn a_clean_document_holds_no_baseline_copy_and_the_first_edit_moves_one_in() {
+        // #140: a loaded document's baseline is its content, so no copy is kept.
+        let mut d = doc("saved");
+        assert_eq!(d.saved.text, None);
+        // The first edit away adopts the text it replaces as the baseline by
+        // move, not a clone: the copy is the very allocation the content had.
+        let loaded = d.content.as_ptr();
+        assert!(d.commit("saved!".into()));
+        assert_eq!(d.saved.text.as_deref(), Some("saved"));
+        assert_eq!(d.saved.text.as_ref().map(|s| s.as_ptr()), Some(loaded));
+        // Later edits keep that one copy.
+        assert!(d.commit("saved!!".into()));
+        assert_eq!(d.saved.text.as_ref().map(|s| s.as_ptr()), Some(loaded));
+        d.assert_derived_data_matches_recount();
+        // An edit back onto the saved bytes drops it...
+        assert!(d.commit("saved".into()));
+        assert_eq!(d.saved.text, None);
+        assert!(!d.dirty());
+        // ...and so does a save, which takes the new text's line count with it.
+        assert!(d.commit("edited\n".into()));
+        assert!(d.saved.text.is_some());
+        d.mark_saved();
+        assert_eq!(d.saved.text, None);
+        assert!(!d.dirty());
+        d.assert_derived_data_matches_recount();
+        // ...and a reload from disk while dirty: the new text is the baseline.
+        assert!(d.commit("edited again".into()));
+        assert!(d.saved.text.is_some());
+        d.load(
+            "on disk".into(),
+            EndOfLine::Lf,
+            FileEncoding::default(),
+            None,
+        );
+        assert_eq!(d.saved.text, None);
+        assert!(!d.dirty());
+        d.assert_derived_data_matches_recount();
+    }
+
+    #[test]
+    fn a_load_trims_the_decode_slack_the_first_edit_would_keep() {
+        // #140: a transcoded file arrives in a buffer sized for the worst case,
+        // and the first edit moves that buffer into the baseline, so the load
+        // trims it rather than keep the slack for as long as the text is dirty.
+        let cp1252 = FileEncoding::from_label("Windows-1252").unwrap();
+        let (text, encoding) = crate::encoding::decode_with_owned(b"caf\xe9".to_vec(), cp1252);
+        assert!(
+            text.capacity() > text.len(),
+            "the decode leaves slack to trim"
+        );
+        let mut d = Document::blank(1);
+        d.load(text, EndOfLine::Lf, encoding, None);
+        assert_eq!(d.content.capacity(), d.content.len());
+        assert!(d.commit("café!".into()));
+        let saved = d
+            .saved
+            .text
+            .as_ref()
+            .expect("dirty, so the baseline is held");
+        assert_eq!(saved, "café");
+        assert_eq!(saved.capacity(), saved.len());
+    }
+
+    #[test]
+    fn undo_or_redo_from_a_clean_document_copies_the_text_it_leaves() {
+        // #140: undo and redo rewrite the text in place, so leaving a clean
+        // state that way clones it first: the copy a save used to make.
+        let mut d = doc("a");
+        assert!(d.commit("ab".into()));
+        d.mark_saved();
+        assert_eq!(d.saved.text, None);
+        assert!(d.undo().is_some());
+        assert_eq!(d.content(), "a");
+        assert_eq!(d.saved.text.as_deref(), Some("ab"));
+        assert!(d.dirty());
+        d.assert_derived_data_matches_recount();
+        // Redo lands back on the saved bytes: the copy goes again.
+        assert!(d.redo().is_some());
+        assert_eq!(d.saved.text, None);
+        assert!(!d.dirty());
+        // A redo away from a clean state copies the same way: save while
+        // undone, then redo.
+        assert!(d.undo().is_some());
+        d.mark_saved();
+        assert_eq!(d.saved.text, None);
+        assert!(d.redo().is_some());
+        assert_eq!(d.content(), "ab");
+        assert_eq!(d.saved.text.as_deref(), Some("a"));
+        assert!(d.dirty());
+        d.assert_derived_data_matches_recount();
+    }
+
+    #[test]
     fn dirty_refresh_short_circuits_on_length_totals_then_bytes() {
         let mut d = doc("ab");
         // A different length is decided without reading any bytes.
@@ -851,8 +998,11 @@ mod tests {
         }
 
         /// Random single-span edits applied directly through `commit`, with the
-        /// cached totals, index and dirty flag checked against a from-scratch
-        /// recount after every one, then undone and redone all the way.
+        /// cached totals and index checked against a from-scratch recount after
+        /// every one, then undone and redone all the way. The dirty flag is
+        /// checked against the loaded text the test keeps itself: a clean
+        /// document holds no copy of its saved text (#140), so the recount
+        /// cannot check it.
         #[test]
         fn incremental_splices_match_a_full_recount(
             base in seam_text(40),
@@ -869,14 +1019,17 @@ mod tests {
                 next.push_str(&text[hi..]);
                 d.commit(next);
                 d.assert_derived_data_matches_recount();
+                prop_assert_eq!(d.dirty(), d.content() != base);
             }
             while d.undo().is_some() {
                 d.assert_derived_data_matches_recount();
+                prop_assert_eq!(d.dirty(), d.content() != base);
             }
             prop_assert_eq!(d.content(), base.as_str());
             prop_assert!(!d.dirty());
             while d.redo().is_some() {
                 d.assert_derived_data_matches_recount();
+                prop_assert_eq!(d.dirty(), d.content() != base);
             }
         }
     }

@@ -214,7 +214,7 @@ a display, drive it headlessly:
 
 ```sh
 Xvfb :99 -screen 0 1280x820x24 &
-DISPLAY=:99 cargo run -p notepad-iced &
+DISPLAY=:99 cargo run &
 WID=$(DISPLAY=:99 xdotool search --name "Notepad Extra" | tail -1)
 DISPLAY=:99 xdotool windowfocus "$WID"
 DISPLAY=:99 xdotool type --window "$WID" 'fn main() {}'   # keys need --window

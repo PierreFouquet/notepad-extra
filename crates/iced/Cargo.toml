@@ -75,7 +75,7 @@ png = { version = "0.18", default-features = false }
 # deleted or renamed by another program. `notify` is the standard cross-platform
 # filesystem-event crate — inotify on Linux, FSEvents on macOS,
 # ReadDirectoryChangesW on Windows, all pure-Rust bindings (no C to compile; only
-# the usual `libc` FFI declarations). Permissive licence (CC0/Artistic-2.0) and
+# the usual `libc` FFI declarations). Permissive licence (CC0-1.0) and
 # purely **local** filesystem events — it opens no sockets, so the offline
 # invariant holds. Lives only in this shell: the pure core stays I/O-free and
 # receives the watch verdict as a `DiskChanged` message (the watcher is an edge

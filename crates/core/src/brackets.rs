@@ -5,7 +5,7 @@
 //! text plus the caret byte offset the render shell reads from its editor
 //! widget — no window, no I/O — so the whole thing is asserted headlessly (the
 //! epic #25 testing standard). The shell calls [`match_at`] with the caret it
-//! already computes for [`crate::status`] and highlights the returned offsets.
+//! already computes for [`crate::status()`] and highlights the returned offsets.
 //!
 //! Only the three ASCII pairs `()`, `[]`, `{}` are matched. Matching is by
 //! nesting depth alone; it is **not** string/comment-aware, because the native

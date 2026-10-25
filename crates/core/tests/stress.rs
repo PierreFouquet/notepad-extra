@@ -633,6 +633,52 @@ fn typing_into_a_200k_line_document_keeps_the_cached_totals_exact() {
 }
 
 #[test]
+fn undo_and_redo_between_unsaved_states_copy_nothing() {
+    // Undo and redo rewrite the text in place, so leaving the saved state that
+    // way clones the old text once to keep as the baseline (#140). Between two
+    // unsaved states that copy already exists and nothing may be cloned: an
+    // eager clone thrown away when the copy is found leaves every result
+    // unchanged and costs a full copy of the text per step (≈120 µs here at
+    // 5.4 MB in debug, against ≈3 µs for the step itself). The bound is set
+    // against a clone timed on the same machine, before and after the steps
+    // with the slower kept, so it holds on a slow or busy runner as well as a
+    // fast one.
+    let mut s = two_hundred_thousand_lines(); // the loaded text plus "x": dirty
+    let unsaved = s.active_doc().content().to_string();
+    // A newline never joins a typing run, so this is an undo step of its own.
+    update(&mut s, Message::Edited(format!("{unsaved}\n")));
+
+    let time_a_clone = |s: &State| {
+        let started = Instant::now();
+        for _ in 0..100 {
+            std::hint::black_box(s.active_doc().content().to_string());
+        }
+        started.elapsed() / 100
+    };
+    let clone_before = time_a_clone(&s);
+
+    let steps = 10_000u32;
+    let started = Instant::now();
+    for _ in 0..steps / 2 {
+        update(&mut s, Message::Undo);
+        update(&mut s, Message::Redo);
+    }
+    let elapsed = started.elapsed();
+    let clone = clone_before.max(time_a_clone(&s));
+    assert!(
+        elapsed < clone * steps / 4,
+        "{steps} undo/redo steps between unsaved states took {elapsed:?}, against {clone:?} \
+         for one clone of the text: a step copies the document (#140)"
+    );
+
+    // The steps did what they say: back and forth between the two edits.
+    update(&mut s, Message::Undo);
+    let doc = s.active_doc();
+    assert_eq!(doc.content(), unsaved);
+    assert!(doc.dirty());
+}
+
+#[test]
 fn typing_at_the_top_of_a_200k_line_document_diffs_at_memory_speed() {
     // Every keystroke reaches the core as the whole new text, and `diff` finds
     // the one changed span by scanning both buffers from each end. A keystroke

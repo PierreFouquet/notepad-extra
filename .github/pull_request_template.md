@@ -2,10 +2,9 @@
 Thanks for contributing to Notepad Extra!
 
 This one template covers both regular changes and plugin submissions.
-👉 Fill in "All PRs" below, then KEEP the ONE section that matches your PR and
-   DELETE the other:
-     • Code / docs / packaging change  → keep "Regular change", delete "Plugin submission"
-     • Submitting a plugin             → keep "Plugin submission", delete "Regular change"
+👉 Fill in "All PRs" below, then:
+     • Code / docs / packaging change  → delete the "Plugin submission" section
+     • Submitting a plugin             → fill in "Plugin submission" as well
 -->
 
 # All PRs
@@ -51,6 +50,14 @@ The full list, with the exact commands, is `AGENTS.md` §6; run it on the newest
 - [ ] Dependencies touched: `LICENSE_AUDIT_ONLINE=1 bash scripts/license-audit.sh --check`, `PACKAGING_DEPS_ONLINE=1 bash scripts/packaging-deps.sh --check` and `cargo audit` are clean (plus `bash scripts/vendored-crates.sh check` and `audit` if `vendor/` changed), and any runtime-loaded library is in the deb/rpm dependency lists — or N/A.
 - [ ] Shell touched: windowed smoke `xvfb-run -a timeout 10 ./target/debug/notepad-extra` exits 124 — or N/A.
 - [ ] Packaging metadata still validates if touched (`appstreamcli validate --no-net …`, `desktop-file-validate …`); the `packaging.yml` jobs are green on the PR.
+
+## Reviews
+
+`AGENTS.md` §2 "Reviews": two full reviews, then one review per part of the change (up to four), fixing between rounds.
+
+- [ ] Two full reviews ran, the second after the first one's fixes. What they changed: …
+- [ ] Chunked reviews ran, one per part, and what each changed: …
+- [ ] Findings outside the change were fixed here under their issue, or filed as their own issue: …
 
 ## Project constraints
 

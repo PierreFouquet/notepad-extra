@@ -1398,7 +1398,7 @@ fn resync_find_after_doc_change(state: &mut State) {
 }
 
 /// Drop a now-stale highlight and recount after the active buffer changed
-/// (edit / undo / redo). Clearing `current` unconditionally stops it ever
+/// (edit / undo / redo / text operation). Clearing `current` unconditionally stops it ever
 /// pointing past a shrunken buffer; the recount itself runs only while the bar
 /// is open (so plain typing on a huge file pays nothing).
 fn refresh_find_after_edit(state: &mut State) -> Vec<Effect> {
@@ -1523,6 +1523,8 @@ fn text_operation(
     let had_selection = selection.is_some_and(|(a, b)| a != b);
     let (start, end) = applied.selection;
     let mut fx = apply_rewrite(state, applied.content);
+    // The highlight and the readout described the old text (#165).
+    fx.extend(refresh_find_after_edit(state));
     if had_selection {
         fx.push(Effect::RevealRange { start, end });
     }
@@ -3132,6 +3134,32 @@ mod tests {
     }
 
     #[test]
+    fn a_text_operation_resets_the_stale_find_highlight() {
+        // Regression (#165): a text operation rewrites the buffer as undo and
+        // redo do, so it drops the highlight and recounts the same way.
+        use crate::textops::TextOp;
+        let op = |op| Message::TextOperation {
+            op,
+            selection: None,
+        };
+        let mut s = State::default();
+        update(&mut s, Message::Edited("Ⱥ{\nȺ{\n".into()));
+        find_for(&mut s, "{");
+        assert_eq!(s.find.current, Some(Match { start: 2, end: 3 }));
+        assert_eq!((s.find.count, s.find.ordinal), (2, 1));
+        // Lowercasing grows "Ⱥ" from two bytes to three ("ⱥ"): a highlight left
+        // at 2..3 would now start inside that character.
+        update(&mut s, op(TextOp::Lowercase));
+        assert_eq!(s.active_doc().content(), "ⱥ{\nⱥ{\n");
+        assert_eq!(s.find.current, None);
+        assert_eq!((s.find.count, s.find.ordinal), (2, 0));
+        // Dropping the duplicate line drops a match, and the count follows.
+        update(&mut s, op(TextOp::RemoveDuplicateLines));
+        assert_eq!(s.active_doc().content(), "ⱥ{\n");
+        assert_eq!(s.find.count, 1);
+    }
+
+    #[test]
     fn find_messages_are_inert_while_the_bar_is_closed() {
         let mut s = State::default();
         update(&mut s, Message::Edited("aaa".into()));
@@ -4578,17 +4606,30 @@ mod tests {
         /// The invalidation pin for #126: after **every** path that rewrites a
         /// buffer — edits, undo/redo, replace-next/all, text operations, load,
         /// reload, save, encoding changes, new/selected tabs — every document's
-        /// cached chars / words / lines / line index / dirty flag equals a
-        /// from-scratch recount, and `status()` reports those same numbers. The
-        /// seam alphabet (newlines, apostrophes, CJK, emoji, regional
-        /// indicators, joiners, combining marks, a lone CR) is chosen so the
-        /// per-line word recount is exercised at every awkward UAX #29 boundary.
+        /// cached chars / words / lines / line index equals a from-scratch
+        /// recount, its dirty flag matches the test's own record of each tab's
+        /// text at its creation or last load, reload or save (#140), and
+        /// `status()` reports those same numbers. The seam alphabet (newlines,
+        /// apostrophes, CJK, emoji, regional indicators, joiners, combining
+        /// marks, a lone CR) is chosen so the per-line word recount is
+        /// exercised at every awkward UAX #29 boundary.
         #[test]
         fn cached_totals_match_a_recount_after_every_rewrite_path(
             steps in prop::collection::vec(arb_rewrite(), 0..40),
         ) {
+            use std::collections::HashMap;
             use unicode_segmentation::UnicodeSegmentation;
+            // Each tab's saved text and encoding, as of its creation (the first
+            // tab, a new tab) or its last load, reload or save: the dirty flag's
+            // reference, kept out here because a clean document holds no copy
+            // of it (#140).
+            fn rebaseline(s: &State, saved: &mut HashMap<TabId, (String, FileEncoding)>) {
+                let doc = s.active_doc();
+                saved.insert(doc.id, (doc.content().to_string(), doc.encoding));
+            }
             let mut s = State::default();
+            let mut saved = HashMap::new();
+            rebaseline(&s, &mut saved);
             update(&mut s, Message::FindOpened); // so replace-next / replace-all act
             for step in steps {
                 match step {
@@ -4620,6 +4661,7 @@ mod tests {
                     }
                     Rewrite::Load(text) => {
                         load(&mut s, "/t/loaded.txt", &text);
+                        rebaseline(&s, &mut saved);
                     }
                     Rewrite::Reload(content) => {
                         let id = s.active_doc().id;
@@ -4629,6 +4671,7 @@ mod tests {
                             encoding: FileEncoding::default(),
                             disk: None,
                         });
+                        rebaseline(&s, &mut saved);
                     }
                     Rewrite::Save => {
                         let id = s.active_doc().id;
@@ -4637,20 +4680,29 @@ mod tests {
                             path: PathBuf::from("/t/saved.txt"),
                             disk: None,
                         });
+                        rebaseline(&s, &mut saved);
                     }
                     Rewrite::SetEncoding(label) => {
                         update(&mut s, Message::SetEncoding(label.to_string()));
                     }
                     Rewrite::NewTab => {
                         update(&mut s, Message::NewTab);
+                        rebaseline(&s, &mut saved);
                     }
                     Rewrite::SelectTab(i) => {
                         update(&mut s, Message::TabSelected(i));
                     }
                 }
                 for doc in &s.docs {
-                    // The private-field oracle (dirty flag included)...
+                    // The private-field oracle...
                     doc.assert_derived_data_matches_recount();
+                    // ...the dirty flag against the model's saved text...
+                    let (text, encoding) = &saved[&doc.id];
+                    prop_assert_eq!(
+                        doc.dirty(),
+                        doc.content() != text || doc.encoding != *encoding,
+                        "dirty flag drifted"
+                    );
                     // ...and the public readers, spelled out against the
                     // definitions the status bar used to compute per frame.
                     let text = doc.content();

@@ -1398,7 +1398,7 @@ fn resync_find_after_doc_change(state: &mut State) {
 }
 
 /// Drop a now-stale highlight and recount after the active buffer changed
-/// (edit / undo / redo). Clearing `current` unconditionally stops it ever
+/// (edit / undo / redo / text operation). Clearing `current` unconditionally stops it ever
 /// pointing past a shrunken buffer; the recount itself runs only while the bar
 /// is open (so plain typing on a huge file pays nothing).
 fn refresh_find_after_edit(state: &mut State) -> Vec<Effect> {
@@ -1523,6 +1523,8 @@ fn text_operation(
     let had_selection = selection.is_some_and(|(a, b)| a != b);
     let (start, end) = applied.selection;
     let mut fx = apply_rewrite(state, applied.content);
+    // The highlight and the readout described the old text (#165).
+    fx.extend(refresh_find_after_edit(state));
     if had_selection {
         fx.push(Effect::RevealRange { start, end });
     }
@@ -3128,6 +3130,32 @@ mod tests {
         update(&mut s, Message::Redo);
         assert_eq!(s.active_doc().content(), "abcdef");
         assert_eq!(s.find.current, None);
+        assert_eq!(s.find.count, 1);
+    }
+
+    #[test]
+    fn a_text_operation_resets_the_stale_find_highlight() {
+        // Regression (#165): a text operation rewrites the buffer as undo and
+        // redo do, so it drops the highlight and recounts the same way.
+        use crate::textops::TextOp;
+        let op = |op| Message::TextOperation {
+            op,
+            selection: None,
+        };
+        let mut s = State::default();
+        update(&mut s, Message::Edited("Ⱥ{\nȺ{\n".into()));
+        find_for(&mut s, "{");
+        assert_eq!(s.find.current, Some(Match { start: 2, end: 3 }));
+        assert_eq!((s.find.count, s.find.ordinal), (2, 1));
+        // Lowercasing grows "Ⱥ" from two bytes to three ("ⱥ"): a highlight left
+        // at 2..3 would now start inside that character.
+        update(&mut s, op(TextOp::Lowercase));
+        assert_eq!(s.active_doc().content(), "ⱥ{\nⱥ{\n");
+        assert_eq!(s.find.current, None);
+        assert_eq!((s.find.count, s.find.ordinal), (2, 0));
+        // Dropping the duplicate line drops a match, and the count follows.
+        update(&mut s, op(TextOp::RemoveDuplicateLines));
+        assert_eq!(s.active_doc().content(), "ⱥ{\n");
         assert_eq!(s.find.count, 1);
     }
 

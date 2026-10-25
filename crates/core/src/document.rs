@@ -816,8 +816,8 @@ mod tests {
         assert!(d.commit("saved".into()));
         assert_eq!(d.saved.text, None);
         assert!(!d.dirty());
-        // ...and so does a save.
-        assert!(d.commit("edited".into()));
+        // ...and so does a save, which takes the new text's line count with it.
+        assert!(d.commit("edited\n".into()));
         assert!(d.saved.text.is_some());
         d.mark_saved();
         assert_eq!(d.saved.text, None);

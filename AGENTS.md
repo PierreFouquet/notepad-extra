@@ -93,9 +93,10 @@ starts, so each round reviews the change as fixed.
    line, which a review of the whole change cannot afford. A small change has
    fewer parts and gets fewer chunked reviews.
 3. **Findings outside the change.** A small fix goes in the same PR, as its own
-   commit under the issue it belongs to (open one if none fits, rule 1). Anything
-   larger gets its own issue with the evidence. When unsure which it is, ask the
-   person you work for.
+   commit under the issue it belongs to (open one if none fits, rule 1). This
+   is an exception to rule 1's preference for stacked PRs: a PR of its own
+   costs more than a few lines are worth. Anything larger gets its own issue
+   with the evidence. When unsure which it is, ask the person you work for.
 
 The PR says which rounds ran and what they changed.
 
@@ -105,8 +106,8 @@ The PR says which rounds ran and what they changed.
    Branch from it: `git checkout -b <type>/<short-topic>` (types in §7).
 2. Do the work on that branch: small conventional commits with the tests §5 and §6
    require.
-3. Review it in rounds ("Reviews" above) and commit the fixes.
-4. Push the branch: `git push -u origin <branch>`.
+3. Push the branch: `git push -u origin <branch>`.
+4. Review it in rounds ("Reviews" above) and push the fixes.
 5. **Once prompted, and only once prompted** (rule 2), open the PR. Fill in the PR
    template: what & why, `Closes #N`, the test-driven Definition of Done, the local
    checks you ran, the reviews that ran, the project constraints. Request review.
@@ -122,9 +123,9 @@ here constrains what you do inside your own fork.
 1. Fork the repository, or sync your fork's `main` with upstream `main`.
 2. Do the work **on a branch in your fork**, not on its `main`, so the fork stays
    syncable.
-3. Review it in rounds ("Reviews" above) and commit the fixes.
-4. Push the branch to your fork (your clone's `origin`; the main repository is
+3. Push the branch to your fork (your clone's `origin`; the main repository is
    `upstream`).
+4. Review it in rounds ("Reviews" above) and push the fixes.
 5. **Once prompted** (rule 2), open a **cross-fork PR on the upstream repository**
    — base `PierreFouquet/notepad-extra:main`, head `<your-fork>:<branch>` — as a
    **draft**, so it is reviewed upstream like any other PR.

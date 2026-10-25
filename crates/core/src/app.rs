@@ -4607,12 +4607,12 @@ mod tests {
         /// buffer — edits, undo/redo, replace-next/all, text operations, load,
         /// reload, save, encoding changes, new/selected tabs — every document's
         /// cached chars / words / lines / line index equals a from-scratch
-        /// recount, its dirty flag matches the test's own record of what each
-        /// tab last loaded or saved (#140), and `status()` reports those same
-        /// numbers. The seam alphabet (newlines, apostrophes, CJK, emoji,
-        /// regional indicators, joiners, combining marks, a lone CR) is chosen
-        /// so the per-line word recount is exercised at every awkward UAX #29
-        /// boundary.
+        /// recount, its dirty flag matches the test's own record of each tab's
+        /// text at its creation or last load, reload or save (#140), and
+        /// `status()` reports those same numbers. The seam alphabet (newlines,
+        /// apostrophes, CJK, emoji, regional indicators, joiners, combining
+        /// marks, a lone CR) is chosen so the per-line word recount is
+        /// exercised at every awkward UAX #29 boundary.
         #[test]
         fn cached_totals_match_a_recount_after_every_rewrite_path(
             steps in prop::collection::vec(arb_rewrite(), 0..40),

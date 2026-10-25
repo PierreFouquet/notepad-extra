@@ -321,11 +321,16 @@ impl Document {
     /// them.
     pub(crate) fn load(
         &mut self,
-        text: String,
+        mut text: String,
         eol: EndOfLine,
         encoding: FileEncoding,
         disk: Option<DiskMeta>,
     ) {
+        // Transcoding sizes its output for the worst case, about three times
+        // the text for a single-byte encoding, and the first edit moves this
+        // buffer into the baseline (#140), spare capacity and all. Trimming it
+        // here is a shrink in place under the usual allocators, not a copy.
+        text.shrink_to_fit();
         self.totals = Totals::of(&text);
         self.line_starts = line_starts(&text);
         self.saved = Baseline {
@@ -825,6 +830,30 @@ mod tests {
         assert_eq!(d.saved.text, None);
         assert!(!d.dirty());
         d.assert_derived_data_matches_recount();
+    }
+
+    #[test]
+    fn a_load_trims_the_decode_slack_the_first_edit_would_keep() {
+        // #140: a transcoded file arrives in a buffer sized for the worst case,
+        // and the first edit moves that buffer into the baseline, so the load
+        // trims it rather than keep the slack for as long as the text is dirty.
+        let cp1252 = FileEncoding::from_label("Windows-1252").unwrap();
+        let (text, encoding) = crate::encoding::decode_with_owned(b"caf\xe9".to_vec(), cp1252);
+        assert!(
+            text.capacity() > text.len(),
+            "the decode leaves slack to trim"
+        );
+        let mut d = Document::blank(1);
+        d.load(text, EndOfLine::Lf, encoding, None);
+        assert_eq!(d.content.capacity(), d.content.len());
+        assert!(d.commit("café!".into()));
+        let saved = d
+            .saved
+            .text
+            .as_ref()
+            .expect("dirty, so the baseline is held");
+        assert_eq!(saved, "café");
+        assert_eq!(saved.capacity(), saved.len());
     }
 
     #[test]
